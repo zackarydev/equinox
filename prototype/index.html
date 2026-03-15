@@ -232,6 +232,177 @@
     camera.updateProjectionMatrix();
 
     // ─────────────────────────────────────────
+    //  DEFERRED LIGHT ACCUMULATION PASS
+    //  Renders scene to FBO with depth, then a fullscreen pass computes
+    //  point-light contributions per-pixel from a uniform array.
+    //  This replaces the SpotLight/PointLight pool for buildings.
+    // ─────────────────────────────────────────
+    const DEFERRED_MAX_LIGHTS = 128;
+    // Light data packed into a DataTexture: 2 texels per light
+    // texel 0: (x, y, z, intensity)  texel 1: (r, g, b, range)
+    const _dlTexWidth = DEFERRED_MAX_LIGHTS * 2;
+    const _dlData = new Float32Array(_dlTexWidth * 4); // RGBA per texel
+    const _dlDataTex = new THREE.DataTexture(_dlData, _dlTexWidth, 1, THREE.RGBAFormat, THREE.FloatType);
+    _dlDataTex.minFilter = THREE.NearestFilter;
+    _dlDataTex.magFilter = THREE.NearestFilter;
+    _dlDataTex.needsUpdate = true;
+    let _dlCount = 0;
+
+    const _deferredColorTarget = new THREE.WebGLRenderTarget(
+      window.innerWidth, window.innerHeight, {
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        format: THREE.RGBAFormat,
+        type: THREE.HalfFloatType,
+      }
+    );
+    _deferredColorTarget.depthTexture = new THREE.DepthTexture(
+      window.innerWidth, window.innerHeight,
+      THREE.UnsignedIntType
+    );
+    _deferredColorTarget.depthTexture.format = THREE.DepthFormat;
+
+    // Fullscreen quad geometry
+    const _fsQuadGeo = new THREE.PlaneGeometry(2, 2);
+
+    const _lightAccumMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tColor:       { value: _deferredColorTarget.texture },
+        tDepth:       { value: _deferredColorTarget.depthTexture },
+        tLights:      { value: _dlDataTex },
+        uInvProjView: { value: new THREE.Matrix4() },
+        uCamPos:      { value: new THREE.Vector3() },
+        uLightCount:  { value: 0 },
+        uLightTexWidth: { value: _dlTexWidth },
+        uResolution:  { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        precision highp float;
+        uniform sampler2D tColor;
+        uniform sampler2D tDepth;
+        uniform sampler2D tLights;
+        uniform mat4 uInvProjView;
+        uniform vec3 uCamPos;
+        uniform int uLightCount;
+        uniform float uLightTexWidth;
+        uniform vec2 uResolution;
+        varying vec2 vUv;
+
+        vec3 worldPosFromDepth(float depth, vec2 uv) {
+          vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+          vec4 wp = uInvProjView * ndc;
+          return wp.xyz / wp.w;
+        }
+
+        void main() {
+          vec4 sceneColor = texture2D(tColor, vUv);
+          float depth = texture2D(tDepth, vUv).r;
+
+          if (depth >= 0.9999) {
+            gl_FragColor = sceneColor;
+            return;
+          }
+
+          vec3 worldPos = worldPosFromDepth(depth, vUv);
+          // Screen-space normals from depth
+          vec2 texel = 1.0 / uResolution;
+          vec3 wpL = worldPosFromDepth(texture2D(tDepth, vUv - vec2(texel.x, 0.0)).r, vUv - vec2(texel.x, 0.0));
+          vec3 wpR = worldPosFromDepth(texture2D(tDepth, vUv + vec2(texel.x, 0.0)).r, vUv + vec2(texel.x, 0.0));
+          vec3 wpU = worldPosFromDepth(texture2D(tDepth, vUv + vec2(0.0, texel.y)).r, vUv + vec2(0.0, texel.y));
+          vec3 wpD = worldPosFromDepth(texture2D(tDepth, vUv - vec2(0.0, texel.y)).r, vUv - vec2(0.0, texel.y));
+          vec3 normal = normalize(cross(wpR - wpL, wpU - wpD));
+
+          vec3 lightAccum = vec3(0.0);
+          vec3 viewDir = normalize(uCamPos - worldPos);
+          float invW = 1.0 / uLightTexWidth;
+
+          for (int i = 0; i < ${DEFERRED_MAX_LIGHTS}; i++) {
+            if (i >= uLightCount) break;
+            // Read 2 texels per light from data texture
+            float t0 = (float(i * 2) + 0.5) * invW;
+            float t1 = (float(i * 2 + 1) + 0.5) * invW;
+            vec4 d0 = texture2D(tLights, vec2(t0, 0.5)); // xyz=pos, w=intensity
+            vec4 d1 = texture2D(tLights, vec2(t1, 0.5)); // xyz=color, w=range
+
+            vec3 toLight = d0.xyz - worldPos;
+            float dist = length(toLight);
+            if (dist > d1.w) continue;
+
+            vec3 lightDir = toLight / dist;
+            float att = clamp(1.0 - dist / d1.w, 0.0, 1.0);
+            att = att * att * d0.w / (dist * dist + 1.0);
+
+            float NdotL = max(dot(normal, lightDir), 0.0);
+            vec3 halfDir = normalize(lightDir + viewDir);
+            float spec = pow(max(dot(normal, halfDir), 0.0), 16.0) * 0.15;
+
+            lightAccum += d1.xyz * att * (NdotL + spec);
+          }
+
+          gl_FragColor = vec4(sceneColor.rgb + lightAccum, sceneColor.a);
+        }
+      `,
+      depthWrite: false,
+      depthTest: false,
+      transparent: false,
+    });
+
+    const _lightAccumMesh = new THREE.Mesh(_fsQuadGeo, _lightAccumMat);
+    const _lightAccumScene = new THREE.Scene();
+    const _lightAccumCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    _lightAccumScene.add(_lightAccumMesh);
+
+    const _invProjView = new THREE.Matrix4();
+    function deferredLightsClear() { _dlCount = 0; }
+    function deferredLightPush(x, y, z, r, g, b, intensity, range) {
+      if (_dlCount >= DEFERRED_MAX_LIGHTS) return;
+      const base = _dlCount * 2 * 4; // 2 texels × 4 channels (RGBA)
+      // Texel 0: position + intensity
+      _dlData[base]     = x;
+      _dlData[base + 1] = y;
+      _dlData[base + 2] = z;
+      _dlData[base + 3] = intensity;
+      // Texel 1: color + range
+      _dlData[base + 4] = r;
+      _dlData[base + 5] = g;
+      _dlData[base + 6] = b;
+      _dlData[base + 7] = range;
+      _dlCount++;
+    }
+    function deferredLightsRender() {
+      _invProjView.copy(camera.projectionMatrix).multiply(camera.matrixWorldInverse);
+      _invProjView.invert();
+      _lightAccumMat.uniforms.uInvProjView.value.copy(_invProjView);
+      _lightAccumMat.uniforms.uCamPos.value.copy(camera.position);
+      _lightAccumMat.uniforms.uLightCount.value = _dlCount;
+
+      if (_dlCount === 0) {
+        renderer.render(scene, camera);
+        return;
+      }
+
+      // Upload light data texture
+      _dlDataTex.needsUpdate = true;
+
+      // Render scene to FBO
+      renderer.setRenderTarget(_deferredColorTarget);
+      renderer.render(scene, camera);
+      // Composite — disable tone mapping to avoid double-apply
+      const prevToneMapping = renderer.toneMapping;
+      renderer.toneMapping = THREE.NoToneMapping;
+      renderer.setRenderTarget(null);
+      renderer.render(_lightAccumScene, _lightAccumCam);
+      renderer.toneMapping = prevToneMapping;
+    }
+
+    // ─────────────────────────────────────────
     //  LIGHTING
     // ─────────────────────────────────────────
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
@@ -1000,22 +1171,36 @@
         group.add(building);
         // Register as smoke attractor (world space)
         const dims = building.userData.dims;
+        // Compute window light positions in world space — one per windowed face, offset outward
+        const rot = building.rotation.y;
+        const cosR = Math.cos(rot), sinR = Math.sin(rot);
+        const wcx = center.x + bx, wcz = center.y + bz;
+        const winY = wy + dims.h * 0.45; // mid-window height
+        // Match wind face transform convention exactly
+        const windowLights = [
+          // +Z face (nx=-sinR, nz=cosR) — offset outward along normal
+          { x: wcx - (dims.d/2 + 0.8)*sinR, z: wcz + (dims.d/2 + 0.8)*cosR, y: winY },
+          // +X face (nx=cosR, nz=sinR) — offset outward along normal
+          { x: wcx + (dims.w/2 + 0.8)*cosR, z: wcz + (dims.w/2 + 0.8)*sinR, y: winY },
+          // -X face (nx=-cosR, nz=-sinR) — offset outward along normal
+          { x: wcx - (dims.w/2 + 0.8)*cosR, z: wcz - (dims.w/2 + 0.8)*sinR, y: winY },
+        ];
         buildingAttractors.push({
           x: center.x + bx,
           y: wy + dims.h * 0.5,
           z: center.y + bz,
           r: Math.max(dims.w, dims.d) * 0.6, // consumption radius
           windowMats: building.userData.windowMats || [],
+          windowLights: windowLights,
           glowIntensity: 0,
           glowColor: new THREE.Color(0, 0, 0),
           charge: 0,        // accumulated smoke charge (0–1)
           chargeMax: 1.0,    // 1.0 = fully charged = 3 in-game hours of glow
-          // hearth score: 0 = no chimney, 0.3–1.0 = hearth intensity
-          // bigger buildings with larger roofs smoke more (forges, bakeries)
           hearth: Math.random() < 0.35
             ? (0.3 + Math.random() * 0.7) * Math.min(1, (dims.w * dims.d) / 20)
             : 0,
-          roofY: wy + dims.h + dims.h * 0.5 * 0.4, // top of roof
+          roofY: wy + dims.h + dims.h * 0.5 * 0.4,
+          settlementX: center.x, settlementZ: center.y,
         });
         // Hard wind blocker — buildings act as solid obstacles
         // Register all 4 vertical faces of the building box in world space.
@@ -1750,20 +1935,8 @@
       spawnNPC(b.x, b.z, isB ? PALETTE.B : PALETTE.A, isB ? 1 : 0);
     }
 
-    // Shared SpotLight pool for building window glow — only top N brightest get real lights
-    const BLDG_SPOT_COUNT = 4;
-    const bldgSpots = [];
-    for (let i = 0; i < BLDG_SPOT_COUNT; i++) {
-      const sl = new THREE.SpotLight(0xffcc77, 0, 30, Math.PI * 0.45, 0.6, 1.2);
-      sl.castShadow = false;
-      // Always visible — toggling .visible causes shader recompiles.
-      // Use intensity=0 to "turn off" instead.
-      sl.position.set(0, -1000, 0);
-      sl.target.position.set(0, -1010, 0);
-      scene.add(sl);
-      scene.add(sl.target);
-      bldgSpots.push(sl);
-    }
+    // Building lights now handled by deferred light accumulation pass.
+    // Every lit building gets its own deferred point light — no pool limit.
 
     // Eclipse point — subtle stone circle at world center
     const eclipseGroup = new THREE.Group();
@@ -1833,10 +2006,7 @@
     playerGroup.position.set(startX, getExactTerrainY(startX, startZ), startZ);
     scene.add(playerGroup);
 
-    // Player night light — subtle luminous glow around the player at night
-    const playerNightLight = new THREE.PointLight(0x6688cc, 0, 10000, 2);
-    playerNightLight.position.set(0, 2, 0); // above player's head
-    playerGroup.add(playerNightLight);
+    // (player night light removed — ghost lights handle all night illumination)
 
     // ─────────────────────────────────────────
     //  CAMERA CONTROLLER — 65° top-down, third person
@@ -2620,7 +2790,12 @@
 
       // 6b. Building center attractor — radial pull from further out
       // Effect decays with height above building so upper layers see prevailing wind.
+      // Buildings also create a strong downward suction above their roofline,
+      // pulling smoke from the sky down into the building (chimney effect).
       const BLDG_ATTRACT_RANGE = 25.0;
+      const BLDG_CHIMNEY_HEIGHT = 50.0; // suction zone extends ~1 building height above roof
+      const BLDG_CHIMNEY_PULL = 9.0;    // downward pull strength
+      const BLDG_CHIMNEY_HORIZ = 6.0;   // horizontal radius of chimney suction
       for (let bi = 0; bi < buildingAttractors.length; bi++) {
         const ba = buildingAttractors[bi];
         const adx = ba.x - wx, adz = ba.z - wz;
@@ -2629,7 +2804,8 @@
         const ad = Math.sqrt(ad2);
         if (ad < 0.5) continue;
         // Height above building top — attractor fades out above roofline
-        const aboveRoof = Math.max(0, wy - (ba.y + ba.r));
+        const roofTop = ba.y + ba.r;
+        const aboveRoof = Math.max(0, wy - roofTop);
         const heightFade = 1.0 / (1.0 + aboveRoof * aboveRoof * 0.08);
         if (heightFade < 0.03) continue;
         const proximity = 1.0 - ad / BLDG_ATTRACT_RANGE;
@@ -2641,6 +2817,24 @@
         // Updraft near building (only near roofline)
         const vertDist = Math.abs(wy - ba.y);
         if (vertDist < 8) dy += proximity * 0.5 * heightFade;
+
+        // ── Chimney suction: strong downward pull above roofline ──
+        // Pulls smoke from the sky down into the building.
+        // Active within a narrow column above the roof, fading with horizontal distance
+        // and with height above the chimney zone ceiling.
+        if (aboveRoof > 0 && ad < BLDG_CHIMNEY_HORIZ) {
+          const horizF = 1.0 - ad / BLDG_CHIMNEY_HORIZ; // 1 at center, 0 at edge
+          // Vertical envelope: strongest just above roof, fades at chimney top
+          const chimneyF = aboveRoof < BLDG_CHIMNEY_HEIGHT
+            ? 1.0 - (aboveRoof / BLDG_CHIMNEY_HEIGHT) * 0.5 // gentle fade within zone
+            : Math.exp(-(aboveRoof - BLDG_CHIMNEY_HEIGHT) * 0.3); // rapid falloff above
+          const suctionStr = horizF * horizF * chimneyF * BLDG_CHIMNEY_PULL;
+          dy -= suctionStr; // pull DOWN
+          // Also pull horizontally toward building center within chimney zone
+          dx += adx * invAd * suctionStr * 0.4;
+          dz += adz * invAd * suctionStr * 0.4;
+        }
+
         if (proximity > 0.25 && heightFade > 0.2) attracted = true;
       }
 
@@ -3324,11 +3518,54 @@
     const SMOKE_SPAWN_RATE  = 0.0065; // one puff every ~65 ms ≈ 15/s
     const SMOKE_WIND_SPEED  = 20;   // world units per second per unit wind
 
+    // ── Building glow decay + deferred light push (runs every frame, even with smoke off) ──
+    function updateBuildingLights(dt) {
+      deferredLightsClear();
+      const MAX_DRAIN_TIME = 0.250 / CYCLE_SPEED;
+      for (let bi = 0; bi < buildingAttractors.length; bi++) {
+        const ba = buildingAttractors[bi];
+        if (ba.charge > 0.001) {
+          if (autoCycle) {
+            const drainRate = 1.0 / (MAX_DRAIN_TIME * Math.max(ba.charge, 0.05));
+            ba.charge = Math.max(0, ba.charge - drainRate * dt);
+          }
+          ba.glowIntensity = Math.min(ba.charge * 1.2, 1.0);
+          for (let mi = 0; mi < ba.windowMats.length; mi++) {
+            ba.windowMats[mi].color.copy(ba.glowColor).multiplyScalar(ba.glowIntensity);
+          }
+          // One light per windowed wall face, offset outward from the building
+          const gi = ba.glowIntensity;
+          const wl = ba.windowLights;
+          if (wl) {
+            for (let wi = 0; wi < wl.length; wi++) {
+              deferredLightPush(
+                wl[wi].x, wl[wi].y, wl[wi].z,
+                1.0, 0.85, 0.4,    // warm yellow
+                gi * 12.0,
+                15 + gi * 10
+              );
+            }
+          }
+        } else if (ba.charge > 0 || ba.glowIntensity > 0) {
+          ba.charge = 0;
+          ba.glowIntensity = 0;
+          const dark = new THREE.Color(0x1a1a22);
+          for (let mi = 0; mi < ba.windowMats.length; mi++) {
+            ba.windowMats[mi].color.copy(dark);
+          }
+        }
+      }
+    }
+
     function updateSmoke(dt) {
       if (!smokeVisible) return;
-      // Spawn — rate scales with night glow (no smoke during bright day/full moon)
+      const px = playerGroup.position.x, pz = playerGroup.position.z;
+      // Spawn — rate scales with night glow and ghost blob count
+      // More blobs alive = more trail. No blobs = no trail.
       const glowVal = smokeMat.uniforms.uNightGlow.value;
-      const effectiveRate = glowVal < 0.01 ? Infinity : SMOKE_SPAWN_RATE / glowVal;
+      const blobFrac = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
+      const trailMult = ghostActive ? Math.max(0.05, blobFrac) : 1.0; // day = full trail
+      const effectiveRate = (glowVal < 0.01 ? Infinity : SMOKE_SPAWN_RATE / glowVal) / trailMult;
       _smokeSpawnT += dt;
       if (_smokeSpawnT >= effectiveRate) {
         _smokeSpawnT = 0;
@@ -3388,7 +3625,7 @@
           const pull = ATTRACT_STRENGTH * (1.0 - dist / ATTRACT_RANGE) * windSuppression;
           const invD = 1.0 / (dist + 0.5);
           _svx[i] += adx * invD * pull * dt;
-          _svy[i] += ady * invD * pull * 0.5 * dt;
+          _svy[i] += ady * invD * pull * 1.5 * dt;
           _svz[i] += adz * invD * pull * dt;
           // Consume only when wind is calm enough for smoke to actually reach
           if (dist < ba.r && windSuppression > 0.3) {
@@ -3404,7 +3641,7 @@
               const warmCol = new THREE.Color(1.0, 0.85, 0.5);
               neonCol.lerp(warmCol, 0.5);
               // Accumulate charge — each particle adds a small amount
-              ba.charge = Math.min(ba.charge + 0.0008, ba.chargeMax);
+              ba.charge = Math.min(ba.charge + 0.08, ba.chargeMax);
               ba.glowIntensity = Math.min(ba.charge * 1.2, 1.0);
               ba.glowColor.lerp(neonCol, 0.3);
             }
@@ -3550,69 +3787,8 @@
         }
       }
 
-      // ── Building window glow decay — drain scales with charge level ──
-      // 3 in-game hours = 0.125 of day cycle. At CYCLE_SPEED=0.015, that's ~8.3s real.
-      // 6 in-game hours = 0.250 of day cycle. At CYCLE_SPEED=0.015, that's ~16.7s real.
-      // Full charge drains in ~8.3s; low charge drains much faster.
-      // Drain pauses when clock is paused.
-      const MAX_DRAIN_TIME = 0.250 / CYCLE_SPEED;
-      const _bldgTop = new Float32Array(BLDG_SPOT_COUNT).fill(-1);
-      const _bldgIdx = new Int32Array(BLDG_SPOT_COUNT).fill(-1);
-      _bldgTop.fill(-1); _bldgIdx.fill(-1);
-
-      for (let bi = 0; bi < buildingAttractors.length; bi++) {
-        const ba = buildingAttractors[bi];
-        if (ba.charge > 0.001) {
-          // Only drain when clock is running
-          if (autoCycle) {
-            const drainRate = 1.0 / (MAX_DRAIN_TIME * Math.max(ba.charge, 0.05));
-            ba.charge = Math.max(0, ba.charge - drainRate * dt);
-          }
-          ba.glowIntensity = Math.min(ba.charge * 1.2, 1.0);
-          for (let mi = 0; mi < ba.windowMats.length; mi++) {
-            ba.windowMats[mi].color.copy(ba.glowColor).multiplyScalar(ba.glowIntensity);
-          }
-          // Track top N for SpotLight assignment
-          let minJ = 0;
-          for (let j = 1; j < BLDG_SPOT_COUNT; j++) {
-            if (_bldgTop[j] < _bldgTop[minJ]) minJ = j;
-          }
-          if (ba.glowIntensity > _bldgTop[minJ]) {
-            _bldgTop[minJ] = ba.glowIntensity;
-            _bldgIdx[minJ] = bi;
-          }
-        } else if (ba.charge > 0 || ba.glowIntensity > 0) {
-          ba.charge = 0;
-          ba.glowIntensity = 0;
-          const dark = new THREE.Color(0x1a1a22);
-          for (let mi = 0; mi < ba.windowMats.length; mi++) {
-            ba.windowMats[mi].color.copy(dark);
-          }
-        }
-      }
-
-      // Assign shared SpotLight pool to top-N brightest buildings
-      for (let si = 0; si < BLDG_SPOT_COUNT; si++) {
-        const sl = bldgSpots[si];
-        const bi = _bldgIdx[si];
-        if (bi < 0) {
-          // No building to light — zero intensity, park far away
-          sl.intensity = 0;
-          continue;
-        }
-        const ba = buildingAttractors[bi];
-        sl.position.set(ba.x, ba.y + 2, ba.z);
-        sl.target.position.set(ba.x, ba.y - 10, ba.z);
-        sl.color.copy(ba.glowColor);
-        sl.intensity = ba.glowIntensity * 8.0;
-        sl.distance = 20 + ba.glowIntensity * 10;
-      }
-
       // Update smoke glow lights — smoothly track particles, pulsate colors
       const nightGlow = smokeMat.uniforms.uNightGlow.value;
-
-      // Update player night light intensity
-      playerNightLight.intensity = nightGlow * 1000;
 
       if (nightGlow < 0.05) {
         for (let li = 0; li < SMOKE_LIGHT_COUNT; li++) {
@@ -4523,12 +4699,24 @@
                 { cx: npc.siteX+(bd/2)*sR, cz: npc.siteZ-(bd/2)*cR, nx:sR, nz:-cR, halfExtent:bw/2, height:bh, groundY:bgy }
               );
               // Register smoke attractor
+              const winY = bgy + bh * 0.45;
+              const nwl = [
+                // +Z face
+                { x: npc.siteX - (bd/2+0.8)*sR, z: npc.siteZ + (bd/2+0.8)*cR, y: winY },
+                // +X face
+                { x: npc.siteX + (bw/2+0.8)*cR, z: npc.siteZ + (bw/2+0.8)*sR, y: winY },
+                // -X face
+                { x: npc.siteX - (bw/2+0.8)*cR, z: npc.siteZ - (bw/2+0.8)*sR, y: winY },
+              ];
               buildingAttractors.push({
                 x: npc.siteX, y: bgy + bh * 0.5, z: npc.siteZ,
                 r: Math.max(bw, bd) * 0.6,
                 windowMats: nb.userData.windowMats || [],
+                windowLights: nwl,
                 glowIntensity: 0, glowColor: new THREE.Color(0, 0, 0),
-                charge: 0, chargeMax: 1.0
+                charge: 0, chargeMax: 1.0,
+                roofY: bgy + bh + bh * 0.5 * 0.4,
+                settlementX: npc.siteX, settlementZ: npc.siteZ,
               });
               // Spawn new NPC at the new home
               spawnNPC(npc.siteX, npc.siteZ, npc.palette, npc.kingdomIdx);
@@ -5348,6 +5536,9 @@
     const NM_SMOKE_KILL_RANGE = 5.0; // smoke particle kills mob within this range
     const NM_SMOKE_ATTRACT_RANGE = 120; // how far mobs can sense smoke
     const NM_LINGER_RANGE = 30;      // wander radius when no smoke
+    const NM_HOME_ATTRACT_RANGE = 80; // how far wraiths can sense lit homes
+    const NM_HOME_ATTACK_RANGE = 3.0; // distance to drain home power
+    const NM_PLAYER_NEARBY = 30;      // if player is within this range, wraiths target player not homes
     const NM_FADE_SPEED = 2.0;       // alpha fade in/out speed
     const NM_SPAWN_EDGE = WORLD_SIZE * 0.4; // spawn near world edges
 
@@ -5432,7 +5623,8 @@
         mesh,
         x: sx, z: sz,
         targetX: sx, targetZ: sz,
-        state: 'wander', // 'wander', 'chase_smoke', 'attack_player', 'attack_npc', 'attack_squirrel', 'dying'
+        state: 'wander', // 'wander', 'chase_smoke', 'attack_player', 'attack_npc', 'attack_squirrel', 'attack_home', 'dying'
+        homeTargetIdx: -1, // index into buildingAttractors
         timer: 0,
         attackCooldown: 0,
         alpha: 0, // fade in
@@ -5589,6 +5781,7 @@
         // ── AI: find target ──
         const distToPlayer2 = (px - nm.x) ** 2 + (pz - nm.z) ** 2;
         const distToPlayer = Math.sqrt(distToPlayer2);
+        const playerNearby = distToPlayer < NM_PLAYER_NEARBY;
 
         // Priority 1: Attack player if close
         if (distToPlayer < NM_ATTACK_RANGE * 3) {
@@ -5596,7 +5789,43 @@
           nm.targetX = px;
           nm.targetZ = pz;
         }
-        // Priority 2: Follow smoke (use cached centroid)
+        // Priority 2: If player is NOT nearby, hunt lit homes
+        else if (!playerNearby) {
+          let bestHome = -1, bestHomeD2 = NM_HOME_ATTRACT_RANGE * NM_HOME_ATTRACT_RANGE;
+          for (let bi = 0; bi < buildingAttractors.length; bi++) {
+            const ba = buildingAttractors[bi];
+            if (ba.destroyed || ba.charge < 0.05) continue;
+            const hd2 = (ba.x - nm.x) ** 2 + (ba.z - nm.z) ** 2;
+            if (hd2 < bestHomeD2) { bestHomeD2 = hd2; bestHome = bi; }
+          }
+          if (bestHome >= 0) {
+            nm.state = 'attack_home';
+            nm.homeTargetIdx = bestHome;
+            nm.targetX = buildingAttractors[bestHome].x;
+            nm.targetZ = buildingAttractors[bestHome].z;
+          } else {
+            // Fallback: follow smoke or wander
+            const smokeCentroid = _smkCentroid;
+            if (smokeCentroid) {
+              nm.state = 'chase_smoke';
+              nm.targetX = smokeCentroid.x;
+              nm.targetZ = smokeCentroid.z;
+            } else {
+              nm.wanderTimer -= dt;
+              if (nm.wanderTimer <= 0 || nm.state !== 'wander') {
+                nm.state = 'wander';
+                nm.wanderTimer = 4 + Math.random() * 6;
+                const ang = Math.random() * Math.PI * 2;
+                nm.targetX = nm.x + Math.cos(ang) * NM_LINGER_RANGE;
+                nm.targetZ = nm.z + Math.sin(ang) * NM_LINGER_RANGE;
+                const bnd = WORLD_SIZE * 0.42;
+                nm.targetX = Math.max(-bnd, Math.min(bnd, nm.targetX));
+                nm.targetZ = Math.max(-bnd, Math.min(bnd, nm.targetZ));
+              }
+            }
+          }
+        }
+        // Priority 3: Follow smoke (use cached centroid)
         else {
           const smokeCentroid = _smkCentroid;
           if (smokeCentroid) {
@@ -5604,7 +5833,7 @@
             nm.targetX = smokeCentroid.x;
             nm.targetZ = smokeCentroid.z;
           }
-          // Priority 3: Attack outdoor NPCs
+          // Priority 4: Attack outdoor NPCs
           else {
             let nearNpc = -1, nearNpcD2 = 40 * 40;
             for (let ni = 0; ni < npcs.length; ni++) {
@@ -5617,7 +5846,7 @@
               nm.targetX = npcs[nearNpc].x;
               nm.targetZ = npcs[nearNpc].z;
             }
-            // Priority 4: Attack outdoor squirrels (not in canopy)
+            // Priority 5: Attack outdoor squirrels (not in canopy)
             else {
               let nearSq = -1, nearSqD2 = 30 * 30;
               for (let si = 0; si < squirrels.length; si++) {
@@ -5630,7 +5859,7 @@
                 nm.targetX = squirrels[nearSq].x;
                 nm.targetZ = squirrels[nearSq].z;
               }
-              // Priority 5: Wander
+              // Priority 6: Wander
               else {
                 nm.wanderTimer -= dt;
                 if (nm.wanderTimer <= 0 || nm.state !== 'wander') {
@@ -5673,9 +5902,6 @@
           if (nm.state === 'attack_player' && distToPlayer < NM_ATTACK_RANGE) {
             ashenDrain = Math.min(0.9, ashenDrain + ASHEN_DRAIN_PER_HIT);
             nm.attackCooldown = NM_ATTACK_COOLDOWN;
-            // Flash player light red briefly
-            playerNightLight.color.setHex(0xff2222);
-            setTimeout(() => playerNightLight.color.setHex(0x6688cc), 200);
           }
           // Kill outdoor NPC on contact
           if (nm.state === 'attack_npc') {
@@ -5687,6 +5913,23 @@
                 npcs[ni].state = NPC_GOING_HOME;
                 nm.attackCooldown = NM_ATTACK_COOLDOWN;
                 break;
+              }
+            }
+          }
+          // Destroy home power on contact
+          if (nm.state === 'attack_home' && nm.homeTargetIdx >= 0) {
+            const ba = buildingAttractors[nm.homeTargetIdx];
+            if (ba && !ba.destroyed && ba.charge > 0) {
+              const hd = Math.sqrt((ba.x - nm.x) ** 2 + (ba.z - nm.z) ** 2);
+              if (hd < NM_HOME_ATTACK_RANGE) {
+                ba.charge = 0;
+                ba.glowIntensity = 0;
+                for (let mi = 0; mi < ba.windowMats.length; mi++) {
+                  ba.windowMats[mi].color.setScalar(0);
+                  ba.windowMats[mi].emissive && ba.windowMats[mi].emissive.setScalar(0);
+                }
+                nm.attackCooldown = NM_ATTACK_COOLDOWN;
+                nm.homeTargetIdx = -1;
               }
             }
           }
@@ -5761,34 +6004,34 @@
     //  coordinated breathing. One organism, not separate particles.
     // ─────────────────────────────────────────
     const GHOST_MAX = 125;
-    const GHOST_MIN_SIZE_CORE = 0.3;
-    const GHOST_MAX_SIZE_CORE = 1;
-    const GHOST_MIN_SIZE_OUTER = 0.25;
-    const GHOST_MAX_SIZE_OUTER = 0.25;
-    const GHOST_CORE_R = 2;        // dense inner core radius
-    const GHOST_OUTER_R = 5;       // wispy outer reach
+    const GHOST_MIN_SIZE_CORE = 0.5;
+    const GHOST_MAX_SIZE_CORE = 0.7;
+    const GHOST_MIN_SIZE_OUTER = 0.4;
+    const GHOST_MAX_SIZE_OUTER = 0.5;
+    const GHOST_CORE_R = 1;        // dense inner core radius
+    const GHOST_OUTER_R = 2;       // wispy outer reach
     const GHOST_SPRING = 20.0;       // strong spring snap to formation
-    const GHOST_DAMP = 0.1;         // velocity damping (lower = more viscous)
-    const GHOST_CURL_STR = 2.5;      // curl-noise swirl intensity
-    const GHOST_CURL_SCALE = 0.6;    // spatial frequency of swirl
-    const GHOST_CURL_SPEED = 0.4;    // swirl time evolution
-    const GHOST_WIND_FACTOR = 0.3;   // wind push on cloud
-    const GHOST_BREATH_RATE = 1.3;   // breathing frequency (Hz)
-    const GHOST_BREATH_AMP = 0.15;   // breathing expansion fraction
+    const GHOST_DAMP = 0.05;         // velocity damping (lower = more viscous)
+    const GHOST_CURL_STR = 6;      // curl-noise swirl intensity
+    const GHOST_CURL_SCALE = 1;    // spatial frequency of swirl
+    const GHOST_CURL_SPEED = 0.3;    // swirl time evolution
+    const GHOST_WIND_FACTOR = 1.5;   // wind push on cloud
+    const GHOST_BREATH_RATE = 0.4;   // breathing frequency (Hz)
+    const GHOST_BREATH_AMP = 0.2;   // breathing expansion fraction
     const GHOST_OBS_RANGE = 4.0;     // obstacle avoidance trigger
     const GHOST_OBS_PUSH = 20.0;     // obstacle push + tangential slide
-    const GHOST_DRAIN_BLDG = 20.0;
-    const GHOST_DRAIN_WRAITH = 6.0;
-    const GHOST_REGEN_RATE = 2.0;
-    const GHOST_DRAIN_RATE_BLDG = 15.0;
-    const GHOST_DRAIN_RATE_WRAITH = 5.0;
+    const GHOST_DRAIN_BLDG = 1.0;
+    const GHOST_DRAIN_WRAITH = 4.0; // wraith must be close to the core to drain
+    const GHOST_REGEN_RATE = 40;
+    const GHOST_DRAIN_RATE_BLDG = 100.0;
+    const GHOST_DRAIN_RATE_WRAITH = 40.0; // blobs/sec at point-blank
     const GHOST_ATTACK_RANGE = 5.0;
     const GHOST_ATTACK_DPS = 2.5;
     const GHOST_LIGHT_COUNT = 1;
 
     // Moon jump
-    const MOON_GRAVITY = 2.5;
-    const JUMP_VELOCITY = 10.0;
+    const MOON_GRAVITY = 4;
+    const JUMP_VELOCITY = 20.0;
     let playerYVel = 0;
     let playerAirborne = false;
     let _jumpLaunchFrame = false;
@@ -5810,12 +6053,13 @@
     let ghostBlobCount = 0;
     let ghostMaxBlobs = GHOST_MAX;
     let ghostFade = 0;
+    let _ghostRegenAccum = 0;
 
     const _ghostGeo = new THREE.IcosahedronGeometry(0.1, 1);
     const _ghostMat = new THREE.MeshStandardMaterial({
-      color: 0x8844ff,
-      emissive: 0x8844ff,
-      emissiveIntensity: 3.0,
+      color: 0xffffff,
+      emissive: 0x222222,
+      emissiveIntensity: 1.0,
       flatShading: true,
       transparent: true,
       opacity: 0.9,
@@ -5831,13 +6075,14 @@
     ghostCloud.castShadow = false;
     scene.add(ghostCloud);
 
-    // Ghost cloud point lights
+    // Ghost cloud point lights — deep blues and purples
+    const GHOST_LIGHT_HUES = [0.72, 0.62, 0.82];
     const ghostLights = [];
     for (let i = 0; i < GHOST_LIGHT_COUNT; i++) {
-      const gl = new THREE.PointLight(0x8844ff, 0, 20, 2);
+      const gl = new THREE.PointLight(0x8844ff, 0, 22, 2);
       gl.visible = false;
       scene.add(gl);
-      ghostLights.push({ light: gl, blobIdx: -1, hue: 0 });
+      ghostLights.push({ light: gl, blobIdx: -1, baseHue: GHOST_LIGHT_HUES[i] });
     }
 
     // Dummy matrix for instanced mesh updates
@@ -5878,8 +6123,9 @@
       _gbz[i] = pz + Math.sin(ang) * r;
       _gbvx[i] = 0; _gbvy[i] = 0; _gbvz[i] = 0;
       _gbac[i] = 1;
-      const h = Math.random();
-      _gbhue[i] = h < 0.88 ? 0.58 + h * 0.34 : 0.28 + (h - 0.88) * 1.5;
+      // Match smoke trail hue distribution: 88% blue-violet-magenta, 12% green-teal
+      const _h = Math.random();
+      _gbhue[i] = _h < 0.88 ? 0.58 + _h * 0.34 : 0.28 + (_h - 0.88) * 1.5;
       _gbsz[i] = layer === 0
         ? (GHOST_MIN_SIZE_CORE + Math.random() * GHOST_MAX_SIZE_CORE)
         : (GHOST_MIN_SIZE_OUTER + Math.random() * GHOST_MAX_SIZE_OUTER);
@@ -5915,17 +6161,22 @@
       // Max blobs based on ghost power (moon phase) and fade-in only
       ghostMaxBlobs = Math.floor(GHOST_MAX * gp * ghostFade);
 
-      // ── Regeneration — ashen drain slows regen rate, doesn't reduce cap ──
+      // ── Regeneration — fractional accumulator for proper rate control ──
       if (ghostBlobCount < ghostMaxBlobs) {
-        // Full ashen = full regen, drained ashen = much slower recovery
         const regenMult = 0.15 + ashen * 0.85; // 0.15..1.0
-        const rate = GHOST_REGEN_RATE * regenMult;
-        const toSpawn = Math.min(Math.ceil(rate * dt), ghostMaxBlobs - ghostBlobCount);
-        let spawned = 0;
-        for (let i = 0; i < GHOST_MAX && spawned < toSpawn; i++) {
-          if (!_gbac[i]) { initGhostBlob(i, px, py, pz); spawned++; }
+        const rate = GHOST_REGEN_RATE * regenMult; // blobs per second
+        _ghostRegenAccum += rate * dt;
+        const toSpawn = Math.min(Math.floor(_ghostRegenAccum), ghostMaxBlobs - ghostBlobCount);
+        if (toSpawn > 0) {
+          _ghostRegenAccum -= toSpawn;
+          let spawned = 0;
+          for (let i = 0; i < GHOST_MAX && spawned < toSpawn; i++) {
+            if (!_gbac[i]) { initGhostBlob(i, px, py, pz); spawned++; }
+          }
+          ghostBlobCount += spawned;
         }
-        ghostBlobCount += spawned;
+      } else {
+        _ghostRegenAccum = 0;
       }
 
       // ── Building drain: wind field pulls blobs in, consume on contact ──
@@ -5955,20 +6206,30 @@
       }
 
       // ── Wraith drain + ghost attacks ──
+      // Wraiths that reach the core destroy blobs aggressively.
+      // Ghost can fight back when enough blobs surround the wraith.
       for (let ni = nightMobs.length - 1; ni >= 0; ni--) {
         const nm = nightMobs[ni];
         if (nm.state === 'dying') continue;
         const wd = Math.sqrt((nm.x - px) ** 2 + (nm.z - pz) ** 2);
-        if (wd < GHOST_DRAIN_WRAITH + 3) {
-          let drained = 0;
-          const drainBudget = GHOST_DRAIN_RATE_WRAITH * dt;
-          for (let i = 0; i < GHOST_MAX && drained < drainBudget; i++) {
+
+        // Wraith close to player core — destroy blobs on contact
+        if (wd < GHOST_DRAIN_WRAITH) {
+          // Kill rate: massive — scales with how close the wraith is
+          const intensity = 1.0 - wd / GHOST_DRAIN_WRAITH; // 0..1
+          const killCount = Math.ceil(GHOST_DRAIN_RATE_WRAITH * intensity * dt);
+          let killed = 0;
+          for (let i = 0; i < GHOST_MAX && killed < killCount; i++) {
             if (!_gbac[i]) continue;
-            if ((_gbx[i] - nm.x) ** 2 + (_gbz[i] - nm.z) ** 2 < GHOST_DRAIN_WRAITH * GHOST_DRAIN_WRAITH) {
-              _gbac[i] = 0; ghostBlobCount--; drained++;
+            // Kill any active blob near the wraith OR near the player (core hit)
+            const bd2 = (_gbx[i] - nm.x) ** 2 + (_gbz[i] - nm.z) ** 2;
+            if (bd2 < 9.0) { // 3-unit radius around wraith
+              _gbac[i] = 0; ghostBlobCount--; killed++;
             }
           }
         }
+
+        // Ghost attacks wraith when blobs surround it
         if (wd < GHOST_ATTACK_RANGE) {
           let nearBlobs = 0;
           for (let i = 0; i < GHOST_MAX; i++) {
@@ -5985,12 +6246,16 @@
       }
 
       // ── Shared cloud state (computed ONCE, not per blob) ──
-      const breath = 1.0 + Math.sin(t * GHOST_BREATH_RATE * Math.PI * 2) * GHOST_BREATH_AMP;
       const playerGndY = getTerrainY(px, pz); // one terrain lookup for all blobs
       const cw = windForSmoke(px, pz, py + 2, playerGndY, windTime);
-      const wdx = cw.dx * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR;
-      const wdz = cw.dz * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR;
-      const wdy = cw.dy * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR * 0.3;
+      const windStr = Math.sqrt(cw.dx * cw.dx + cw.dz * cw.dz);
+      // Breathing responds to wind — gusts stretch the cloud
+      const breathBase = Math.sin(t * GHOST_BREATH_RATE * Math.PI * 2) * GHOST_BREATH_AMP;
+      const windBreath = windStr * 0.35; // wind stretches breathing
+      const breath = 1.0 + breathBase + windBreath;
+      // Formation offset — sphere center shifts downwind so the cloud leans
+      const windLeanX = cw.dx * 15.0;
+      const windLeanZ = cw.dz * 15.0;
 
       // Shared curl sample at player center (6 simplex calls total, not per blob)
       const _curlCenter = curlNoise3D(px, py + 2, pz, t, GHOST_CURL_SCALE, GHOST_CURL_SPEED);
@@ -6026,21 +6291,43 @@
           continue;
         }
 
-        // Formation target
+        // Formation target — spherical distribution
         const orbR = _gborbit[i] * breath;
         const orbAngle = _gbphase[i] + t * (0.3 + _gblayer[i] * 0.5);
-        const tgtX = px + Math.cos(orbAngle) * orbR;
-        const tgtZ = pz + Math.sin(orbAngle) * orbR;
-        const yRange = _gblayer[i] === 0 ? 0.6 : 1.4;
-        const tgtY = py + 2.0 + Math.sin(_gbphase[i] * 3.7 + t * 0.8) * yRange * breath;
+        // Elevation angle derived from phase — spread blobs vertically across a sphere
+        const elevAngle = Math.acos(1 - 2 * ((_gbphase[i] * 2.347) % 1)) - Math.PI * 0.5; // -π/2..π/2
+        const elevDrift = Math.sin(_gbphase[i] * 3.7 + t * 0.8) * 0.3; // gentle wobble
+        const cosElev = Math.cos(elevAngle + elevDrift);
+        const sinElev = Math.sin(elevAngle + elevDrift);
+        const tgtX = px + Math.cos(orbAngle) * orbR * cosElev + windLeanX;
+        const tgtZ = pz + Math.sin(orbAngle) * orbR * cosElev + windLeanZ;
+        const tgtY = py + 2.0 + orbR * sinElev;
 
-        // Spring + shared curl + wind (no per-blob simplex calls)
-        let fx = (tgtX - _gbx[i]) * GHOST_SPRING + _curlCenter.x * GHOST_CURL_STR + wdx;
-        let fy = (tgtY - _gby[i]) * GHOST_SPRING + _curlCenter.y * GHOST_CURL_STR * 0.5 + wdy;
-        let fz = (tgtZ - _gbz[i]) * GHOST_SPRING + _curlCenter.z * GHOST_CURL_STR + wdz;
+        // Per-blob wind — each blob feels wind at its own position
+        const bw = windForSmoke(_gbx[i], _gbz[i], _gby[i], playerGndY, windTime);
+        const bwdx = bw.dx * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR;
+        const bwdz = bw.dz * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR;
+        // Suppress vertical wind near buildings so chimney/updraft effects
+        // don't rip the ghost cloud apart or suck it into structures
+        let _blobVWindDamp = 1.0;
+        for (let _bi = 0; _bi < _nearBldg.length; _bi++) {
+          const _ba = _nearBldg[_bi];
+          const _bd2 = (_gbx[i] - _ba.x) ** 2 + (_gbz[i] - _ba.z) ** 2;
+          const _bThresh = _ba.r + 12; // suppress within ~12 units of building center
+          if (_bd2 < _bThresh * _bThresh) {
+            const _bProx = 1.0 - Math.sqrt(_bd2) / _bThresh;
+            _blobVWindDamp = Math.min(_blobVWindDamp, 1.0 - _bProx * 0.95); // up to 95% suppression
+          }
+        }
+        const bwdy = bw.dy * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR * 0.5 * _blobVWindDamp;
+
+        // Spring + shared curl + per-blob wind
+        let fx = (tgtX - _gbx[i]) * GHOST_SPRING + _curlCenter.x * GHOST_CURL_STR + bwdx;
+        let fy = (tgtY - _gby[i]) * GHOST_SPRING + _curlCenter.y * GHOST_CURL_STR * 0.5 + bwdy;
+        let fz = (tgtZ - _gbz[i]) * GHOST_SPRING + _curlCenter.z * GHOST_CURL_STR + bwdz;
 
         // Per-blob curl variation: cheap phase-offset of shared curl (no extra simplex)
-        const phOff = _gbphase[i];
+        const phOff = _gbphase[i] * (Math.random() * 0.5);
         const cSin = Math.sin(phOff), cCos = Math.cos(phOff);
         fx += (_curlCenter.x * cCos - _curlCenter.z * cSin) * 0.8;
         fz += (_curlCenter.x * cSin + _curlCenter.z * cCos) * 0.8;
@@ -6064,12 +6351,21 @@
           const tp = _nearTrees[ti];
           const odx = _gbx[i] - tp.x, odz = _gbz[i] - tp.z;
           const od2 = odx * odx + odz * odz;
-          if (od2 < 6.25 && od2 > 0.01) {
+          // Trunk collision — tight radius (0.8), hard push
+          const TRUNK_R = 0.8;
+          const TRUNK_AVOID_R = TRUNK_R + 1.5; // start pushing at 2.3 units
+          if (od2 < TRUNK_AVOID_R * TRUNK_AVOID_R && od2 > 0.01) {
             const od = Math.sqrt(od2);
-            const pen = 1.0 - od / 2.5;
-            const push = GHOST_OBS_PUSH * 0.4 * pen;
-            fx += (odx / od) * push + (-odz / od) * push * 0.5;
-            fz += (odz / od) * push + (odx / od) * push * 0.5;
+            const pen = 1.0 - od / TRUNK_AVOID_R;
+            // Strong repulsion that ramps up sharply near trunk surface
+            const push = GHOST_OBS_PUSH * pen * pen * 2.0;
+            fx += (odx / od) * push;
+            fz += (odz / od) * push;
+            // Hard clamp — if inside trunk, teleport out
+            if (od < TRUNK_R) {
+              _gbx[i] = tp.x + (odx / od) * TRUNK_R;
+              _gbz[i] = tp.z + (odz / od) * TRUNK_R;
+            }
           }
         }
 
@@ -6095,8 +6391,8 @@
 
         // Color: reuse inline HSV calc (no object allocation)
         const hue = ((_gbhue[i] + _baseHueShift + Math.sin(t * 0.6 + _gbphase[i]) * 0.02) % 1 + 1) % 1;
-        const sat = _gblayer[i] === 0 ? 0.95 : 0.75;
-        const c = sat, x = c * (1 - Math.abs((hue * 6) % 2 - 1)), m = 1 - c;
+        const sat = 1.0; // fully saturated — vivid colors
+        const c = sat, x = c * (1 - Math.abs((hue * 6) % 2 - 1)), m = 0;
         const h6 = hue * 6;
         let cr, cg, cb;
         if (h6 < 1) { cr = c; cg = x; cb = 0; }
@@ -6113,7 +6409,7 @@
       ghostCloud.count = GHOST_MAX;
       ghostCloud.instanceMatrix.needsUpdate = true;
       ghostCloud.instanceColor.needsUpdate = true;
-      _ghostMat.emissiveIntensity = 2.5 + gp * 2.0;
+      _ghostMat.emissiveIntensity = 0.3 + gp * 0.4;
       _ghostMat.opacity = 0.85 + ghostFade * 0.1;
 
       // ── Ghost lights: track core blobs ──
@@ -6140,12 +6436,13 @@
           gl.light.position.x += (_gbx[bi] - gl.light.position.x) * lr;
           gl.light.position.y += (_gby[bi] - gl.light.position.y) * lr;
           gl.light.position.z += (_gbz[bi] - gl.light.position.z) * lr;
-          const h = _gbhue[bi] + Math.sin(t * 1.0 + li * 2.1) * 0.05;
-          const c = hsvToColor(((h % 1) + 1) % 1, 0.8, 1.0);
+          // Each light uses its own deep blue/purple hue with gentle drift
+          const h = gl.baseHue + Math.sin(t * 0.7 + li * 1.7) * 0.04;
+          const c = hsvToColor(((h % 1) + 1) % 1, 0.85, 0.6);
           gl.light.color.copy(c);
           const blobRatio = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
-          gl.light.intensity = (100 + Math.sin(t * 1.8 + li * 1.5) * 40) * ghostFade * gp * blobRatio;
-          gl.light.distance = 18 + gp * 8;
+          gl.light.intensity = (1000 + Math.sin(t * 1.8 + li * 1.5) * 50) * ghostFade * gp * blobRatio;
+          gl.light.distance = 100000000 + gp * 50;
         }
       }
 
@@ -6192,8 +6489,6 @@
         }
       }
 
-      const blobFrac = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
-      playerNightLight.intensity = ghostFade * gp * blobFrac * 300;
     }
 
     // ─────────────────────────────────────────
@@ -6242,7 +6537,8 @@
       updateGrowingTrees(dt);
       updateNightMobs(dt);
 
-      // Smoke
+      // Building lights (deferred) + Smoke
+      updateBuildingLights(dt);
       updateSmoke(dt);
       updateChimneySmoke(dt);
 
@@ -6254,7 +6550,7 @@
       updateCamera();
       drawAxisHud();
 
-      renderer.render(scene, camera);
+      deferredLightsRender();
     }
 
     // ─────────────────────────────────────────
@@ -6264,6 +6560,8 @@
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      _deferredColorTarget.setSize(window.innerWidth, window.innerHeight);
+      _lightAccumMat.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
     });
 
     // Start
