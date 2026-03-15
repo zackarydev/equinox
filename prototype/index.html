@@ -44,7 +44,7 @@
 <body>
   <div id="info">
     WASD — move &nbsp;|&nbsp; Mouse — look<br>
-    1 / 2 / 3 — Day / Dusk / Night &nbsp;|&nbsp; T — auto cycle &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; X — axis
+    1 / 2 / 3 — Day / Dusk / Night &nbsp;|&nbsp; T — auto cycle &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis
   </div>
   <div id="time-indicator"></div>
   <div id="moon-indicator"><canvas id="moon-hud" width="24" height="24"></canvas><span id="moon-text"></span></div>
@@ -269,7 +269,7 @@
       { name: 'Last Quarter',    symbol: '🌗', light: 1.0, dawnPower: 0.85, ashenPower: 0.75 },
       { name: 'Waning Crescent', symbol: '🌘', light: 0.9, dawnPower: 0.95, ashenPower: 0.6 },
     ];
-    let moonPhaseIndex = 4; // Start at full moon so night is visible
+    let moonPhaseIndex = 0; // Start at full moon so night is visible
     let dayCounter = 0;
     let lastDayState = false; // was it day last frame?
     const DAYS_PER_PHASE = 1; // phase advances every full day cycle
@@ -1780,6 +1780,7 @@
     //  PLAYER CHARACTER (scaled up ~2.5x)
     // ─────────────────────────────────────────
     const playerGroup = new THREE.Group();
+    const PLAYER_HEIGHT = 3.6;
     // Body
     const bodyGeo = new THREE.CapsuleGeometry(0.7, 2.0, 4, 6);
     const bodyMat = new THREE.MeshStandardMaterial({ color: 0xb08060, flatShading: true });
@@ -1934,7 +1935,10 @@
     //  INPUT
     // ─────────────────────────────────────────
     const keys = {};
-    window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; });
+    window.addEventListener('keydown', e => {
+      keys[e.key.toLowerCase()] = true;
+      if (e.key === ' ') e.preventDefault(); // prevent scroll on space
+    });
     window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
     // Mouse look
@@ -2218,6 +2222,16 @@
           _windDbgTimer = 99; // force immediate redraw at new density
         }
       }
+      if (e.key === 'ArrowUp' && windDebugLevel > 0) {
+        windDbgLayerCount = Math.min(windDbgLayerCount + 1, WIND_DBG_MAX_LAYERS);
+        _windDbgTimer = 99; // force redraw
+      }
+      if (e.key === 'ArrowDown' && windDebugLevel > 0) {
+        windDbgLayerCount = Math.max(1, windDbgLayerCount - 1);
+        // Hide arrows that may now be beyond active set
+        for (const a of windDebugArrows) a.visible = false;
+        _windDbgTimer = 99;
+      }
       if (e.key.toLowerCase() === 'f') {
         faceDebugVisible = !faceDebugVisible;
         buildFaceDebugArrows();
@@ -2294,10 +2308,13 @@
       playerGroup.position.z = Math.max(-bound, Math.min(bound, playerGroup.position.z));
 
       // Exact terrain following — raycast onto actual mesh surface
-      const targetY = getExactTerrainY(playerGroup.position.x, playerGroup.position.z);
-      const ySmooth = 1 - Math.pow(0.0001, dt);
-      smoothedY += (targetY - smoothedY) * ySmooth;
-      playerGroup.position.y = smoothedY;
+      // Skip Y override when ghost cloud moon-jump is active
+      if (!playerAirborne) {
+        const targetY = getExactTerrainY(playerGroup.position.x, playerGroup.position.z);
+        const ySmooth = 1 - Math.pow(0.0001, dt);
+        smoothedY += (targetY - smoothedY) * ySmooth;
+        playerGroup.position.y = smoothedY;
+      }
 
       // Walking animation
       const speed = playerVelocity.length();
@@ -2396,7 +2413,8 @@
         const ashenStr = effAshen < phase.ashenPower
           ? `Ashen ×${effAshen.toFixed(2)} (−${(phase.ashenPower - effAshen).toFixed(2)})`
           : `Ashen ×${effAshen.toFixed(2)}`;
-        moonEl.textContent += `  |  Dawnkeeper ×${phase.dawnPower.toFixed(2)}  ${ashenStr}`;
+        const ghostStr = ghostActive ? `  Cloud ${ghostBlobCount}/${ghostMaxBlobs}` : '';
+        moonEl.textContent += `  |  Dawnkeeper ×${phase.dawnPower.toFixed(2)}  ${ashenStr}${ghostStr}`;
       }
     }
 
@@ -2448,7 +2466,7 @@
     //   • Soft structures (trees) — canopy fade above tree top, updraft at canopy
     //       crown, boundary turbulence, forest-edge channeling
     // ─────────────────────────────────────────
-    const _wdbgOut = { dx: 0, dy: 0, dz: 0, strength: 0, blocked: false, turbulent: false };
+    const _wdbgOut = { dx: 0, dy: 0, dz: 0, strength: 0 };
     function getWindDebug(wx, wy, wz, t) {
       // ── 1. Height above local ground ────────────────────────────────────
       const groundY = getTerrainY(wx, wz);
@@ -2503,110 +2521,115 @@
         const relY   = wy - infTop; // < 0 = inside/below structure height
 
         {
-          // ── Soft blocker (tree / vegetation) ────────────────────────────
-          // Effect fades quickly above canopy top.
+          // ── Tree canopy — acts as a turbulent barrier ──────────────────
+          // Inside canopy: heavy damping + outward repulsion from trunk.
+          // Canopy edge: strong turbulent deflection around the tree.
+          // Above canopy: rapid falloff so open sky is unaffected.
           const canopyF = relY < 0
             ? 1.0
-            : Math.exp(-relY / (inf.height * 0.25 + 0.5));
-          if (canopyF < 0.03) continue; // well above canopy, skip
+            : Math.exp(-relY / (inf.height * 0.2 + 0.3));
+          if (canopyF < 0.03) continue;
 
-          // Boundary turbulence peaks exactly at canopy edge (f2d ≈ 0.5)
-          const edgeFalloff = f2d * (1 - f2d) * 4;
-
-          const swirl = simplex2(wx * 0.18 + t * 0.35 + 77, wz * 0.18) * 0.35;
-          const eTx = simplex2(wx * 0.28 + t * 0.25 + inf.x * 0.07, wz * 0.28) * 0.55;
-          const eTz = simplex2(wx * 0.28, wz * 0.28 + t * 0.25 + inf.z * 0.07) * 0.55;
-
-          // Forest-edge channeling: wind pushed perpendicular to sample→tree vector
           const invD = 1 / (dist + 0.0001);
+          // Outward direction from trunk
+          const outX = ddx * invD, outZ = ddz * invD;
+          // Perpendicular (tangential around trunk)
           const perpX = -ddz * invD, perpZ = ddx * invD;
 
-          dx = dx * (1 - f2d * inf.strength * 0.5 * canopyF)
-               + swirl * f2d * 0.20 * canopyF
-               + eTx * edgeFalloff * 0.32 * canopyF
-               + perpX * edgeFalloff * 0.22 * inf.strength;
-          dz = dz * (1 - f2d * inf.strength * 0.5 * canopyF)
-               + swirl * f2d * 0.20 * canopyF
-               + eTz * edgeFalloff * 0.32 * canopyF
-               + perpZ * edgeFalloff * 0.22 * inf.strength;
+          // Inside canopy radius: heavy wind kill + outward push (barrier)
+          const blockStr = f2d * f2d * inf.strength * canopyF;
+          // Kill 90% of incoming wind deep inside canopy
+          const damp = 1 - blockStr * 0.90;
+          dx *= damp;
+          dz *= damp;
 
-          // Vertical: wind deflected upward at/near canopy crown
-          if (relY > -inf.height * 0.6 && relY < inf.height * 0.4) {
-            dy += f2d * inf.strength * 0.30 * canopyF;
+          // Repel wind outward from trunk — makes arrows push away from tree
+          const repulse = blockStr * 1.8;
+          dx += outX * repulse;
+          dz += outZ * repulse;
+
+          // Boundary turbulence peaks at canopy edge (f2d ≈ 0.5)
+          const edgeFalloff = f2d * (1 - f2d) * 4;
+          const tSwirl = simplex2(wx * 0.22 + t * 0.4 + 77, wz * 0.22) * 0.6;
+          dx += perpX * edgeFalloff * 0.5 * inf.strength * canopyF;
+          dz += perpZ * edgeFalloff * 0.5 * inf.strength * canopyF;
+          dx += tSwirl * edgeFalloff * 0.35 * canopyF;
+          dz += tSwirl * edgeFalloff * 0.35 * canopyF;
+
+          // Updraft at canopy crown — wind forced up and over
+          if (relY > -inf.height * 0.5 && relY < inf.height * 0.5) {
+            dy += f2d * inf.strength * 0.6 * canopyF;
           }
 
-          if (edgeFalloff > 0.5) turbulent = true;
+          if (edgeFalloff > 0.35 || blockStr > 0.3) turbulent = true;
         }
       }
 
-      // ── 6. Face-normal hard-blocker deflection ──────────────────────────
-      // Each entry is one physical face of a wall/building.
-      // Windward side: project out the normal component so wind can't pass through,
-      //   accelerate the tangential component (Bernoulli), deflect upward over top.
-      // Lee side: calm wake pocket, mild downdraft.
-      const FACE_WIND_DIST = 8.0;  // windward influence depth (world units)
-      const FACE_WAKE_DIST = 14.0; // leeward wake depth
+      // ── 6. Wall inward pull + building attractor ─────────────────────
+      // Near wall faces, wind is drawn inward (through the wall toward building
+      // center).  Further out, a radial pull toward the building center dominates.
+      // Both effects use the same "attracted" flag for debug coloring.
+      let attracted = false;
+
+      // 6a. Face-based inward pull — strongest right at the wall surface
+      const FACE_PULL_DIST = 10.0;
       for (let fi = 0; fi < windFaces.length; fi++) {
         const face = windFaces[fi];
         const fdx = wx - face.cx, fdz = wz - face.cz;
-        // Signed distance from face plane: positive = windward, negative = wake
-        const signedDist = fdx * face.nx + fdz * face.nz;
-        if (signedDist > FACE_WIND_DIST || signedDist < -FACE_WAKE_DIST) continue;
+        // Perpendicular distance from face plane (positive = outside)
+        const perpDist = fdx * face.nx + fdz * face.nz;
+        if (perpDist < -2 || perpDist > FACE_PULL_DIST) continue;
 
-        // Lateral extent — how far along the face surface is this sample?
-        const tanX = -face.nz, tanZ = face.nx; // 90° rotation of normal
+        // Lateral extent check
+        const tanX = -face.nz, tanZ = face.nx;
         const lateralDist = Math.abs(fdx * tanX + fdz * tanZ);
-        // Taper off beyond face halfExtent with a soft margin
-        const lateralF = Math.max(0, 1 - Math.max(0, lateralDist - face.halfExtent) / (FACE_WIND_DIST * 0.65));
+        const lateralF = Math.max(0, 1 - Math.max(0, lateralDist - face.halfExtent) / 4.0);
         if (lateralF < 0.01) continue;
 
         // Vertical extent
         const fRelY = wy - (face.groundY + face.height);
-        const vf = fRelY < 0
-          ? 1.0
-          : Math.exp(-fRelY * fRelY / (face.height * face.height * 0.5 + 1));
+        const vf = fRelY < 0 ? 1.0 : Math.exp(-fRelY * fRelY / (face.height * face.height * 0.5 + 1));
         if (vf < 0.03) continue;
 
-        const roofZone = Math.exp(-fRelY * fRelY / (face.height * face.height * 0.8 + 1));
+        // Pull strength: strong close to wall, fading with distance
+        const distNorm = Math.max(0, perpDist) / FACE_PULL_DIST;
+        const pullF = (1 - distNorm) * (1 - distNorm) * lateralF * vf;
+        // Pull INTO the wall (opposite to outward normal)
+        const pullMag = pullF * 3.0;
+        dx -= face.nx * pullMag;
+        dz -= face.nz * pullMag;
+        if (pullF > 0.15) attracted = true;
+      }
 
-        if (signedDist >= 0) {
-          // ── WINDWARD SIDE ──────────────────────────────────────────────
-          const distF = (1 - signedDist / FACE_WIND_DIST) * lateralF * vf;
-          // How much wind is pressing INTO the face?
-          const wNorm = dx * face.nx + dz * face.nz; // positive = away from face
-          if (wNorm < 0) {
-            // Block: remove the inward normal component
-            const block = -wNorm * distF;
-            dx += block * face.nx;
-            dz += block * face.nz;
-            // Tangential acceleration (Bernoulli — flow squeezes around the face)
-            const currNorm = dx * face.nx + dz * face.nz;
-            const wTanX = dx - currNorm * face.nx;
-            const wTanZ = dz - currNorm * face.nz;
-            const tanMag = Math.sqrt(wTanX * wTanX + wTanZ * wTanZ) + 0.0001;
-            dx += (wTanX / tanMag) * block * 0.42;
-            dz += (wTanZ / tanMag) * block * 0.42;
-            // Upward deflection over the top
-            dy += block * 0.90 * roofZone;
-            if (distF > 0.25) blocked = true;
-          }
-        } else {
-          // ── WAKE / LEE SIDE ───────────────────────────────────────────
-          const wakeF = (1 + signedDist / FACE_WAKE_DIST) * lateralF * vf;
-          // Calm pocket — damp horizontal wind
-          dx *= (1 - wakeF * 0.72);
-          dz *= (1 - wakeF * 0.72);
-          // Mild downdraft
-          dy -= (Math.sqrt(dx * dx + dz * dz) + 0.01) * wakeF * 0.28 * roofZone;
-          if (wakeF > 0.35) blocked = true;
-        }
+      // 6b. Building center attractor — radial pull from further out
+      // Effect decays with height above building so upper layers see prevailing wind.
+      const BLDG_ATTRACT_RANGE = 25.0;
+      for (let bi = 0; bi < buildingAttractors.length; bi++) {
+        const ba = buildingAttractors[bi];
+        const adx = ba.x - wx, adz = ba.z - wz;
+        const ad2 = adx * adx + adz * adz;
+        if (ad2 > BLDG_ATTRACT_RANGE * BLDG_ATTRACT_RANGE) continue;
+        const ad = Math.sqrt(ad2);
+        if (ad < 0.5) continue;
+        // Height above building top — attractor fades out above roofline
+        const aboveRoof = Math.max(0, wy - (ba.y + ba.r));
+        const heightFade = 1.0 / (1.0 + aboveRoof * aboveRoof * 0.08);
+        if (heightFade < 0.03) continue;
+        const proximity = 1.0 - ad / BLDG_ATTRACT_RANGE;
+        // Cubic ramp — gentle far out, very strong close, scaled by height
+        const pullStr = proximity * proximity * proximity * 3.5 * heightFade;
+        const invAd = 1.0 / ad;
+        dx += adx * invAd * pullStr;
+        dz += adz * invAd * pullStr;
+        // Updraft near building (only near roofline)
+        const vertDist = Math.abs(wy - ba.y);
+        if (vertDist < 8) dy += proximity * 0.5 * heightFade;
+        if (proximity > 0.25 && heightFade > 0.2) attracted = true;
       }
 
       const strength = Math.sqrt(dx * dx + dy * dy + dz * dz);
       _wdbgOut.dx = dx; _wdbgOut.dy = dy; _wdbgOut.dz = dz;
       _wdbgOut.strength = strength;
-      _wdbgOut.blocked = blocked;
-      _wdbgOut.turbulent = turbulent;
       return _wdbgOut;
     }
 
@@ -2631,31 +2654,29 @@
 
     // ─────────────────────────────────────────
     //  3D WIND DEBUG FIELD (toggle V)
-    //  A grid of ArrowHelper objects placed at terrain height.
-    //  Arrows show the full terrain-following, object-influenced wind
-    //  vector at each sample point.  Color encodes state:
-    //  Color coding:
-    //    cyan → white  — open wind, brightness = speed
-    //    orange / red  — hard-blocked wake (wall / building)
-    //    magenta       — turbulent zone (vortex shedding / canopy edge)
-    //    dim teal      — calm inside a forest canopy
+    //  All arrows are the same fixed size.  Color encodes wind magnitude:
+    //    dim blue   — calm / near-zero
+    //    cyan       — light breeze
+    //    green      — moderate
+    //    yellow     — strong
+    //    red        — very strong / attractor zone
+    //  3 dynamic layers track the player height.
     // ─────────────────────────────────────────
 
-    // V cycles: off → sparse → medium → dense → off.
-    // Each level defines a horizontal grid + an array of height offsets above terrain.
-    // Higher layers are more transparent so the ground layer always reads clearly.
-    //
-    // Level 1 — 1 slice  at +2         →  14×14×1  = 196  arrows
-    // Level 2 — 3 slices at +1, +8, +18 →  18×18×3  = 972  arrows
-    // Level 3 — 4 slices at +1,+5,+12,+25 → 22×22×4 = 1936 arrows
+    // V cycles: off → local → medium → wide → off.
+    // Level 1: tight local grid, small arrows — see nearby wall/building effects
+    // Level 2: medium range
+    // Level 3: wide overview
+    const WIND_DBG_MAX_LAYERS = 10;
+    let windDbgLayerCount = 1; // current layer count, adjustable with up/down arrows
     const WIND_DBG_LEVELS = [
       null,
-      { grid: 14, spacing: 9, layers: [2] },
-      { grid: 18, spacing: 6, layers: [1, 8, 18] },
-      { grid: 22, spacing: 4, layers: [1, 5, 12, 25] },
+      { grid: 18, spacing: 1.6, arrowLen: 0.8 },
+      { grid: 18, spacing: 5, arrowLen: 1.5 },
+      { grid: 18, spacing: 9, arrowLen: 3 },
     ];
-    // Max total arrows = level-3 count
-    const WIND_DBG_MAX_ARROWS = 22 * 22 * 4; // 1936
+    // Max total arrows = 18×18×10 = 3240
+    const WIND_DBG_MAX_ARROWS = 18 * 18 * WIND_DBG_MAX_LAYERS;
 
     let windDebugLevel = 0;
 
@@ -2683,24 +2704,42 @@
     function updateWindDebug(dt) {
       if (windDebugLevel === 0) return;
       _windDbgTimer += dt;
-      // Refresh budget scales with arrow count
-      const refreshRate = windDebugLevel === 3 ? 0.5 : windDebugLevel === 2 ? 0.35 : 0.25;
+      // Refresh budget scales with arrow count (more layers = less frequent updates)
+      const baseRate = windDebugLevel === 3 ? 0.5 : windDebugLevel === 2 ? 0.35 : 0.25;
+      const refreshRate = baseRate + (windDbgLayerCount - 1) * 0.05;
       if (_windDbgTimer < refreshRate) return;
       _windDbgTimer = 0;
 
-      const { grid, spacing, layers } = WIND_DBG_LEVELS[windDebugLevel];
-      // Arrow length fills ~80% of grid spacing — readable without overlapping
-      const arrowBase = spacing * 0.80;
+      const lvl = WIND_DBG_LEVELS[windDebugLevel];
+      const grid = lvl.grid, spacing = lvl.spacing, arrowLen = lvl.arrowLen;
       const px = playerGroup.position.x;
+      const py = playerGroup.position.y;
       const pz = playerGroup.position.z;
       const half = (grid - 1) * spacing * 0.5;
       const perLayer = grid * grid;
-      const activeCount = perLayer * layers.length;
+      const layerCount = windDbgLayerCount;
+      const activeCount = perLayer * layerCount;
 
-      for (let li = 0; li < layers.length; li++) {
-        const heightOffset = layers[li];
-        // Higher layers: slightly more transparent so ground layer is always readable
-        const opacity = Math.max(0.35, 0.85 - li * 0.15);
+      // Player height above terrain
+      const playerGndY = getTerrainY(px, pz);
+      const playerHAG = Math.max(0, py - playerGndY);
+
+      // Layer 0 = terrain level (+0.5)
+      // Layer 1..N = stacked above the player's head, each +5 units apart
+      const LAYER_SPACING = 5;
+      const layerOffsets = [0.5];
+      for (let li = 1; li < layerCount; li++) {
+        layerOffsets.push(playerHAG + 2.0 + (li - 1) * LAYER_SPACING);
+      }
+
+      // Fixed arrow dimensions
+      const headLen = arrowLen * 0.28;
+      const headW   = arrowLen * 0.14;
+
+      for (let li = 0; li < layerCount; li++) {
+        const heightOffset = layerOffsets[li];
+        // Higher layers progressively more transparent
+        const opacity = Math.max(0.25, 0.90 - li * 0.07);
 
         for (let gi = 0; gi < grid; gi++) {
           for (let gj = 0; gj < grid; gj++) {
@@ -2715,11 +2754,10 @@
             arrow.visible = true;
             arrow.position.set(wx, wy, wz);
 
-            // Update per-layer opacity (cheap — material is shared within a layer)
             arrow.line.material.opacity = opacity;
             arrow.cone.material.opacity = opacity;
 
-            // Direction — straight up as a calm-spot sentinel
+            // Direction — straight up as calm sentinel
             if (str > 0.01) {
               _dbgDirV.set(w.dx / str, w.dy / str, w.dz / str);
             } else {
@@ -2727,21 +2765,31 @@
             }
             arrow.setDirection(_dbgDirV);
 
-            const scale = Math.max(0.18, Math.min(str, 1.5));
-            const len   = arrowBase * scale;
-            arrow.setLength(len, len * 0.30, len * 0.14);
+            // Fixed arrow size — color carries magnitude info
+            arrow.setLength(arrowLen, headLen, headW);
 
-            // Color encodes wind state:
-            //   orange-red  — hard-blocked wake (wall / building)
-            //   magenta     — turbulent zone (vortex shedding / canopy boundary)
-            //   cyan→white  — free wind, brightness proportional to speed
-            if (w.blocked) {
-              _dbgCol.setRGB(1.0, 0.22 + str * 0.28, 0.05);
-            } else if (w.turbulent) {
-              _dbgCol.setRGB(0.90 + str * 0.10, 0.12 + str * 0.18, 0.90);
+            // Color: magnitude gradient  dim blue → cyan → green → yellow → red
+            // str typically 0..2+, clamp to 0..2 for color mapping
+            const t01 = Math.min(str / 2.0, 1.0);
+            let r, g, b;
+            if (t01 < 0.25) {
+              // dim blue → cyan
+              const f = t01 / 0.25;
+              r = 0.10; g = 0.15 + f * 0.65; b = 0.45 + f * 0.55;
+            } else if (t01 < 0.5) {
+              // cyan → green
+              const f = (t01 - 0.25) / 0.25;
+              r = 0.05; g = 0.80 + f * 0.20; b = 1.0 - f * 0.85;
+            } else if (t01 < 0.75) {
+              // green → yellow
+              const f = (t01 - 0.5) / 0.25;
+              r = f * 1.0; g = 1.0; b = 0.15 - f * 0.10;
             } else {
-              _dbgCol.setRGB(0.10 + str * 0.55, 0.78 + str * 0.22, 1.0);
+              // yellow → red
+              const f = (t01 - 0.75) / 0.25;
+              r = 1.0; g = 1.0 - f * 0.85; b = 0.05;
             }
+            _dbgCol.setRGB(r, g, b);
             arrow.setColor(_dbgCol);
           }
         }
@@ -3109,7 +3157,7 @@
     scene.add(trailPoints);
 
     // Smoke glow lights — smoothly track particles, pulsate between colors
-    const SMOKE_LIGHT_COUNT = 6;
+    const SMOKE_LIGHT_COUNT = 4;
     const smokeLights = [];
     const _smokeLightHSL = { h: 0, s: 0, l: 0 };
     const _slTracked = new Int32Array(SMOKE_LIGHT_COUNT).fill(-1); // tracked particle index
@@ -5272,7 +5320,7 @@
     // ─────────────────────────────────────────
     //  NIGHT MOBS — Shadow Wraiths
     // ─────────────────────────────────────────
-    const NM_MAX = 30;
+    const NM_MAX = 15;
     const NM_SPEED = 8;
     const NM_SPAWN_INTERVAL = 3.0;   // seconds between spawn attempts
     const NM_ATTACK_RANGE = 4.0;     // distance to deal damage
@@ -5341,11 +5389,8 @@
         tendril.rotation.z = (Math.random() - 0.5) * 0.5;
         g.add(tendril);
       }
-      // Eerie point light
-      const glow = new THREE.PointLight(0x6622aa, 200, 15, 2);
-      glow.position.set(0, 2, 0);
-      g.add(glow);
-      g.userData = { bodyMat, headMat, glow };
+      // No per-wraith light — use shared pool for perf
+      g.userData = { bodyMat, headMat };
       return g;
     }
 
@@ -5376,6 +5421,16 @@
         wanderTimer: 0,
         hp: 3, // hits from smoke to kill
       });
+    }
+
+    // ── Shared wraith light pool (3 lights for nearest wraiths) ──
+    const WRAITH_LIGHT_COUNT = 3;
+    const _wraithLights = [];
+    for (let i = 0; i < WRAITH_LIGHT_COUNT; i++) {
+      const wl = new THREE.PointLight(0x6622aa, 0, 15, 2);
+      wl.visible = false;
+      scene.add(wl);
+      _wraithLights.push(wl);
     }
 
     // ── Smoke spatial grid for fast night-mob queries ──
@@ -5467,7 +5522,7 @@
           }
           nm.mesh.userData.bodyMat.opacity = nm.alpha * 0.85;
           nm.mesh.userData.headMat.opacity = nm.alpha * 0.9;
-          nm.mesh.userData.glow.intensity = nm.alpha * 200;
+          // glow handled by shared wraith light pool
           continue;
         }
 
@@ -5476,7 +5531,7 @@
           nm.alpha = Math.min(1, nm.alpha + NM_FADE_SPEED * dt);
           nm.mesh.userData.bodyMat.opacity = nm.alpha * 0.85;
           nm.mesh.userData.headMat.opacity = nm.alpha * 0.9;
-          nm.mesh.userData.glow.intensity = nm.alpha * 200;
+          // glow handled by shared wraith light pool
         }
 
         nm.attackCooldown = Math.max(0, nm.attackCooldown - dt);
@@ -5486,7 +5541,7 @@
           nm.alpha -= NM_FADE_SPEED * 2 * dt;
           nm.mesh.userData.bodyMat.opacity = nm.alpha * 0.85;
           nm.mesh.userData.headMat.opacity = nm.alpha * 0.9;
-          nm.mesh.userData.glow.intensity = nm.alpha * 200;
+          // glow handled by shared wraith light pool
           nm.mesh.scale.setScalar(1 + (1 - nm.alpha) * 0.5); // expand as dying
           if (nm.alpha <= 0) {
             scene.remove(nm.mesh);
@@ -5646,10 +5701,452 @@
       if (!isDeadNight && ashenDrain > 0) {
         ashenDrain = Math.max(0, ashenDrain - ASHEN_REGEN_RATE * dt);
       }
+
+      // ── Wraith light pool: assign to nearest wraiths to player ──
+      if (isDeadNight && nightMobs.length > 0) {
+        // Sort by distance to player, pick top N
+        const px = playerGroup.position.x, pz = playerGroup.position.z;
+        const scored = [];
+        for (let i = 0; i < nightMobs.length; i++) {
+          const nm = nightMobs[i];
+          if (nm.state === 'dying' || nm.alpha < 0.3) continue;
+          scored.push({ idx: i, d2: (nm.x - px) ** 2 + (nm.z - pz) ** 2 });
+        }
+        scored.sort((a, b) => a.d2 - b.d2);
+        for (let li = 0; li < WRAITH_LIGHT_COUNT; li++) {
+          const wl = _wraithLights[li];
+          if (li < scored.length) {
+            const nm = nightMobs[scored[li].idx];
+            wl.visible = true;
+            wl.position.set(nm.x, nm.mesh.position.y + 2, nm.z);
+            wl.intensity = nm.alpha * 150;
+          } else {
+            wl.visible = false;
+            wl.intensity = 0;
+          }
+        }
+      } else {
+        for (let li = 0; li < WRAITH_LIGHT_COUNT; li++) {
+          _wraithLights[li].visible = false;
+          _wraithLights[li].intensity = 0;
+        }
+      }
     }
 
     // ── Player mesh visibility at night ──
     const playerBodyParts = [body, head, shoulders, ...legs];
+
+    // ─────────────────────────────────────────
+    //  GHOST CLOUD SYSTEM — cohesive luminous entity at night
+    //  Dense core + wispy outer shell, curl-noise swirling, wind-guided,
+    //  coordinated breathing. One organism, not separate particles.
+    // ─────────────────────────────────────────
+    const GHOST_MAX = 160;
+    const GHOST_CORE_R = 1.0;        // dense inner core radius
+    const GHOST_OUTER_R = 2.2;       // wispy outer reach
+    const GHOST_SPRING = 18.0;       // strong spring snap to formation
+    const GHOST_DAMP = 0.3;         // velocity damping (lower = more viscous)
+    const GHOST_CURL_STR = 2.5;      // curl-noise swirl intensity
+    const GHOST_CURL_SCALE = 0.6;    // spatial frequency of swirl
+    const GHOST_CURL_SPEED = 0.4;    // swirl time evolution
+    const GHOST_WIND_FACTOR = 0.3;   // wind push on cloud
+    const GHOST_BREATH_RATE = 1.2;   // breathing frequency (Hz)
+    const GHOST_BREATH_AMP = 0.15;   // breathing expansion fraction
+    const GHOST_OBS_RANGE = 4.0;     // obstacle avoidance trigger
+    const GHOST_OBS_PUSH = 20.0;     // obstacle push + tangential slide
+    const GHOST_DRAIN_BLDG = 10.0;
+    const GHOST_DRAIN_WRAITH = 6.0;
+    const GHOST_REGEN_RATE = 4.0;
+    const GHOST_DRAIN_RATE_BLDG = 2.5;
+    const GHOST_DRAIN_RATE_WRAITH = 5.0;
+    const GHOST_ATTACK_RANGE = 5.0;
+    const GHOST_ATTACK_DPS = 2.5;
+    const GHOST_LIGHT_COUNT = 2;
+
+    // Moon jump
+    const MOON_GRAVITY = 2.5;
+    const JUMP_VELOCITY = 10.0;
+    let playerYVel = 0;
+    let playerAirborne = false;
+    let ghostActive = false;  // is ghost cloud currently active?
+
+    // Ghost blob data (SoA)
+    const _gbx = new Float32Array(GHOST_MAX);
+    const _gby = new Float32Array(GHOST_MAX);
+    const _gbz = new Float32Array(GHOST_MAX);
+    const _gbvx = new Float32Array(GHOST_MAX);
+    const _gbvy = new Float32Array(GHOST_MAX);
+    const _gbvz = new Float32Array(GHOST_MAX);
+    const _gbac = new Uint8Array(GHOST_MAX);
+    const _gbhue = new Float32Array(GHOST_MAX);
+    const _gbsz = new Float32Array(GHOST_MAX);
+    const _gblayer = new Float32Array(GHOST_MAX); // 0=core, 1=outer
+    const _gbphase = new Float32Array(GHOST_MAX); // orbit phase offset
+    const _gborbit = new Float32Array(GHOST_MAX); // assigned orbit radius
+    let ghostBlobCount = 0;
+    let ghostMaxBlobs = GHOST_MAX;
+    let ghostFade = 0;
+
+    const _ghostGeo = new THREE.IcosahedronGeometry(0.1, 1);
+    const _ghostMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      emissive: 0x8844ff,
+      emissiveIntensity: 3.0,
+      flatShading: true,
+      transparent: true,
+      opacity: 0.9,
+    });
+    const ghostCloud = new THREE.InstancedMesh(_ghostGeo, _ghostMat, GHOST_MAX);
+    ghostCloud.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    // Per-instance color
+    const _ghostColors = new Float32Array(GHOST_MAX * 3);
+    ghostCloud.instanceColor = new THREE.InstancedBufferAttribute(_ghostColors, 3);
+    ghostCloud.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    ghostCloud.frustumCulled = false;
+    ghostCloud.visible = false;
+    ghostCloud.castShadow = false;
+    scene.add(ghostCloud);
+
+    // Ghost cloud point lights
+    const ghostLights = [];
+    for (let i = 0; i < GHOST_LIGHT_COUNT; i++) {
+      const gl = new THREE.PointLight(0x8844ff, 0, 20, 2);
+      gl.visible = false;
+      scene.add(gl);
+      ghostLights.push({ light: gl, blobIdx: -1, hue: 0 });
+    }
+
+    // Dummy matrix for instanced mesh updates
+    const _ghostDummy = new THREE.Object3D();
+
+    function getGhostPower() {
+      // New Moon (light 0.5) = 1.0, Full Moon (light 3.0) = 0.25
+      const ml = getCurrentMoonPhase().light;
+      return Math.max(0.25, 1.0 - (ml - 0.5) / 2.5 * 0.75);
+    }
+
+    // Curl noise: divergence-free rotational flow via finite differences on simplex2
+    function curlNoise3D(x, y, z, t, scale, speed) {
+      const eps = 0.15;
+      const sx = x * scale, sy = y * scale, sz = z * scale, tt = t * speed;
+      const n0  = simplex2(sx + tt, sz + 50);
+      const ndy = simplex2(sx + tt, sz + eps + 50);
+      const ndz = simplex2(sx + tt + 100, sy + 70);
+      const ndz2 = simplex2(sx + tt + 100, sy + eps + 70);
+      const nx  = simplex2(sz + tt + 200, sy + 30);
+      const ndx = simplex2(sz + tt + 200, sy + eps + 30);
+      return {
+        x: (ndy - n0) / eps - (ndz2 - ndz) / eps,
+        y: (ndz2 - ndz) / eps - (ndx - nx) / eps,
+        z: (ndx - nx) / eps - (ndy - n0) / eps
+      };
+    }
+
+    function initGhostBlob(i, px, py, pz) {
+      const layer = Math.random() < 0.6 ? 0 : 1;
+      _gblayer[i] = layer;
+      const maxR = layer === 0 ? GHOST_CORE_R : GHOST_OUTER_R;
+      _gborbit[i] = Math.pow(Math.random(), 0.5) * maxR;
+      _gbphase[i] = Math.random() * Math.PI * 2;
+      const ang = _gbphase[i], r = _gborbit[i];
+      _gbx[i] = px + Math.cos(ang) * r;
+      _gby[i] = py + 2.0 + (Math.random() - 0.5) * maxR * 0.6;
+      _gbz[i] = pz + Math.sin(ang) * r;
+      _gbvx[i] = 0; _gbvy[i] = 0; _gbvz[i] = 0;
+      _gbac[i] = 1;
+      const h = Math.random();
+      _gbhue[i] = h < 0.88 ? 0.58 + h * 0.34 : 0.28 + (h - 0.88) * 1.5;
+      _gbsz[i] = layer === 0
+        ? 0.10 + Math.random() * 0.10
+        : 0.05 + Math.random() * 0.07;
+    }
+
+    function updateGhostCloud(dt) {
+      const _isDeepNight = timeOfDay > 0.82 || timeOfDay < 0.22;
+      const _isTransition = (timeOfDay > 0.75 && timeOfDay <= 0.82) ||
+                            (timeOfDay >= 0.22 && timeOfDay < 0.30);
+      if (_isDeepNight) {
+        ghostFade = Math.min(1, ghostFade + dt * 1.5);
+      } else if (_isTransition) {
+        ghostFade = timeOfDay > 0.75
+          ? Math.min(1, (timeOfDay - 0.75) / 0.07)
+          : Math.max(0, 1.0 - (timeOfDay - 0.22) / 0.08);
+      } else {
+        ghostFade = Math.max(0, ghostFade - dt * 2.0);
+      }
+      ghostActive = ghostFade > 0.01;
+      if (!ghostActive) {
+        ghostCloud.visible = false; ghostCloud.count = 0;
+        for (let i = 0; i < GHOST_LIGHT_COUNT; i++) ghostLights[i].light.visible = false;
+        playerAirborne = false; playerYVel = 0; ghostBlobCount = 0;
+        for (let i = 0; i < GHOST_MAX; i++) _gbac[i] = 0;
+        return;
+      }
+      ghostCloud.visible = true;
+
+      const px = playerGroup.position.x, py = playerGroup.position.y, pz = playerGroup.position.z;
+      const t = performance.now() * 0.001;
+      const gp = getGhostPower();
+      const ashen = getEffectiveAshenPower();
+      ghostMaxBlobs = Math.floor(GHOST_MAX * gp * ghostFade * Math.max(0.1, ashen));
+
+      // ── Regeneration ──
+      if (ghostBlobCount < ghostMaxBlobs) {
+        const rate = ghostBlobCount < 20 ? 80 : GHOST_REGEN_RATE;
+        const toSpawn = Math.min(Math.ceil(rate * dt), ghostMaxBlobs - ghostBlobCount);
+        let spawned = 0;
+        for (let i = 0; i < GHOST_MAX && spawned < toSpawn; i++) {
+          if (!_gbac[i]) { initGhostBlob(i, px, py, pz); spawned++; }
+        }
+        ghostBlobCount += spawned;
+      }
+
+      // ── Building drain: sudden yank toward center + tangential curve ──
+      for (let bi = 0; bi < buildingAttractors.length; bi++) {
+        const ba = buildingAttractors[bi];
+        if (ba.destroyed) continue;
+        const bd = Math.sqrt((ba.x - px) ** 2 + (ba.z - pz) ** 2);
+        if (bd < GHOST_DRAIN_BLDG + 5) {
+          let drained = 0;
+          const drainBudget = GHOST_DRAIN_RATE_BLDG * dt;
+          for (let i = 0; i < GHOST_MAX && drained < drainBudget; i++) {
+            if (!_gbac[i]) continue;
+            const ddx = _gbx[i] - ba.x, ddz = _gbz[i] - ba.z;
+            const d2 = ddx * ddx + ddz * ddz;
+            if (d2 < GHOST_DRAIN_BLDG * GHOST_DRAIN_BLDG) {
+              const d = Math.sqrt(d2) + 0.1;
+              _gbvx[i] += (-ddx / d) * 35;
+              _gbvz[i] += (-ddz / d) * 35;
+              _gbvx[i] += (-ddz / d) * 15; // tangential curve
+              _gbvz[i] += (ddx / d) * 15;
+              if (d2 < 4) { _gbac[i] = 0; ghostBlobCount--; drained++; }
+            }
+          }
+        }
+      }
+
+      // ── Wraith drain + ghost attacks ──
+      for (let ni = nightMobs.length - 1; ni >= 0; ni--) {
+        const nm = nightMobs[ni];
+        if (nm.state === 'dying') continue;
+        const wd = Math.sqrt((nm.x - px) ** 2 + (nm.z - pz) ** 2);
+        if (wd < GHOST_DRAIN_WRAITH + 3) {
+          let drained = 0;
+          const drainBudget = GHOST_DRAIN_RATE_WRAITH * dt;
+          for (let i = 0; i < GHOST_MAX && drained < drainBudget; i++) {
+            if (!_gbac[i]) continue;
+            if ((_gbx[i] - nm.x) ** 2 + (_gbz[i] - nm.z) ** 2 < GHOST_DRAIN_WRAITH * GHOST_DRAIN_WRAITH) {
+              _gbac[i] = 0; ghostBlobCount--; drained++;
+            }
+          }
+        }
+        if (wd < GHOST_ATTACK_RANGE) {
+          let nearBlobs = 0;
+          for (let i = 0; i < GHOST_MAX; i++) {
+            if (!_gbac[i]) continue;
+            if ((_gbx[i] - nm.x) ** 2 + (_gbz[i] - nm.z) ** 2 < GHOST_ATTACK_RANGE * GHOST_ATTACK_RANGE) nearBlobs++;
+            if (nearBlobs >= 10) break;
+          }
+          if (nearBlobs > 3) {
+            nm.hp -= GHOST_ATTACK_DPS * Math.min(nearBlobs / 10, 1.0) * dt;
+            nm.mesh.userData.headMat.emissiveIntensity = 3.0;
+            if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; }
+          }
+        }
+      }
+
+      // ── Shared cloud state (computed ONCE, not per blob) ──
+      const breath = 1.0 + Math.sin(t * GHOST_BREATH_RATE * Math.PI * 2) * GHOST_BREATH_AMP;
+      const playerGndY = getTerrainY(px, pz); // one terrain lookup for all blobs
+      const cw = windForSmoke(px, pz, py + 2, playerGndY, windTime);
+      const wdx = cw.dx * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR;
+      const wdz = cw.dz * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR;
+      const wdy = cw.dy * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR * 0.3;
+
+      // Shared curl sample at player center (6 simplex calls total, not per blob)
+      const _curlCenter = curlNoise3D(px, py + 2, pz, t, GHOST_CURL_SCALE, GHOST_CURL_SPEED);
+      // Pre-compute global hue shift
+      const _baseHueShift = Math.sin(t * 0.3) * 0.04;
+      // Reusable color object
+      const _gcTmp = { r: 0, g: 0, b: 0 };
+
+      // Pre-filter nearby obstacles (once)
+      const _nearBldg = [];
+      for (let bi = 0; bi < buildingAttractors.length; bi++) {
+        const ba = buildingAttractors[bi];
+        if (ba.destroyed) continue;
+        if ((ba.x - px) ** 2 + (ba.z - pz) ** 2 < (GHOST_OUTER_R + GHOST_OBS_RANGE + ba.r + 5) ** 2)
+          _nearBldg.push(ba);
+      }
+      const _nearTrees = [];
+      for (let ti = 0; ti < treePositions.length; ti++) {
+        if (windTrees[ti] && windTrees[ti].chopped) continue;
+        const tp = treePositions[ti];
+        if ((tp.x - px) ** 2 + (tp.z - pz) ** 2 < (GHOST_OUTER_R + 6) ** 2)
+          _nearTrees.push(tp);
+      }
+
+      // ── Update each blob ──
+      for (let i = 0; i < GHOST_MAX; i++) {
+        if (!_gbac[i]) {
+          _ghostDummy.position.set(0, -1000, 0);
+          _ghostDummy.scale.setScalar(0);
+          _ghostDummy.updateMatrix();
+          ghostCloud.setMatrixAt(i, _ghostDummy.matrix);
+          _ghostColors[i * 3] = 0; _ghostColors[i * 3 + 1] = 0; _ghostColors[i * 3 + 2] = 0;
+          continue;
+        }
+
+        // Formation target
+        const orbR = _gborbit[i] * breath;
+        const orbAngle = _gbphase[i] + t * (0.3 + _gblayer[i] * 0.5);
+        const tgtX = px + Math.cos(orbAngle) * orbR;
+        const tgtZ = pz + Math.sin(orbAngle) * orbR;
+        const yRange = _gblayer[i] === 0 ? 0.6 : 1.4;
+        const tgtY = py + 2.0 + Math.sin(_gbphase[i] * 3.7 + t * 0.8) * yRange * breath;
+
+        // Spring + shared curl + wind (no per-blob simplex calls)
+        let fx = (tgtX - _gbx[i]) * GHOST_SPRING + _curlCenter.x * GHOST_CURL_STR + wdx;
+        let fy = (tgtY - _gby[i]) * GHOST_SPRING + _curlCenter.y * GHOST_CURL_STR * 0.5 + wdy;
+        let fz = (tgtZ - _gbz[i]) * GHOST_SPRING + _curlCenter.z * GHOST_CURL_STR + wdz;
+
+        // Per-blob curl variation: cheap phase-offset of shared curl (no extra simplex)
+        const phOff = _gbphase[i];
+        const cSin = Math.sin(phOff), cCos = Math.cos(phOff);
+        fx += (_curlCenter.x * cCos - _curlCenter.z * cSin) * 0.8;
+        fz += (_curlCenter.x * cSin + _curlCenter.z * cCos) * 0.8;
+
+        // Obstacle avoidance (only for outer-layer blobs — core is shielded)
+        if (_gblayer[i] === 1) {
+          for (let bi = 0; bi < _nearBldg.length; bi++) {
+            const ba = _nearBldg[bi];
+            const odx = _gbx[i] - ba.x, odz = _gbz[i] - ba.z;
+            const od2 = odx * odx + odz * odz;
+            const thresh = ba.r + GHOST_OBS_RANGE;
+            if (od2 < thresh * thresh && od2 > 0.01) {
+              const od = Math.sqrt(od2);
+              const pen = 1.0 - od / thresh;
+              const push = GHOST_OBS_PUSH * pen * pen;
+              fx += (odx / od) * push + (-odz / od) * push * 0.7;
+              fz += (odz / od) * push + (odx / od) * push * 0.7;
+              if (_gby[i] < ba.y + 3) fy += push * 0.6;
+            }
+          }
+          for (let ti = 0; ti < _nearTrees.length; ti++) {
+            const tp = _nearTrees[ti];
+            const odx = _gbx[i] - tp.x, odz = _gbz[i] - tp.z;
+            const od2 = odx * odx + odz * odz;
+            if (od2 < 6.25 && od2 > 0.01) {
+              const od = Math.sqrt(od2);
+              const pen = 1.0 - od / 2.5;
+              const push = GHOST_OBS_PUSH * 0.4 * pen;
+              fx += (odx / od) * push + (-odz / od) * push * 0.5;
+              fz += (odz / od) * push + (odx / od) * push * 0.5;
+            }
+          }
+        }
+
+        // Integrate
+        _gbvx[i] = (_gbvx[i] + fx * dt) * GHOST_DAMP;
+        _gbvy[i] = (_gbvy[i] + fy * dt) * GHOST_DAMP;
+        _gbvz[i] = (_gbvz[i] + fz * dt) * GHOST_DAMP;
+        _gbx[i] += _gbvx[i] * dt;
+        _gby[i] += _gbvy[i] * dt;
+        _gbz[i] += _gbvz[i] * dt;
+
+        // Ground check: use player ground Y (blobs are close to player)
+        if (_gby[i] < playerGndY + 0.2) { _gby[i] = playerGndY + 0.2; _gbvy[i] = Math.max(0, _gbvy[i]); }
+
+        // Render
+        const shimmer = 0.9 + Math.sin(t * 4.0 + _gbphase[i] * 5) * 0.1;
+        const layerFade = _gblayer[i] === 0 ? 1.0 : 0.7;
+        _ghostDummy.position.set(_gbx[i], _gby[i], _gbz[i]);
+        _ghostDummy.scale.setScalar(_gbsz[i] * breath * shimmer * ghostFade * layerFade);
+        _ghostDummy.updateMatrix();
+        ghostCloud.setMatrixAt(i, _ghostDummy.matrix);
+
+        // Color: reuse inline HSV calc (no object allocation)
+        const hue = ((_gbhue[i] + _baseHueShift + Math.sin(t * 0.6 + _gbphase[i]) * 0.02) % 1 + 1) % 1;
+        const sat = _gblayer[i] === 0 ? 0.95 : 0.75;
+        const c = sat, x = c * (1 - Math.abs((hue * 6) % 2 - 1)), m = 1 - c;
+        const h6 = hue * 6;
+        let cr, cg, cb;
+        if (h6 < 1) { cr = c; cg = x; cb = 0; }
+        else if (h6 < 2) { cr = x; cg = c; cb = 0; }
+        else if (h6 < 3) { cr = 0; cg = c; cb = x; }
+        else if (h6 < 4) { cr = 0; cg = x; cb = c; }
+        else if (h6 < 5) { cr = x; cg = 0; cb = c; }
+        else { cr = c; cg = 0; cb = x; }
+        _ghostColors[i * 3] = cr + m;
+        _ghostColors[i * 3 + 1] = cg + m;
+        _ghostColors[i * 3 + 2] = cb + m;
+      }
+
+      ghostCloud.count = GHOST_MAX;
+      ghostCloud.instanceMatrix.needsUpdate = true;
+      ghostCloud.instanceColor.needsUpdate = true;
+      _ghostMat.emissiveIntensity = 2.5 + gp * 2.0;
+      _ghostMat.opacity = 0.85 + ghostFade * 0.1;
+
+      // ── Ghost lights: track core blobs ──
+      for (let li = 0; li < GHOST_LIGHT_COUNT; li++) {
+        const gl = ghostLights[li];
+        gl.light.visible = ghostFade > 0.1;
+        if (!gl.light.visible) continue;
+        if (gl.blobIdx < 0 || !_gbac[gl.blobIdx]) {
+          gl.blobIdx = -1;
+          const start = (Math.random() * GHOST_MAX) | 0;
+          for (let j = 0; j < GHOST_MAX; j++) {
+            const idx = (start + j) % GHOST_MAX;
+            if (_gbac[idx] && _gblayer[idx] === 0) { gl.blobIdx = idx; break; }
+          }
+          if (gl.blobIdx < 0) {
+            for (let j = 0; j < GHOST_MAX; j++) {
+              if (_gbac[(start + j) % GHOST_MAX]) { gl.blobIdx = (start + j) % GHOST_MAX; break; }
+            }
+          }
+        }
+        if (gl.blobIdx >= 0) {
+          const bi = gl.blobIdx;
+          const lr = 1 - Math.pow(0.005, dt);
+          gl.light.position.x += (_gbx[bi] - gl.light.position.x) * lr;
+          gl.light.position.y += (_gby[bi] - gl.light.position.y) * lr;
+          gl.light.position.z += (_gbz[bi] - gl.light.position.z) * lr;
+          const h = _gbhue[bi] + Math.sin(t * 1.0 + li * 2.1) * 0.05;
+          const c = hsvToColor(((h % 1) + 1) % 1, 0.8, 1.0);
+          gl.light.color.copy(c);
+          gl.light.intensity = (100 + Math.sin(t * 1.8 + li * 1.5) * 40) * ghostFade * gp;
+          gl.light.distance = 18 + gp * 8;
+        }
+      }
+
+      // ── Moon jump ──
+      if (ghostActive && keys[' '] && !playerAirborne) {
+        playerAirborne = true;
+        playerYVel = JUMP_VELOCITY;
+      }
+      if (playerAirborne) {
+        playerYVel -= MOON_GRAVITY * dt;
+        // Wind pushes player in the air — stronger with altitude
+        const airGndY = getTerrainY(playerGroup.position.x, playerGroup.position.z);
+        const airHag = Math.max(0, playerGroup.position.y - airGndY);
+        const airWindScale = Math.min(airHag / 8.0, 2.5); // ramps up with height, caps at 2.5x
+        const airWind = windForSmoke(playerGroup.position.x, playerGroup.position.z,
+                                     playerGroup.position.y, airGndY, windTime);
+        playerVelocity.x += airWind.dx * SMOKE_WIND_SPEED * airWindScale * dt * 0.8;
+        playerVelocity.z += airWind.dz * SMOKE_WIND_SPEED * airWindScale * dt * 0.8;
+        playerYVel += airWind.dy * SMOKE_WIND_SPEED * airWindScale * dt * 0.3;
+
+        playerGroup.position.y += playerYVel * dt;
+        const groundY = getExactTerrainY(playerGroup.position.x, playerGroup.position.z);
+        if (playerGroup.position.y <= groundY) {
+          playerGroup.position.y = groundY;
+          playerAirborne = false; playerYVel = 0; smoothedY = groundY;
+        }
+      }
+
+      playerNightLight.intensity = ghostFade * gp * 800;
+    }
 
     // ─────────────────────────────────────────
     const clock = new THREE.Clock();
@@ -5701,9 +6198,9 @@
       updateSmoke(dt);
       updateChimneySmoke(dt);
 
-      // Player mesh visibility — hide body at night, keep glow
-      const _isDeepNight = timeOfDay > 0.85 || timeOfDay < 0.20;
-      for (const part of playerBodyParts) part.visible = !_isDeepNight;
+      // Ghost cloud + player mesh visibility
+      updateGhostCloud(dt);
+      for (const part of playerBodyParts) part.visible = !ghostActive;
 
       // Camera
       updateCamera();
