@@ -238,9 +238,9 @@
     //  This replaces the SpotLight/PointLight pool for buildings.
     // ─────────────────────────────────────────
     const DEFERRED_MAX_LIGHTS = 128;
-    // Light data packed into a DataTexture: 2 texels per light
-    // texel 0: (x, y, z, intensity)  texel 1: (r, g, b, range)
-    const _dlTexWidth = DEFERRED_MAX_LIGHTS * 2;
+    // Light data packed into a DataTexture: 3 texels per light
+    // texel 0: (x, y, z, intensity)  texel 1: (r, g, b, range)  texel 2: (dirX, dirY, dirZ, cosConeAngle)
+    const _dlTexWidth = DEFERRED_MAX_LIGHTS * 3;
     const _dlData = new Float32Array(_dlTexWidth * 4); // RGBA per texel
     const _dlDataTex = new THREE.DataTexture(_dlData, _dlTexWidth, 1, THREE.RGBAFormat, THREE.FloatType);
     _dlDataTex.minFilter = THREE.NearestFilter;
@@ -325,11 +325,13 @@
 
           for (int i = 0; i < ${DEFERRED_MAX_LIGHTS}; i++) {
             if (i >= uLightCount) break;
-            // Read 2 texels per light from data texture
-            float t0 = (float(i * 2) + 0.5) * invW;
-            float t1 = (float(i * 2 + 1) + 0.5) * invW;
+            // Read 3 texels per light from data texture
+            float t0 = (float(i * 3) + 0.5) * invW;
+            float t1 = (float(i * 3 + 1) + 0.5) * invW;
+            float t2 = (float(i * 3 + 2) + 0.5) * invW;
             vec4 d0 = texture2D(tLights, vec2(t0, 0.5)); // xyz=pos, w=intensity
             vec4 d1 = texture2D(tLights, vec2(t1, 0.5)); // xyz=color, w=range
+            vec4 d2 = texture2D(tLights, vec2(t2, 0.5)); // xyz=coneDir, w=cosConeAngle
 
             vec3 toLight = d0.xyz - worldPos;
             float dist = length(toLight);
@@ -338,6 +340,16 @@
             vec3 lightDir = toLight / dist;
             float att = clamp(1.0 - dist / d1.w, 0.0, 1.0);
             att = att * att * d0.w / (dist * dist + 1.0);
+
+            // Cone attenuation — d2.w is cosConeAngle (> -0.99 means spot light)
+            float cosOuter = d2.w;
+            if (cosOuter > -0.99) {
+              vec3 coneDir = normalize(d2.xyz);
+              float cosAngle = dot(-lightDir, coneDir);
+              // Smooth falloff from inner (cosOuter + 0.15) to outer edge
+              float coneFade = smoothstep(cosOuter, cosOuter + 0.15, cosAngle);
+              att *= coneFade;
+            }
 
             float NdotL = max(dot(normal, lightDir), 0.0);
             vec3 halfDir = normalize(lightDir + viewDir);
@@ -361,9 +373,9 @@
 
     const _invProjView = new THREE.Matrix4();
     function deferredLightsClear() { _dlCount = 0; }
-    function deferredLightPush(x, y, z, r, g, b, intensity, range) {
+    function deferredLightPush(x, y, z, r, g, b, intensity, range, dirX, dirY, dirZ, cosCone) {
       if (_dlCount >= DEFERRED_MAX_LIGHTS) return;
-      const base = _dlCount * 2 * 4; // 2 texels × 4 channels (RGBA)
+      const base = _dlCount * 3 * 4; // 3 texels × 4 channels (RGBA)
       // Texel 0: position + intensity
       _dlData[base]     = x;
       _dlData[base + 1] = y;
@@ -374,15 +386,14 @@
       _dlData[base + 5] = g;
       _dlData[base + 6] = b;
       _dlData[base + 7] = range;
+      // Texel 2: cone direction + cosine of outer half-angle (-1 = point light)
+      _dlData[base + 8]  = dirX  !== undefined ? dirX  : 0;
+      _dlData[base + 9]  = dirY  !== undefined ? dirY  : 0;
+      _dlData[base + 10] = dirZ  !== undefined ? dirZ  : 0;
+      _dlData[base + 11] = cosCone !== undefined ? cosCone : -1; // -1 = omnidirectional
       _dlCount++;
     }
     function deferredLightsRender() {
-      _invProjView.copy(camera.projectionMatrix).multiply(camera.matrixWorldInverse);
-      _invProjView.invert();
-      _lightAccumMat.uniforms.uInvProjView.value.copy(_invProjView);
-      _lightAccumMat.uniforms.uCamPos.value.copy(camera.position);
-      _lightAccumMat.uniforms.uLightCount.value = _dlCount;
-
       if (_dlCount === 0) {
         renderer.render(scene, camera);
         return;
@@ -391,9 +402,16 @@
       // Upload light data texture
       _dlDataTex.needsUpdate = true;
 
-      // Render scene to FBO
+      // Render scene to FBO first — this updates camera.matrixWorldInverse
       renderer.setRenderTarget(_deferredColorTarget);
       renderer.render(scene, camera);
+
+      // Now compute inverse proj-view from the up-to-date camera matrices
+      _invProjView.copy(camera.projectionMatrix).multiply(camera.matrixWorldInverse);
+      _invProjView.invert();
+      _lightAccumMat.uniforms.uInvProjView.value.copy(_invProjView);
+      _lightAccumMat.uniforms.uCamPos.value.copy(camera.position);
+      _lightAccumMat.uniforms.uLightCount.value = _dlCount;
       // Composite — disable tone mapping to avoid double-apply
       const prevToneMapping = renderer.toneMapping;
       renderer.toneMapping = THREE.NoToneMapping;
@@ -833,6 +851,7 @@
       }
       group.userData.canopyMats = group.children.slice(1).map(c => c.material);
       group.userData.canopyH = trunkH + height * 0.35;
+      group.userData.trunkR = trunkR;
       return group;
     }
 
@@ -895,6 +914,7 @@
       }
       group.userData.canopyMats = group.children.slice(1).map(c => c.material);
       group.userData.canopyH = trunkH * 0.85 + height * 0.25;
+      group.userData.trunkR = trunkR;
       return group;
     }
 
@@ -927,6 +947,7 @@
       group.add(cone);
       group.userData.canopyMats = [coneMat];
       group.userData.canopyH = trunkH * 0.7 + coneH * 0.4;
+      group.userData.trunkR = trunkR;
       return group;
     }
 
@@ -1006,6 +1027,108 @@
       }
       group.userData.canopyMats = oakCanopyMats;
       group.userData.canopyH = trunkH + height * 0.25;
+      group.userData.trunkR = trunkR;
+      return group;
+    }
+
+    // Ancient giant tree — rare, massive trunk with buttress roots and sprawling canopy
+    function createAncientTree(height, palette) {
+      const group = new THREE.Group();
+      const trunkH = height * 0.4;
+      const trunkR = height * 0.09; // very thick trunk
+      // Main trunk — wide base tapering
+      const trunkGeo = new THREE.CylinderGeometry(trunkR * 0.55, trunkR * 1.4, trunkH, 8);
+      const trunkMat = new THREE.MeshStandardMaterial({
+        color: palette.trunk.clone().offsetHSL(0, -0.04, -0.08),
+        flatShading: true, roughness: 0.95
+      });
+      const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+      trunk.position.y = trunkH / 2;
+      trunk.castShadow = true;
+      group.add(trunk);
+
+      // Buttress roots — thick fins radiating from base
+      const rootCount = 4 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < rootCount; i++) {
+        const angle = (i / rootCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.4;
+        const rootLen = trunkR * (1.8 + Math.random() * 1.2);
+        const rootH = trunkH * (0.25 + Math.random() * 0.15);
+        const rootW = trunkR * (0.3 + Math.random() * 0.2);
+        const rootGeo = new THREE.BoxGeometry(rootW, rootH, rootLen);
+        const root = new THREE.Mesh(rootGeo, trunkMat);
+        root.position.set(
+          Math.cos(angle) * trunkR * 0.8,
+          rootH * 0.35,
+          Math.sin(angle) * trunkR * 0.8
+        );
+        root.rotation.y = angle;
+        root.rotation.x = 0.2 + Math.random() * 0.2; // roots angle outward/down
+        root.castShadow = true;
+        group.add(root);
+      }
+
+      // Major branches
+      const branchCount = 4 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < branchCount; i++) {
+        const angle = (i / branchCount) * Math.PI * 2 + Math.random() * 0.5;
+        const branchLen = height * (0.18 + Math.random() * 0.12);
+        const branchR = trunkR * (0.25 + Math.random() * 0.15);
+        const branchGeo = new THREE.CylinderGeometry(branchR * 0.3, branchR, branchLen, 5);
+        const branch = new THREE.Mesh(branchGeo, trunkMat);
+        branch.position.set(
+          Math.cos(angle) * trunkR * 0.4,
+          trunkH * (0.6 + Math.random() * 0.3),
+          Math.sin(angle) * trunkR * 0.4
+        );
+        branch.rotation.z = (0.4 + Math.random() * 0.5) * (Math.cos(angle) > 0 ? -1 : 1);
+        branch.rotation.y = angle;
+        branch.castShadow = true;
+        group.add(branch);
+      }
+
+      // Massive canopy — many large overlapping blobs
+      const blobCount = 5 + Math.floor(Math.random() * 4);
+      const ancientCanopyMats = [];
+      for (let b = 0; b < blobCount; b++) {
+        const blobR = height * (0.22 + Math.random() * 0.18);
+        let blobGeo = new THREE.IcosahedronGeometry(blobR, 1);
+        if (blobGeo.index) blobGeo = blobGeo.toNonIndexed();
+        const bp = blobGeo.attributes.position;
+        const seed = Math.random() * 100;
+        const ySquash = 0.4 + Math.random() * 0.15;
+        for (let vi = 0; vi < bp.count; vi += 3) {
+          const vx = bp.getX(vi), vz = bp.getZ(vi);
+          const n = 1 + simplex2(vx * 1.0 + seed, vz * 1.0) * 0.35;
+          for (let v = 0; v < 3; v++) {
+            bp.setX(vi + v, bp.getX(vi + v) * n * 1.3);
+            bp.setY(vi + v, bp.getY(vi + v) * ySquash);
+            bp.setZ(vi + v, bp.getZ(vi + v) * n * 1.3);
+          }
+        }
+        blobGeo.computeVertexNormals();
+        const blobMat = new THREE.MeshStandardMaterial({
+          color: palette.tree.clone().offsetHSL(
+            (Math.random() - 0.5) * 0.06,
+            Math.random() * 0.06,
+            (Math.random() - 0.5) * 0.1
+          ),
+          flatShading: true
+        });
+        const blob = new THREE.Mesh(blobGeo, blobMat);
+        ancientCanopyMats.push(blobMat);
+        const spreadAngle = Math.random() * Math.PI * 2;
+        const spreadDist = height * (0.08 + Math.random() * 0.2);
+        blob.position.set(
+          Math.cos(spreadAngle) * spreadDist,
+          trunkH + blobR * 0.25 + Math.random() * height * 0.12,
+          Math.sin(spreadAngle) * spreadDist
+        );
+        blob.castShadow = true;
+        group.add(blob);
+      }
+      group.userData.canopyMats = ancientCanopyMats;
+      group.userData.canopyH = trunkH + height * 0.3;
+      group.userData.trunkR = trunkR * 1.4;
       return group;
     }
 
@@ -1036,6 +1159,7 @@
         branch.castShadow = true;
         group.add(branch);
       }
+      group.userData.trunkR = trunkR;
       return group;
     }
 
@@ -1112,10 +1236,14 @@
             if (face === 0) {
               // +Z face
               pane.position.set(spanOff, yOff, d / 2 + 0.02);
-            } else {
+            } else if (face === 1) {
               // +X face
-              pane.position.set(faceAxis / 2 + 0.02, yOff, spanOff);
+              pane.position.set(w / 2 + 0.02, yOff, spanOff);
               pane.rotation.y = Math.PI / 2;
+            } else {
+              // -X face
+              pane.position.set(-(w / 2 + 0.02), yOff, spanOff);
+              pane.rotation.y = -Math.PI / 2;
             }
             group.add(pane);
           }
@@ -1153,6 +1281,8 @@
     // Collision boxes for daytime player collision — oriented bounding boxes
     // { cx, cz, hw, hd, cosR, sinR } — center, half-widths in local axes, rotation
     const collisionBoxes = [];
+    // Tree trunk colliders — circular cylinders { x, z, r }
+    const trunkColliders = [];
     // Tree canopy attractors — smoke drawn to canopies, which glow on consumption
     const canopyAttractors = []; // { x, y, z, r, mats[], glowIntensity, glowColor }
 
@@ -1181,12 +1311,15 @@
         const winY = wy + dims.h * 0.45; // mid-window height
         // Match wind face transform convention exactly
         const windowLights = [
-          // +Z face (nx=-sinR, nz=cosR) — offset outward along normal
-          { x: wcx - (dims.d/2 + 0.8)*sinR, z: wcz + (dims.d/2 + 0.8)*cosR, y: winY },
-          // +X face (nx=cosR, nz=sinR) — offset outward along normal
-          { x: wcx + (dims.w/2 + 0.8)*cosR, z: wcz + (dims.w/2 + 0.8)*sinR, y: winY },
-          // -X face (nx=-cosR, nz=-sinR) — offset outward along normal
-          { x: wcx - (dims.w/2 + 0.8)*cosR, z: wcz - (dims.w/2 + 0.8)*sinR, y: winY },
+          // +Z face — local (0,0,1) → world (sinR, 0, cosR)
+          { x: wcx + (dims.d/2 + 0.8)*sinR, z: wcz + (dims.d/2 + 0.8)*cosR, y: winY,
+            nx: sinR, ny: -0.3, nz: cosR },
+          // +X face — local (1,0,0) → world (cosR, 0, -sinR)
+          { x: wcx + (dims.w/2 + 0.8)*cosR, z: wcz - (dims.w/2 + 0.8)*sinR, y: winY,
+            nx: cosR, ny: -0.3, nz: -sinR },
+          // -X face — local (-1,0,0) → world (-cosR, 0, sinR)
+          { x: wcx - (dims.w/2 + 0.8)*cosR, z: wcz + (dims.w/2 + 0.8)*sinR, y: winY,
+            nx: -cosR, ny: -0.3, nz: sinR },
         ];
         buildingAttractors.push({
           x: center.x + bx,
@@ -1621,21 +1754,24 @@
       const pal = inKingdomB ? PALETTE.B : PALETTE.A;
 
       if (inKingdomB) {
-        // Kingdom B: mostly pines & cypress, some dead
-        if (roll < 0.55)      tree = createPineTree(height, PALETTE.B);
+        // Kingdom B: mostly pines & cypress, some dead, rare ancients
+        if (height > 32 && roll < 0.08) tree = createAncientTree(height * 1.6, PALETTE.B);
+        else if (roll < 0.55)      tree = createPineTree(height, PALETTE.B);
         else if (roll < 0.80) tree = createCypressTree(height * 0.9, PALETTE.B);
         else if (roll < 0.92) tree = createBroadleafTree(height * 0.8, PALETTE.B);
         else                  tree = createDeadTree(height * 0.6, PALETTE.B);
       } else if (inKingdomA) {
-        // Kingdom A: mostly broadleaf & oaks, some others
-        if (roll < 0.40)      tree = createBroadleafTree(height, PALETTE.A);
+        // Kingdom A: mostly broadleaf & oaks, some others, rare ancients
+        if (height > 30 && roll < 0.10) tree = createAncientTree(height * 1.6, PALETTE.A);
+        else if (roll < 0.40)      tree = createBroadleafTree(height, PALETTE.A);
         else if (roll < 0.60) tree = createOakTree(height * 1.1, PALETTE.A);
         else if (roll < 0.80) tree = createPineTree(height * 0.85, PALETTE.A);
         else if (roll < 0.93) tree = createCypressTree(height * 0.75, PALETTE.A);
         else                  tree = createDeadTree(height * 0.55, PALETTE.A);
       } else {
-        // Wilderness — full mix
-        if (roll < 0.25)      tree = createPineTree(height, pal);
+        // Wilderness — full mix, rare ancients
+        if (height > 28 && roll < 0.06) tree = createAncientTree(height * 1.8, pal);
+        else if (roll < 0.25)      tree = createPineTree(height, pal);
         else if (roll < 0.50) tree = createBroadleafTree(height, pal);
         else if (roll < 0.65) tree = createOakTree(height * 1.05, pal);
         else if (roll < 0.80) tree = createCypressTree(height * 0.85, pal);
@@ -1655,10 +1791,14 @@
         phase: Math.random() * Math.PI * 2,    // unique phase offset
         flex: (0.6 + Math.random() * 0.8) / Math.max(height, 12), // smaller trees flex more
         wx: x, wz: z,                           // world position for wind field lookup
-        height: height                           // original tree height (for durability)
+        height: height,                          // original tree height (for durability)
+        trunkR: (tree.userData.trunkR || height * 0.025) * scaleVar // collision radius
       });
+      // Register trunk collider for hard collision
+      const tColR = (tree.userData.trunkR || height * 0.025) * scaleVar;
+      trunkColliders.push({ x: x, z: z, r: tColR });
       // Soft wind blocker — radius scales with canopy size, strength with density
-      windInfluencers.push({ x, z, type: 0, radius: height * 0.22, strength: 0.32 + density * 0.22, height, groundY: y });
+      windInfluencers.push({ x, z, type: 0, radius: height * 0.22, strength: 0.12 + density * 0.10, height, groundY: y });
       // Register canopy as smoke attractor (if tree has foliage)
       if (tree.userData.canopyMats && tree.userData.canopyMats.length > 0) {
         canopyAttractors.push({
@@ -2503,6 +2643,29 @@
     let _playerTrampAccum = 0;
     let playerFacingAngle = 0;
 
+    // Resolve player vs tree trunk collision — circular push-out
+    function resolvePlayerTrunkCollisions() {
+      const px = playerGroup.position.x, pz = playerGroup.position.z;
+      for (let i = 0, len = trunkColliders.length; i < len; i++) {
+        const tc = trunkColliders[i];
+        const dx = px - tc.x, dz = pz - tc.z;
+        const d2 = dx * dx + dz * dz;
+        const minDist = tc.r + 0.4; // player radius ~0.4
+        if (d2 >= minDist * minDist || d2 < 0.0001) continue;
+        const d = Math.sqrt(d2);
+        const nx = dx / d, nz = dz / d;
+        const pen = minDist - d;
+        playerGroup.position.x += nx * pen;
+        playerGroup.position.z += nz * pen;
+        // Kill velocity into trunk
+        const vDot = playerVelocity.x * nx + playerVelocity.z * nz;
+        if (vDot < 0) {
+          playerVelocity.x -= vDot * nx;
+          playerVelocity.z -= vDot * nz;
+        }
+      }
+    }
+
     // Resolve player vs OBB collision — push player out of overlapping boxes
     function resolvePlayerBuildingCollisions() {
       for (let i = 0, len = collisionBoxes.length; i < len; i++) {
@@ -2595,6 +2758,8 @@
       // Daytime building/wall collision — player is solid during the day
       if (timeOfDay > 0.25 && timeOfDay < 0.75) {
         resolvePlayerBuildingCollisions();
+        // Tree trunk collision — always active (trunks are always solid)
+        resolvePlayerTrunkCollisions();
       }
 
       // Player trampling
@@ -3708,6 +3873,7 @@
     const SMOKE_WIND_SPEED  = 20;   // world units per second per unit wind
 
     // ── Building glow decay + deferred light push (runs every frame, even with smoke off) ──
+    const _warmWinTmp = new THREE.Color();
     function updateBuildingLights(dt) {
       deferredLightsClear();
       const MAX_DRAIN_TIME = 0.250 / CYCLE_SPEED;
@@ -3736,8 +3902,9 @@
 
           // Apply time-of-day fade to visible glow
           const visGlow = ba.glowIntensity * lightsFade;
+          const warmWinColor = _warmWinTmp.set(1.0, 0.85, 0.4);
           for (let mi = 0; mi < ba.windowMats.length; mi++) {
-            ba.windowMats[mi].color.copy(ba.glowColor).multiplyScalar(visGlow);
+            ba.windowMats[mi].color.copy(warmWinColor).multiplyScalar(visGlow);
           }
           // One light per windowed wall face, offset outward from the building
           if (visGlow > 0.01) {
@@ -3748,7 +3915,9 @@
                   wl[wi].x, wl[wi].y, wl[wi].z,
                   1.0, 0.85, 0.4,    // warm yellow
                   visGlow * 12.0,
-                  15 + visGlow * 10
+                  1500 + visGlow * 10,
+                  wl[wi].nx, wl[wi].ny, wl[wi].nz,
+                  0.35  // cos(~70°) — cone half-angle for window light
                 );
               }
             }
@@ -4952,12 +5121,15 @@
               // Register smoke attractor
               const winY = bgy + bh * 0.45;
               const nwl = [
-                // +Z face
-                { x: npc.siteX - (bd/2+0.8)*sR, z: npc.siteZ + (bd/2+0.8)*cR, y: winY },
-                // +X face
-                { x: npc.siteX + (bw/2+0.8)*cR, z: npc.siteZ + (bw/2+0.8)*sR, y: winY },
-                // -X face
-                { x: npc.siteX - (bw/2+0.8)*cR, z: npc.siteZ - (bw/2+0.8)*sR, y: winY },
+                // +Z face — local (0,0,1) → world (sR, 0, cR)
+                { x: npc.siteX + (bd/2+0.8)*sR, z: npc.siteZ + (bd/2+0.8)*cR, y: winY,
+                  nx: sR, ny: -0.3, nz: cR },
+                // +X face — local (1,0,0) → world (cR, 0, -sR)
+                { x: npc.siteX + (bw/2+0.8)*cR, z: npc.siteZ - (bw/2+0.8)*sR, y: winY,
+                  nx: cR, ny: -0.3, nz: -sR },
+                // -X face — local (-1,0,0) → world (-cR, 0, sR)
+                { x: npc.siteX - (bw/2+0.8)*cR, z: npc.siteZ + (bw/2+0.8)*sR, y: winY,
+                  nx: -cR, ny: -0.3, nz: sR },
               ];
               buildingAttractors.push({
                 x: npc.siteX, y: bgy + bh * 0.5, z: npc.siteZ,
@@ -6275,7 +6447,7 @@
     const GHOST_CURL_STR = 6;      // curl-noise swirl intensity
     const GHOST_CURL_SCALE = 1;    // spatial frequency of swirl
     const GHOST_CURL_SPEED = 0.3;    // swirl time evolution
-    const GHOST_WIND_FACTOR = 1.5;   // wind push on cloud
+    const GHOST_WIND_FACTOR = 0.25;   // wind push on cloud
     const GHOST_BREATH_RATE = 0.4;   // breathing frequency (Hz)
     const GHOST_BREATH_AMP = 0.2;   // breathing expansion fraction
     const GHOST_OBS_RANGE = 4.0;     // obstacle avoidance trigger
@@ -6290,8 +6462,8 @@
     const GHOST_LIGHT_COUNT = 1;
 
     // Moon jump
-    const MOON_GRAVITY = 4;
-    const JUMP_VELOCITY = 20.0;
+    const MOON_GRAVITY = 7;
+    const JUMP_VELOCITY = 50.0;
     let playerYVel = 0;
     let playerAirborne = false;
     let _jumpLaunchFrame = false;
@@ -6339,7 +6511,7 @@
     const GHOST_LIGHT_HUES = [0.72, 0.62, 0.82];
     const ghostLights = [];
     for (let i = 0; i < GHOST_LIGHT_COUNT; i++) {
-      const gl = new THREE.PointLight(0x8844ff, 0, 22, 2);
+      const gl = new THREE.PointLight(0x8844ff, 0, 200, 0.5);
       gl.visible = false;
       scene.add(gl);
       ghostLights.push({ light: gl, blobIdx: -1, baseHue: GHOST_LIGHT_HUES[i] });
@@ -6537,8 +6709,10 @@
       for (let ti = 0; ti < treePositions.length; ti++) {
         if (windTrees[ti] && windTrees[ti].chopped) continue;
         const tp = treePositions[ti];
-        if ((tp.x - px) ** 2 + (tp.z - pz) ** 2 < (GHOST_OUTER_R + 6) ** 2)
-          _nearTrees.push(tp);
+        const tr = windTrees[ti] ? windTrees[ti].trunkR : 0.8;
+        const gatherR = GHOST_OUTER_R + tr + 6;
+        if ((tp.x - px) ** 2 + (tp.z - pz) ** 2 < gatherR * gatherR)
+          _nearTrees.push({ x: tp.x, y: tp.y, z: tp.z, trunkR: tr });
       }
 
       // ── Update each blob ──
@@ -6612,21 +6786,15 @@
           const tp = _nearTrees[ti];
           const odx = _gbx[i] - tp.x, odz = _gbz[i] - tp.z;
           const od2 = odx * odx + odz * odz;
-          // Trunk collision — tight radius (0.8), hard push
-          const TRUNK_R = 0.8;
-          const TRUNK_AVOID_R = TRUNK_R + 1.5; // start pushing at 2.3 units
+          const tR = tp.trunkR;
+          const TRUNK_AVOID_R = tR + 2.5; // soft push starts outside trunk
           if (od2 < TRUNK_AVOID_R * TRUNK_AVOID_R && od2 > 0.01) {
             const od = Math.sqrt(od2);
             const pen = 1.0 - od / TRUNK_AVOID_R;
-            // Strong repulsion that ramps up sharply near trunk surface
-            const push = GHOST_OBS_PUSH * pen * pen * 2.0;
-            fx += (odx / od) * push;
-            fz += (odz / od) * push;
-            // Hard clamp — if inside trunk, teleport out
-            if (od < TRUNK_R) {
-              _gbx[i] = tp.x + (odx / od) * TRUNK_R;
-              _gbz[i] = tp.z + (odz / od) * TRUNK_R;
-            }
+            const push = GHOST_OBS_PUSH * pen * pen * 4.0;
+            fx += (odx / od) * push + (-odz / od) * push * 0.5;
+            fz += (odz / od) * push + (odx / od) * push * 0.5;
+            if (_gby[i] < tp.y + tR * 4) fy += push * 0.4;
           }
         }
 
@@ -6638,6 +6806,26 @@
         _gbx[i] += _gbvx[i] * dt;
         _gby[i] += _gbvy[i] * dt;
         _gbz[i] += _gbvz[i] * dt;
+
+        // Hard trunk clamp — enforce after integration so nothing penetrates
+        for (let ti = 0; ti < _nearTrees.length; ti++) {
+          const tp = _nearTrees[ti];
+          const cdx = _gbx[i] - tp.x, cdz = _gbz[i] - tp.z;
+          const cd2 = cdx * cdx + cdz * cdz;
+          const minR = tp.trunkR + 0.3;
+          if (cd2 < minR * minR && cd2 > 0.0001) {
+            const cd = Math.sqrt(cd2);
+            const nx = cdx / cd, nz = cdz / cd;
+            _gbx[i] = tp.x + nx * minR;
+            _gbz[i] = tp.z + nz * minR;
+            // Kill inward velocity, keep tangential
+            const vDot = _gbvx[i] * nx + _gbvz[i] * nz;
+            if (vDot < 0) {
+              _gbvx[i] -= vDot * nx;
+              _gbvz[i] -= vDot * nz;
+            }
+          }
+        }
 
         // Ground check: use player ground Y (blobs are close to player)
         if (_gby[i] < playerGndY + 0.2) { _gby[i] = playerGndY + 0.2; _gbvy[i] = Math.max(0, _gbvy[i]); }
@@ -6702,8 +6890,8 @@
           const c = hsvToColor(((h % 1) + 1) % 1, 0.85, 0.6);
           gl.light.color.copy(c);
           const blobRatio = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
-          gl.light.intensity = (1000 + Math.sin(t * 1.8 + li * 1.5) * 50) * ghostFade * gp * blobRatio;
-          gl.light.distance = 100000000 + gp * 50;
+          gl.light.intensity = (200 + Math.sin(t * 1.8 + li * 1.5) * 100) * ghostFade * gp * blobRatio;
+          gl.light.distance = 400 + gp * 80;
         }
       }
 
@@ -6719,7 +6907,7 @@
 
         // Space while already airborne = dive downward (skip launch frame)
         if (keys[' '] && !_jumpLaunchFrame) {
-          playerYVel -= 12.0 * dt;
+          playerYVel -= 120.0 * dt;
         }
         _jumpLaunchFrame = false;
 
