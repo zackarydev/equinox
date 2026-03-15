@@ -2749,7 +2749,14 @@
         if (!playerAirborne) {
           playerVelocity.lerp(new THREE.Vector3(0, 0, 0), decelSmooth);
         }
-        // Airborne with no input: velocity persists (no drag toward zero)
+        // Ghost idle drift — wind pushes the ghost when no input
+        if (ghostActive && !playerAirborne) {
+          const gw = getWindDebug(playerGroup.position.x, playerGroup.position.y + 2,
+                                   playerGroup.position.z, windTime);
+          const driftStr = SMOKE_WIND_SPEED * 1.25;
+          playerVelocity.x += (gw.dx * driftStr - playerVelocity.x) * Math.min(1, 2.0 * dt);
+          playerVelocity.z += (gw.dz * driftStr - playerVelocity.z) * Math.min(1, 2.0 * dt);
+        }
       }
 
       playerGroup.position.x += playerVelocity.x * dt;
@@ -6861,40 +6868,6 @@
       _ghostMat.emissiveIntensity = 0.3 + gp * 0.4;
       _ghostMat.opacity = 0.85 + ghostFade * 0.1;
 
-      // ── Ghost lights: track core blobs ──
-      for (let li = 0; li < GHOST_LIGHT_COUNT; li++) {
-        const gl = ghostLights[li];
-        gl.light.visible = ghostFade > 0.1;
-        if (!gl.light.visible) continue;
-        if (gl.blobIdx < 0 || !_gbac[gl.blobIdx]) {
-          gl.blobIdx = -1;
-          const start = (Math.random() * GHOST_MAX) | 0;
-          for (let j = 0; j < GHOST_MAX; j++) {
-            const idx = (start + j) % GHOST_MAX;
-            if (_gbac[idx] && _gblayer[idx] === 0) { gl.blobIdx = idx; break; }
-          }
-          if (gl.blobIdx < 0) {
-            for (let j = 0; j < GHOST_MAX; j++) {
-              if (_gbac[(start + j) % GHOST_MAX]) { gl.blobIdx = (start + j) % GHOST_MAX; break; }
-            }
-          }
-        }
-        if (gl.blobIdx >= 0) {
-          const bi = gl.blobIdx;
-          const lr = 1 - Math.pow(0.005, dt);
-          gl.light.position.x += (_gbx[bi] - gl.light.position.x) * lr;
-          gl.light.position.y += (_gby[bi] - gl.light.position.y) * lr;
-          gl.light.position.z += (_gbz[bi] - gl.light.position.z) * lr;
-          // Each light uses its own deep blue/purple hue with gentle drift
-          const h = gl.baseHue + Math.sin(t * 0.7 + li * 1.7) * 0.04;
-          const c = hsvToColor(((h % 1) + 1) % 1, 0.85, 0.6);
-          gl.light.color.copy(c);
-          const blobRatio = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
-          gl.light.intensity = (200 + Math.sin(t * 1.8 + li * 1.5) * 100) * ghostFade * gp * blobRatio;
-          gl.light.distance = 400 + gp * 80;
-        }
-      }
-
       // ── Moon jump ──
       if (ghostActive && keys[' '] && !playerAirborne) {
         playerAirborne = true;
@@ -6935,6 +6908,47 @@
         if (playerGroup.position.y <= groundY) {
           playerGroup.position.y = groundY;
           playerAirborne = false; playerYVel = 0; smoothedY = groundY;
+        }
+      }
+
+
+      // ── Ghost lights: track core blobs ──
+      for (let li = 0; li < GHOST_LIGHT_COUNT; li++) {
+        const gl = ghostLights[li];
+        gl.light.visible = ghostFade > 0.1;
+        if (!gl.light.visible) continue;
+        if (gl.blobIdx < 0 || !_gbac[gl.blobIdx]) {
+          gl.blobIdx = -1;
+          const start = (Math.random() * GHOST_MAX) | 0;
+          for (let j = 0; j < GHOST_MAX; j++) {
+            const idx = (start + j) % GHOST_MAX;
+            if (_gbac[idx] && _gblayer[idx] === 0) { gl.blobIdx = idx; break; }
+          }
+          if (gl.blobIdx < 0) {
+            for (let j = 0; j < GHOST_MAX; j++) {
+              if (_gbac[(start + j) % GHOST_MAX]) { gl.blobIdx = (start + j) % GHOST_MAX; break; }
+            }
+          }
+        }
+        if (gl.blobIdx >= 0) {
+          const bi = gl.blobIdx;
+          const lr = 1 - Math.pow(0.005, dt);
+          gl.light.position.x += (_gbx[bi] - gl.light.position.x) * lr;
+          gl.light.position.y += (_gby[bi] - gl.light.position.y) * lr;
+          gl.light.position.z += (_gbz[bi] - gl.light.position.z) * lr;
+          // Each light uses its own deep blue/purple hue with gentle drift
+          const h = gl.baseHue + Math.sin(t * 0.7 + li * 1.7) * 0.04;
+          const c = hsvToColor(((h % 1) + 1) % 1, 0.85, 0.6);
+          gl.light.color.copy(c);
+          const blobRatio = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
+
+          if (playerAirborne) {
+            gl.light.intensity = (100 + Math.sin(t * 1.8 + li * 1.5) * 50) * ghostFade * gp * blobRatio;
+            gl.light.distance = 200 + gp * 80;  
+          } else {
+            gl.light.intensity = (100 + Math.sin(t * 1.8 + li * 1.5) * 50) * ghostFade * gp * blobRatio;
+            gl.light.distance = 400 + gp * 80;
+          }
         }
       }
 
