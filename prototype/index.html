@@ -1330,7 +1330,7 @@
           windowLights: windowLights,
           glowIntensity: 0,
           glowColor: new THREE.Color(0, 0, 0),
-          charge: 10.0,        // accumulated smoke charge (0–1)
+          charge: 1.0 + Math.random() * 3,        // accumulated smoke charge (1-4)
           chargeMax: 10.0,    // 1.0 = fully charged = 3 in-game hours of glow
           hearth: Math.random() < 0.35
             ? (0.3 + Math.random() * 0.7) * Math.min(1, (dims.w * dims.d) / 20)
@@ -3562,31 +3562,28 @@
       else chimDim = 0.12; // very faint at night
       chimMat.uniforms.uDimFactor.value = chimDim;
 
-      // Spawn — all non-contaminated homes emit chimney smoke.
-      // Emission rate scales with charge: uncharged = gentle wisps, fully charged = thick plumes.
-      // Hearth score adds a bonus on top.
+      // Spawn — each building's hearth score drives emission rate
+      // hearth 0.3 → ~1 puff/s, hearth 1.0 → ~4 puffs/s
       _chimSpawnT += dt;
       if (dayActive && _chimSpawnT >= 0.10) {
         _chimSpawnT = 0;
         for (let bi = 0; bi < buildingAttractors.length; bi++) {
           const b = buildingAttractors[bi];
-          if (b.contaminated || b.destroyed) continue;
-          // Base emission from charge (0..1), plus hearth bonus
-          const emitStr = 0.15 + b.charge * 0.65 + (b.hearth || 0) * 0.2;
-          // Emission probability scales with emit strength
-          if (Math.random() > emitStr * 0.4) continue;
+          if (b.hearth <= 0) continue;
+          // Emission probability scales with hearth score
+          if (Math.random() > b.hearth * 0.4) continue;
           const ci = _chimHead;
           _chimHead = (_chimHead + 1) % CHIM_MAX;
           _cx[ci] = b.x + (Math.random() - 0.5) * 0.6;
           _cy[ci] = b.roofY + 0.5 + Math.random() * 0.3;
           _cz[ci] = b.z + (Math.random() - 0.5) * 0.6;
           _cvx[ci] = (Math.random() - 0.5) * 0.3;
-          _cvy[ci] = (0.3 + emitStr * 0.7) + Math.random() * 0.4;
+          _cvy[ci] = (0.5 + b.hearth * 0.5) + Math.random() * 0.4;
           _cvz[ci] = (Math.random() - 0.5) * 0.3;
           _cli[ci] = 0;
-          _cml[ci] = 3.0 + emitStr * 4.0 + Math.random() * 3.0;
+          _cml[ci] = 4.0 + b.hearth * 3.0 + Math.random() * 3.0;
           _cac[ci] = 1;
-          _cgS[ci] = (0.2 + emitStr * 0.5); // start size scales with emission
+          _cgS[ci] = (0.3 + b.hearth * 0.4); // start size scales with hearth
         }
       }
 
@@ -3849,23 +3846,6 @@
           dy += simplex2(wx * 0.12 + t * 0.4 + bi, wz * 0.12) * proximity * 0.4;
         }
 
-        // ── Chimney suction: strong downward pull above roofline ──
-        // Mirrors getWindDebug §6b chimney — pulls smoke from sky into building
-        const _roofTop = ba.y + ba.r;
-        const _aboveRoof = wy - _roofTop;
-        const _CHIMNEY_H = 50.0;
-        const _CHIMNEY_HORIZ = 6.0;
-        const _CHIMNEY_PULL = 18.0;
-        if (_aboveRoof > 0 && od < _CHIMNEY_HORIZ) {
-          const _hF = 1.0 - od / _CHIMNEY_HORIZ;
-          const _cF = _aboveRoof < _CHIMNEY_H
-            ? 1.0 - (_aboveRoof / _CHIMNEY_H) * 0.5
-            : Math.exp(-(_aboveRoof - _CHIMNEY_H) * 0.3);
-          const _sStr = _hF * _hF * _cF * _CHIMNEY_PULL;
-          dy -= _sStr;
-          bx += (-odx * invOd) * _sStr * 0.4;
-          bz += (-odz * invOd) * _sStr * 0.4;
-        }
       }
 
       _swBuf.dx = bx;
@@ -3942,13 +3922,9 @@
 
     function updateSmoke(dt) {
       if (!smokeVisible) return;
-      const px = playerGroup.position.x, pz = playerGroup.position.z;
-      // Spawn — rate scales with night glow and ghost blob count
-      // More blobs alive = more trail. No blobs = no trail.
+      // Spawn — rate scales with night glow (no smoke during bright day/full moon)
       const glowVal = smokeMat.uniforms.uNightGlow.value;
-      const blobFrac = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
-      const trailMult = ghostActive ? Math.max(0.05, blobFrac) : 1.0; // day = full trail
-      const effectiveRate = (glowVal < 0.01 ? Infinity : SMOKE_SPAWN_RATE / glowVal) / trailMult;
+      const effectiveRate = glowVal < 0.01 ? Infinity : SMOKE_SPAWN_RATE / glowVal;
       _smokeSpawnT += dt;
       if (_smokeSpawnT >= effectiveRate) {
         _smokeSpawnT = 0;
@@ -3975,66 +3951,21 @@
         const life = _sli[i];
 
         // Sample wind — smoke is carried more strongly as it cools and slows
-        const w    = windForSmoke(_sx[i], _sz[i], _sy[i], getTerrainY(_sx[i], _sz[i]), windTime);
+        const w    = windForSmoke(_sx[i], _sz[i], _sy[i], groundRef, windTime);
         const drag = Math.min(life * 1.2, 1.0); // 0 = own momentum, 1 = wind-controlled
 
-        // Steer horizontal velocity toward ambient wind (stronger pull)
-        _svx[i] += (w.dx * SMOKE_WIND_SPEED - _svx[i]) * drag * dt * 3.5;
-        _svz[i] += (w.dz * SMOKE_WIND_SPEED - _svz[i]) * drag * dt * 3.5;
+        // Steer horizontal velocity toward ambient wind
+        _svx[i] += (w.dx * SMOKE_WIND_SPEED - _svx[i]) * drag * dt * 2.0;
+        _svz[i] += (w.dz * SMOKE_WIND_SPEED - _svz[i]) * drag * dt * 2.0;
         // Vertical wind steering — turbulence, slope updrafts, object deflection
-        _svy[i] += w.dy * SMOKE_WIND_SPEED * 0.7 * drag * dt;
-
-        // ── Building attraction: structures pull in nearby smoke ──
-        // Smoke trail is strongly drawn to buildings
-        const ATTRACT_RANGE = 35;
-        const ATTRACT_STRENGTH = 12.0;
-        const windSpeed = Math.sqrt(w.dx * w.dx + w.dz * w.dz) * SMOKE_WIND_SPEED;
-        // Wind suppression is gentler — smoke is attracted even in moderate wind
-        const windSuppression = Math.max(0.15, 1.0 - (windSpeed - 6.0) / 14.0);
-
-        let nearDist2 = ATTRACT_RANGE * ATTRACT_RANGE;
-        let nearIdx = -1;
-        for (let bi = 0; bi < buildingAttractors.length; bi++) {
-          const ba = buildingAttractors[bi];
-          const adx = ba.x - _sx[i], adz = ba.z - _sz[i];
-          const d2 = adx * adx + adz * adz;
-          if (d2 < nearDist2) { nearDist2 = d2; nearIdx = bi; }
-        }
-        if (nearIdx >= 0 && windSuppression > 0.01) {
-          const ba = buildingAttractors[nearIdx];
-          const adx = ba.x - _sx[i], ady = ba.y - _sy[i], adz = ba.z - _sz[i];
-          const dist = Math.sqrt(nearDist2);
-          // Attraction ramps up closer, but modulated by wind calm
-          const pull = ATTRACT_STRENGTH * (1.0 - dist / ATTRACT_RANGE) * windSuppression;
-          const invD = 1.0 / (dist + 0.5);
-          _svx[i] += adx * invD * pull * dt;
-          _svy[i] += ady * invD * pull * 1.5 * dt;
-          _svz[i] += adz * invD * pull * dt;
-          // Consume only when wind is calm enough for smoke to actually reach
-          if (dist < ba.r && windSuppression > 0.3) {
-            _sli[i] = Math.max(_sli[i], 0.88);
-            // Light up windows with the smoke's neon hue
-            if (ba.windowMats.length > 0) {
-              const pHash = Math.abs(Math.sin(_sx[i] * 127.1 + _sz[i] * 311.7) * 43758.5453) % 1;
-              let pHue;
-              if (pHash > 0.88) pHue = 0.28 + (pHash - 0.88) * 1.5;
-              else pHue = 0.58 + (pHash / 0.88) * 0.30;
-              // Warm-tinted window glow: neon hue blended toward amber
-              const neonCol = hsvToColor(pHue, 0.8, 1.0);
-              const warmCol = new THREE.Color(1.0, 0.85, 0.5);
-              neonCol.lerp(warmCol, 0.5);
-              // Accumulate charge — each particle adds a small amount
-              ba.charge = Math.min(ba.charge + 0.08, ba.chargeMax);
-              ba.glowIntensity = Math.min(ba.charge * 1.2, 1.0);
-              ba.glowColor.lerp(neonCol, 0.3);
-            }
-          }
-        }
+        _svy[i] += w.dy * SMOKE_WIND_SPEED * 0.5 * drag * dt;
 
         // ── Canopy attraction: tree canopies pull in nearby smoke ──
         // Weaker than buildings, but trees glow when they consume smoke
         const CANOPY_RANGE = 20;
         const CANOPY_STRENGTH = 2.5;
+        const windSpeed = Math.sqrt(w.dx * w.dx + w.dz * w.dz) * SMOKE_WIND_SPEED;
+        const windSuppression = Math.max(0, 1.0 - (windSpeed - 4.0) / 10.0);
         const cnResult = findNearestCanopy(_sx[i], _sz[i], CANOPY_RANGE);
         if (cnResult.idx >= 0 && windSuppression > 0.01) {
           const ca = canopyAttractors[cnResult.idx];
@@ -4071,11 +4002,14 @@
         _sz[i] += _svz[i] * dt;
 
         // Opacity: snappy fade-in, long plateau, graceful fade-out
+        // Night smoke is more diffuse — lower opacity, softer
+        const nightDiffuse = glowVal; // 0 = day, 1 = deep night
         const fadeIn  = Math.min(life * 14.0, 1.0);
         const fadeOut = 1.0 - Math.pow(Math.max(0, (life - 0.50) / 0.50), 1.8);
-        const alpha   = fadeIn * fadeOut * 0.50;
+        const alpha   = fadeIn * fadeOut * (0.50 - nightDiffuse * 0.20);
 
         // Size grows as smoke disperses, but shrinks with distance from camera
+        // Night smoke spreads larger (more diffuse)
         const cam = camera.position;
         const dx = _sx[i] - cam.x;
         const dy = _sy[i] - cam.y;
@@ -4083,7 +4017,8 @@
         const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
         // Perspective: further = smaller, but clamp min/max for visibility
         const perspective = Math.max(0.18, Math.min(1.0, 18.0 / (dist + 1)));
-        const size = _ssi[i] * (0.45 + life * 3.2) * perspective;
+        const nightSizeBoost = 1.0 + nightDiffuse * 0.6;
+        const size = _ssi[i] * (0.45 + life * 3.2) * perspective * nightSizeBoost;
 
         _gPos[pi3]   = _sx[i];
         _gPos[pi3+1] = _sy[i];
@@ -6687,7 +6622,7 @@
 
       // ── Shared cloud state (computed ONCE, not per blob) ──
       const playerGndY = getTerrainY(px, pz); // one terrain lookup for all blobs
-      const cw = windForSmoke(px, pz, py + 2, playerGndY, windTime);
+      const cw = getWindDebug(px, py + 2, pz, windTime);
       const windStr = Math.sqrt(cw.dx * cw.dx + cw.dz * cw.dz);
       // Breathing responds to wind — gusts stretch the cloud
       const breathBase = Math.sin(t * GHOST_BREATH_RATE * Math.PI * 2) * GHOST_BREATH_AMP;
@@ -6745,8 +6680,8 @@
         const tgtZ = pz + Math.sin(orbAngle) * orbR * cosElev + windLeanZ;
         const tgtY = py + 2.0 + orbR * sinElev;
 
-        // Per-blob wind — each blob feels wind at its own position
-        const bw = windForSmoke(_gbx[i], _gbz[i], _gby[i], playerGndY, windTime);
+        // Per-blob wind — each blob feels full wind field at its own position
+        const bw = getWindDebug(_gbx[i], _gby[i], _gbz[i], windTime);
         const bwdx = bw.dx * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR;
         const bwdz = bw.dz * SMOKE_WIND_SPEED * GHOST_WIND_FACTOR;
         // Suppress vertical wind near buildings so chimney/updraft effects
@@ -6890,8 +6825,8 @@
         const gp = getGhostPower();
         // Wind ramps gently with altitude, capped modestly
         const airWindScale = Math.min(airHag / 10.0, 1.5);
-        const airWind = windForSmoke(playerGroup.position.x, playerGroup.position.z,
-                                     playerGroup.position.y, airGndY, windTime);
+        const airWind = getWindDebug(playerGroup.position.x, playerGroup.position.y,
+                                       playerGroup.position.z, windTime);
         // Target velocity = wind vector scaled down (was way too strong)
         const windTargetX = airWind.dx * SMOKE_WIND_SPEED * airWindScale * 0.4;
         const windTargetZ = airWind.dz * SMOKE_WIND_SPEED * airWindScale * 0.4;
@@ -6959,7 +6894,7 @@
     // ─────────────────────────────────────────
     const VINE_COLOR = 0x8a1a1a;
     const VINE_EMISSIVE = 0x660000;
-    const VINE_COUNT_PER_FACE = 4; // vines per wall face
+    const VINE_COUNT_PER_FACE = 3; // vines per wall face
     const CLEANSE_RANGE = 6.0; // must be within this distance
     const SWING_DURATION = 0.3; // seconds per full swing arc
 
@@ -7061,6 +6996,13 @@
         ba.vineGroup = null;
         ba.vineMeshes = null;
       }
+
+      // Reset window tint to yellow
+      for (let mi = 0; mi < ba.windowMats.length; mi++) {
+        const wm = ba.windowMats[mi];
+        const wp = 0.15 + Math.sin(t * 1.2 + mi) * 0.1;
+        wm.color.setRGB(wp, wp * 0.05, 0);
+      }
     }
 
     function updateContamination(dt) {
@@ -7114,7 +7056,11 @@
     function removeOneVine(ba) {
       if (!ba.vineMeshes || ba.vineMeshes.length === 0) return false;
       // Remove last vine mesh (tube or bulb)
-      const vm = ba.vineMeshes.pop();
+      let vm = ba.vineMeshes.pop();
+      if (vm.parent) vm.parent.remove(vm);
+      if (vm.geometry) vm.geometry.dispose();
+      if (vm.material) vm.material.dispose();
+      vm = ba.vineMeshes.pop();
       if (vm.parent) vm.parent.remove(vm);
       if (vm.geometry) vm.geometry.dispose();
       if (vm.material) vm.material.dispose();
