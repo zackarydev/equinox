@@ -43,7 +43,7 @@
 </head>
 <body>
   <div id="info">
-    WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Hold LMB — attack (cleanse)<br>
+    WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Hold LMB — attack (cleanse) &nbsp;|&nbsp; F — place turret<br>
     1 / 2 / 3 — Day / Dusk / Night &nbsp;|&nbsp; T — auto cycle &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; G — smoke &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis &nbsp;|&nbsp; B — collision boxes
   </div>
   <div id="time-indicator"></div>
@@ -1709,15 +1709,34 @@
           NPC_WANDER = 6, NPC_WALK_ROCK = 7, NPC_GATHER_ROCK = 8,
           NPC_SEEK_ROCK = 9,
           NPC_FARM_WALK_TREE = 10, NPC_FARM_CHOP = 11, NPC_FARM_WALK_SITE = 12,
-          NPC_FARM_BUILD = 13, NPC_FARM_TEND = 14;
+          NPC_FARM_BUILD = 13, NPC_FARM_TEND = 14,
+          NPC_TURRET_WALK_ROCK = 20, NPC_TURRET_GATHER_ROCK = 21,
+          NPC_TURRET_WALK_SITE = 22, NPC_TURRET_BUILD = 23,
+          NPC_TURRET_SEEK_ROCK = 24;
     const NPC_BUILDER_RATIO = 0.50; // fraction of NPCs that are builders (configurable)
     const NPC_FARMER_RATIO  = 0.20; // fraction of non-builders that become farmers
     const FARM_WOOD_NEEDED  = 2;    // wood trips to build a farm
     const FARM_BUILD_TIME   = 8.0;  // seconds to construct
     const FARM_TEND_INTERVAL = 6;   // seconds between tending cycles
     const farms = [];               // { mesh, x, z, tenderIdx, growthStage (0-3) }
-    const ROCK_TRIPS  = 3; // rock trips for foundation
-    const WOOD_TRIPS  = 3;  // wood trips for walls (per-tree trips are dynamic based on size)
+    const ROCK_TRIPS  = 1; // rock trips for foundation
+    const WOOD_TRIPS  = 1;  // wood trips for walls (per-tree trips are dynamic based on size)
+
+    // ── Turret system ──
+    const turrets = [];             // active turrets
+    const turretSites = [];         // player-placed turret markers awaiting construction
+    const TURRET_ROCK_TRIPS = 2;   // rocks needed to build a turret
+    const TURRET_BUILD_TIME = 8.0; // seconds to construct
+    const TURRET_RANGE = 35;       // attack range
+    const TURRET_ZAP_COOLDOWN = 1.5; // seconds between zaps
+    const TURRET_ZAP_DAMAGE = 3.0;   // damage per zap, instantly kills a wraith
+    const TURRET_CHARGE_MAX = 1.0;
+    const TURRET_CHARGE_PER_ZAP = 0.08; // charge consumed per zap
+    const TURRET_GHOST_RECHARGE_RANGE = 8.0; // ghost must be within this range
+    const TURRET_GHOST_RECHARGE_RATE = 0.25; // charge per second when ghost nearby
+    const TURRET_MAX_ZAPS = 3;     // max concurrent zap beams
+    const TURRET_ZAP_DURATION = 0.25; // seconds a zap beam is visible
+    const TURRET_PLACEMENT_RANGE = 12; // max distance from player to place
 
     // Two noise layers for varied forest density
     for (let i = 0; i < 2200; i++) {
@@ -2587,6 +2606,7 @@
       if (e.key === '3') { autoCycle = false; timeOfDay = 0.0;  lastDayState = false; }
       if (e.key === '4') { autoCycle = false; timeOfDay = 0.25; lastDayState = false; }
       if (e.key.toLowerCase() === 't') { autoCycle = !autoCycle; }
+      if (e.key.toLowerCase() === 'f') { placeTurretSite(); }
       if (e.key.toLowerCase() === 'm') {
         moonPhaseIndex = (moonPhaseIndex + 1) % MOON_PHASES.length;
         lastDrawnPhase = -1; // force shadow redraw
@@ -2614,10 +2634,6 @@
         smokeVisible = !smokeVisible;
         smokePoints.visible = smokeVisible;
         chimPoints.visible = smokeVisible;
-      }
-      if (e.key.toLowerCase() === 'f') {
-        faceDebugVisible = !faceDebugVisible;
-        buildFaceDebugArrows();
       }
       if (e.key.toLowerCase() === 'b') {
         collisionDebugVisible = !collisionDebugVisible;
@@ -4273,6 +4289,9 @@
         // Memory: last-used resource indices (persists across days)
         lastRockIdx: -1,
         lastTreeIdx: -1,
+        // Turret building
+        turretSiteIdx: -1,
+        turretRocksCarried: 0,
       });
       // Assign farmer role to some non-builders
       const newNpc = npcs[npcs.length - 1];
@@ -4405,15 +4424,61 @@
         for (let fi = 0; fi < farms.length; fi++) {
           if ((sx - farms[fi].x) ** 2 + (sz - farms[fi].z) ** 2 < MIN_FARM_GAP * MIN_FARM_GAP) { tooClose = true; break; }
         }
+        if (tooClose) continue;
+        // Check distance from turrets and turret sites
+        for (let ti = 0; ti < turrets.length; ti++) {
+          if ((sx - turrets[ti].x) ** 2 + (sz - turrets[ti].z) ** 2 < 10 * 10) { tooClose = true; break; }
+        }
+        if (tooClose) continue;
+        for (let si = 0; si < turretSites.length; si++) {
+          if ((sx - turretSites[si].x) ** 2 + (sz - turretSites[si].z) ** 2 < 10 * 10) { tooClose = true; break; }
+        }
+        if (tooClose) continue;
+        // Check distance from NPC building sites in progress
+        for (let ni = 0; ni < npcs.length; ni++) {
+          const bm = npcs[ni].buildMesh;
+          if (!bm) continue;
+          if ((sx - bm.position.x) ** 2 + (sz - bm.position.z) ** 2 < MIN_FARM_GAP * MIN_FARM_GAP) { tooClose = true; break; }
+        }
         if (!tooClose) return { x: sx, z: sz, y: sy };
       }
       return null;
     }
 
+    function isSiteTooClose(sx, sz, minGap, siteRadius) {
+      for (let other = 0; other < npcs.length; other++) {
+        const bm = npcs[other].buildMesh;
+        if (!bm) continue;
+        const ddx = sx - bm.position.x, ddz = sz - bm.position.z;
+        if (ddx * ddx + ddz * ddz < (minGap + siteRadius) ** 2) return true;
+      }
+      for (let bi = 0; bi < buildingAttractors.length; bi++) {
+        const ba = buildingAttractors[bi];
+        const ddx = sx - ba.x, ddz = sz - ba.z;
+        if (ddx * ddx + ddz * ddz < (minGap + ba.r) ** 2) return true;
+      }
+      for (let fi = 0; fi < farms.length; fi++) {
+        const f = farms[fi];
+        const ddx = sx - f.x, ddz = sz - f.z;
+        if (ddx * ddx + ddz * ddz < (minGap + 6) ** 2) return true;
+      }
+      for (let ti = 0; ti < turrets.length; ti++) {
+        const t = turrets[ti];
+        const ddx = sx - t.x, ddz = sz - t.z;
+        if (ddx * ddx + ddz * ddz < (minGap + 3) ** 2) return true;
+      }
+      for (let si = 0; si < turretSites.length; si++) {
+        const s = turretSites[si];
+        const ddx = sx - s.x, ddz = sz - s.z;
+        if (ddx * ddx + ddz * ddz < (minGap + 3) ** 2) return true;
+      }
+      return false;
+    }
+
     function pickBuildSite(npc) {
       const siteRotation = Math.random() * Math.PI * 2;
-      const MIN_BLDG_GAP = 5.5; // minimum distance between building centers
-      const BLD_SITE_RADIUS = 15; // 5x5x5 build site footprint
+      const MIN_BLDG_GAP = 5.5;
+      const BLD_SITE_RADIUS = 15;
       for (let a = 0; a < 20; a++) {
         const ang = Math.random() * Math.PI * 2;
         const d = 10 + Math.random() * 14;
@@ -4421,22 +4486,9 @@
         const sz = npc.homeZ + Math.sin(ang) * d;
         const sy = getTerrainY(sx, sz);
         if (sy < 2.0 || sy > 14) continue;
-        // Check against all existing buildings
-        let tooClose = false;
-        for (let other = 0; other < npcs.length; other++) {
-          const bm = npcs[other].buildMesh;
-          if (!bm) continue; // not all npcs have a buildmesh
-          const ddx = sx - bm.x, ddz = sz - bm.z;
-          if (ddx * ddx + ddz * ddz < (MIN_BLDG_GAP + BLD_SITE_RADIUS) ** 2) { tooClose = true; break; }
-        }
-        for (let bi = 0; bi < buildingAttractors.length; bi++) {
-          const ba = buildingAttractors[bi];
-          const ddx = sx - ba.x, ddz = sz - ba.z;
-          if (ddx * ddx + ddz * ddz < (MIN_BLDG_GAP + ba.r) ** 2) { tooClose = true; break; }
-        }
-        if (!tooClose) return { x: sx, z: sz, y: sy, rot: siteRotation };
+        if (!isSiteTooClose(sx, sz, MIN_BLDG_GAP, BLD_SITE_RADIUS))
+          return { x: sx, z: sz, y: sy, rot: siteRotation };
       }
-      // Fallback: try further from home
       for (let a = 0; a < 10; a++) {
         const ang = Math.random() * Math.PI * 2;
         const d = 20 + Math.random() * 15;
@@ -4444,21 +4496,10 @@
         const sz = npc.homeZ + Math.sin(ang) * d;
         const sy = getTerrainY(sx, sz);
         if (sy < 2.0 || sy > 14) continue;
-        let tooClose = false;
-        for (let other = 0; other < npcs.length; other++) {
-          const bm = npcs[other].buildMesh;
-          if (!bm) continue; // not all npcs have a buildmesh
-          const ddx = sx - bm.x, ddz = sz - bm.z;
-          if (ddx * ddx + ddz * ddz < (MIN_BLDG_GAP + BLD_SITE_RADIUS) ** 2) { tooClose = true; break; }
-        }
-        for (let bi = 0; bi < buildingAttractors.length; bi++) {
-          const ba = buildingAttractors[bi];
-          const ddx = sx - ba.x, ddz = sz - ba.z;
-          if (ddx * ddx + ddz * ddz < (MIN_BLDG_GAP + ba.r) ** 2) { tooClose = true; break; }
-        }
-        if (!tooClose) return { x: sx, z: sz, y: sy, rot: siteRotation };
+        if (!isSiteTooClose(sx, sz, MIN_BLDG_GAP, BLD_SITE_RADIUS))
+          return { x: sx, z: sz, y: sy, rot: siteRotation };
       }
-      return null; // no valid site found
+      return null;
     }
 
     // Pick a waypoint biased toward higher terrain (gradient ascent).
@@ -4597,7 +4638,7 @@
         npc.mesh.userData.woodBundle.visible = npc.carrying;
 
         // At dusk, interrupt active NPCs and send them home
-        if (isDusk && npc.state !== NPC_IDLE && npc.state !== NPC_GOING_HOME && npc.state !== NPC_BUILD && npc.state !== NPC_FARM_BUILD) {
+        if (isDusk && npc.state !== NPC_IDLE && npc.state !== NPC_GOING_HOME && npc.state !== NPC_BUILD && npc.state !== NPC_FARM_BUILD && npc.state !== NPC_TURRET_BUILD) {
           // npc.carrying = false; // do not drop resources at dusk — let them bring it home
           npc.mesh.children[0].rotation.x = 0;
           npc.mesh.children[0].rotation.z = 0;
@@ -4784,6 +4825,46 @@
                 npc.state = NPC_WALK_TREE;
               }
               break;
+            }
+            // ── Check for turret sites needing builders ──
+            {
+              let bestTurretSite = -1, bestTD2 = 60 * 60;
+              for (let si = 0; si < turretSites.length; si++) {
+                const ts = turretSites[si];
+                if (ts.builderIdx >= 0) continue; // already assigned
+                const td2 = (ts.x - npc.homeX) ** 2 + (ts.z - npc.homeZ) ** 2;
+                if (td2 < bestTD2) { bestTD2 = td2; bestTurretSite = si; }
+              }
+              if (bestTurretSite >= 0) {
+                const ts = turretSites[bestTurretSite];
+                ts.builderIdx = i; // claim this site
+                npc.turretSiteIdx = bestTurretSite;
+                npc.turretRocksCarried = 0;
+                // Create construction placeholder
+                const bm = new THREE.Mesh(
+                  new THREE.CylinderGeometry(1.2, 1.5, 3.0, 8),
+                  new THREE.MeshStandardMaterial({ color: 0x9a9a8a, flatShading: true, roughness: 0.9 })
+                );
+                bm.scale.y = 0.05;
+                bm.position.set(ts.x, ts.y + 0.08, ts.z);
+                bm.castShadow = true;
+                scene.add(bm);
+                ts.buildMesh = bm;
+                // Go get rocks
+                if (npc.lastRockIdx >= 0 && !depletedRocks.has(npc.lastRockIdx)) {
+                  npc.rockIdx = npc.lastRockIdx;
+                  npc.targetX = rockPositions[npc.lastRockIdx].x;
+                  npc.targetZ = rockPositions[npc.lastRockIdx].z;
+                  npc.state = NPC_TURRET_WALK_ROCK;
+                } else {
+                  npc.seekRadius = 25;
+                  npc.seekAttempts = 0;
+                  const wp = pickUphillWaypoint(npc.x, npc.z, npc.seekRadius);
+                  npc.targetX = wp.x; npc.targetZ = wp.z;
+                  npc.state = NPC_TURRET_SEEK_ROCK;
+                }
+                break;
+              }
             }
             // Start a new building project
             const site = pickBuildSite(npc);
@@ -5086,6 +5167,12 @@
                 dims: { w: bw, h: bh, d: bd },
                 groundY: bgy, rotation: nb.rotation.y,
               });
+              // Register collision box for player avoidance
+              collisionBoxes.push({
+                cx: npc.siteX, cz: npc.siteZ,
+                hw: bw / 2 + 0.3, hd: bd / 2 + 0.3,
+                cosR: cR, sinR: sR
+              });
               // Spawn new NPC at the new home
               spawnNPC(npc.siteX, npc.siteZ, npc.palette, npc.kingdomIdx);
               // Original NPC goes home
@@ -5093,6 +5180,141 @@
               npc.mesh.position.set(npc.homeX, getTerrainY(npc.homeX, npc.homeZ), npc.homeZ);
               npc.state = NPC_IDLE;
               npc.timer = 10 + Math.random() * 20;
+            }
+            break;
+          }
+
+          // ── Turret builder states ──
+          case NPC_TURRET_SEEK_ROCK: {
+            if (moveNPC(npc, npc.targetX, npc.targetZ, dt) === 0) {
+              // Look for a rock deposit nearby
+              const ri = findNearestRock(npc.x, npc.z, npc.seekRadius);
+              if (ri >= 0) {
+                npc.rockIdx = ri;
+                npc.targetX = rockPositions[ri].x;
+                npc.targetZ = rockPositions[ri].z;
+                npc.state = NPC_TURRET_WALK_ROCK;
+              } else {
+                npc.seekAttempts++;
+                if (npc.seekAttempts > 5) {
+                  npc.seekRadius = Math.min(npc.seekRadius + 15, 80);
+                  npc.seekAttempts = 0;
+                }
+                const wp = pickUphillWaypoint(npc.x, npc.z, npc.seekRadius);
+                npc.targetX = wp.x; npc.targetZ = wp.z;
+              }
+            }
+            break;
+          }
+
+          case NPC_TURRET_WALK_ROCK: {
+            if (moveNPC(npc, npc.targetX, npc.targetZ, dt) === 0) {
+              npc.state = NPC_TURRET_GATHER_ROCK;
+              npc.timer = NPC_GATHER_TIME;
+              npc.lastRockIdx = npc.rockIdx;
+            }
+            break;
+          }
+
+          case NPC_TURRET_GATHER_ROCK: {
+            npc.timer -= dt;
+            // Hammering animation
+            npc.mesh.children[0].rotation.x = Math.sin(performance.now() * 0.008) * 0.4;
+            if (npc.timer <= 0) {
+              npc.mesh.children[0].rotation.x = 0;
+              npc.carrying = true;
+              if (npc.turretSiteIdx >= 0 && npc.turretSiteIdx < turretSites.length) {
+                const ts = turretSites[npc.turretSiteIdx];
+                npc.targetX = ts.x;
+                npc.targetZ = ts.z;
+                npc.state = NPC_TURRET_WALK_SITE;
+              } else {
+                npc.carrying = false;
+                npc.state = NPC_IDLE;
+                npc.timer = 5;
+              }
+              // Deplete rock
+              if (npc.rockIdx >= 0) {
+                if (!rockDurability) { /* safety */ }
+                else if (rockDurability[npc.rockIdx] !== undefined) {
+                  rockDurability[npc.rockIdx]--;
+                  if (rockDurability[npc.rockIdx] <= 0) depletedRocks.add(npc.rockIdx);
+                }
+              }
+            }
+            break;
+          }
+
+          case NPC_TURRET_WALK_SITE: {
+            if (moveNPC(npc, npc.targetX, npc.targetZ, dt) === 0) {
+              npc.carrying = false;
+              if (npc.turretSiteIdx >= 0 && npc.turretSiteIdx < turretSites.length) {
+                const ts = turretSites[npc.turretSiteIdx];
+                ts.rocksDelivered++;
+                // Grow the placeholder
+                if (ts.buildMesh) {
+                  ts.buildMesh.scale.y = Math.min(1, 0.05 + ts.rocksDelivered / TURRET_ROCK_TRIPS * 0.4);
+                  ts.buildMesh.position.y = ts.y + 1.5 * ts.buildMesh.scale.y;
+                }
+                if (ts.rocksDelivered >= TURRET_ROCK_TRIPS) {
+                  // Enough rocks — start building
+                  npc.state = NPC_TURRET_BUILD;
+                  npc.timer = TURRET_BUILD_TIME;
+                } else {
+                  // Go get more rocks
+                  if (npc.lastRockIdx >= 0 && !depletedRocks.has(npc.lastRockIdx)) {
+                    npc.rockIdx = npc.lastRockIdx;
+                    npc.targetX = rockPositions[npc.lastRockIdx].x;
+                    npc.targetZ = rockPositions[npc.lastRockIdx].z;
+                    npc.state = NPC_TURRET_WALK_ROCK;
+                  } else {
+                    npc.seekRadius = 25;
+                    npc.seekAttempts = 0;
+                    const wp = pickUphillWaypoint(npc.x, npc.z, npc.seekRadius);
+                    npc.targetX = wp.x; npc.targetZ = wp.z;
+                    npc.state = NPC_TURRET_SEEK_ROCK;
+                  }
+                }
+              } else {
+                npc.state = NPC_IDLE;
+                npc.timer = 5;
+              }
+            }
+            break;
+          }
+
+          case NPC_TURRET_BUILD: {
+            npc.timer -= dt;
+            // Circle the turret site while building
+            if (npc.turretSiteIdx >= 0 && npc.turretSiteIdx < turretSites.length) {
+              const ts = turretSites[npc.turretSiteIdx];
+              const ba2 = (TURRET_BUILD_TIME - npc.timer) * 1.2;
+              npc.x = ts.x + Math.cos(ba2) * 3;
+              npc.z = ts.z + Math.sin(ba2) * 3;
+              npc.mesh.position.x = npc.x;
+              npc.mesh.position.z = npc.z;
+              npc.mesh.position.y = getTerrainY(npc.x, npc.z);
+              npc.mesh.rotation.y = ba2 + Math.PI;
+              npc.walkPhase += dt * 6;
+              npc.mesh.userData.legL.rotation.x = Math.sin(npc.walkPhase) * 0.3;
+              npc.mesh.userData.legR.rotation.x = Math.sin(npc.walkPhase + Math.PI) * 0.3;
+              // Grow placeholder
+              if (ts.buildMesh) {
+                const bp = 1 - npc.timer / TURRET_BUILD_TIME;
+                ts.buildMesh.scale.y = 0.4 + bp * 0.6;
+                ts.buildMesh.position.y = ts.y + 1.5 * ts.buildMesh.scale.y;
+              }
+              if (npc.timer <= 0) {
+                const sIdx = npc.turretSiteIdx;
+                completeTurretBuild(sIdx);
+                // Adjust our index if the splice changed things
+                npc.turretSiteIdx = -1;
+                npc.state = NPC_IDLE;
+                npc.timer = 10 + Math.random() * 15;
+              }
+            } else {
+              npc.state = NPC_IDLE;
+              npc.timer = 5;
             }
             break;
           }
@@ -5208,7 +5430,7 @@
             } else {
               // Slowly amble around the farm
               npc.timer -= dt;
-              npc.walkPhase += dt * 0.3; // very slow rotation
+              npc.walkPhase += dt * 0.5; // very slow rotation
               const tendAng = npc.walkPhase;
               npc.x = farm.x + Math.cos(tendAng) * 3;
               npc.z = farm.z + Math.sin(tendAng) * 3;
@@ -6566,9 +6788,13 @@
           if (!_gbac[i]) continue;
           const ddx = _gbx[i] - ba.x, ddz = _gbz[i] - ba.z, ddy = _gby[i] - ba.y;
           const d2 = ddx * ddx + ddz * ddz + ddy * ddy;
-          // Consume on contact
+          // Consume on contact — charge the building
           if (d2 < (ba.r + 1.0) * (ba.r + 1.0)) {
-            _gbac[i] = 0; ghostBlobCount--; continue;
+            _gbac[i] = 0; ghostBlobCount--;
+            if (!ba.contaminated) {
+              ba.charge = Math.min(ba.chargeMax, ba.charge + 0.15);
+            }
+            continue;
           }
           // Per-blob wind near buildings — getWindDebug includes attractor pull
           if (d2 < GHOST_DRAIN_BLDG * GHOST_DRAIN_BLDG) {
@@ -7001,7 +7227,7 @@
       for (let mi = 0; mi < ba.windowMats.length; mi++) {
         const wm = ba.windowMats[mi];
         const wp = 0.15 + Math.sin(t * 1.2 + mi) * 0.1;
-        wm.color.setRGB(wp, wp * 0.05, 0);
+        wm.color.setRGB(wp, wp * 0.9, 0);
       }
     }
 
@@ -7165,6 +7391,300 @@
     }
 
     // ─────────────────────────────────────────
+    //  TURRET SYSTEM — player-placed defenses built by NPCs
+    // ─────────────────────────────────────────
+
+    function createTurretMesh() {
+      const g = new THREE.Group();
+      // Stone pedestal — octagonal pillar
+      const baseGeo = new THREE.CylinderGeometry(1.2, 1.5, 3.0, 8);
+      const baseMat = new THREE.MeshStandardMaterial({
+        color: 0x8a8a7a, flatShading: true, roughness: 0.85
+      });
+      const base = new THREE.Mesh(baseGeo, baseMat);
+      base.position.y = 1.5;
+      base.castShadow = true;
+      g.add(base);
+      // Crenellation ring
+      for (let i = 0; i < 8; i++) {
+        const ang = (i / 8) * Math.PI * 2;
+        const cGeo = new THREE.BoxGeometry(0.4, 0.6, 0.4);
+        const cMat = new THREE.MeshStandardMaterial({ color: 0x7a7a6a, flatShading: true });
+        const cren = new THREE.Mesh(cGeo, cMat);
+        cren.position.set(Math.cos(ang) * 1.1, 3.3, Math.sin(ang) * 1.1);
+        cren.castShadow = true;
+        g.add(cren);
+      }
+      // Crystal — the glowing weapon core
+      const crystalGeo = new THREE.OctahedronGeometry(0.5, 0);
+      const crystalMat = new THREE.MeshStandardMaterial({
+        color: 0x44ddff, emissive: 0x22aacc, emissiveIntensity: 1.0,
+        flatShading: true, transparent: true, opacity: 0.9
+      });
+      const crystal = new THREE.Mesh(crystalGeo, crystalMat);
+      crystal.position.y = 3.8;
+      crystal.castShadow = false;
+      g.add(crystal);
+      // Inner glow sphere
+      const glowGeo = new THREE.SphereGeometry(0.3, 6, 6);
+      const glowMat = new THREE.MeshStandardMaterial({
+        color: 0xffffff, emissive: 0x88eeff, emissiveIntensity: 2.0,
+        transparent: true, opacity: 0.4
+      });
+      const glow = new THREE.Mesh(glowGeo, glowMat);
+      glow.position.y = 3.8;
+      g.add(glow);
+      g.userData = { crystalMat, glowMat, crystal, glow };
+      return g;
+    }
+
+    function createTurretSiteMarker(x, y, z) {
+      const g = new THREE.Group();
+      // Semi-transparent ghost of the turret base
+      const baseGeo = new THREE.CylinderGeometry(1.2, 1.5, 3.0, 8);
+      const baseMat = new THREE.MeshStandardMaterial({
+        color: 0xaaaaff, flatShading: true, transparent: true, opacity: 0.3,
+        emissive: 0x4444aa, emissiveIntensity: 0.5
+      });
+      const base = new THREE.Mesh(baseGeo, baseMat);
+      base.position.y = 1.5;
+      g.add(base);
+      // Floating ring indicator
+      const ringGeo = new THREE.TorusGeometry(1.8, 0.08, 6, 16);
+      const ringMat = new THREE.MeshStandardMaterial({
+        color: 0x66aaff, emissive: 0x4488ff, emissiveIntensity: 1.5,
+        transparent: true, opacity: 0.6
+      });
+      const ring = new THREE.Mesh(ringGeo, ringMat);
+      ring.rotation.x = Math.PI / 2;
+      ring.position.y = 0.2;
+      g.add(ring);
+      g.position.set(x, y, z);
+      g.userData = { baseMat, ringMat };
+      scene.add(g);
+      return g;
+    }
+
+    // Turret placement — player presses F during day
+    function placeTurretSite() {
+      const isDay = timeOfDay > 0.28 && timeOfDay < 0.65;
+      if (!isDay || ghostActive) return;
+      // Place in front of player
+      const fwd = new THREE.Vector3();
+      camera.getWorldDirection(fwd);
+      fwd.y = 0; fwd.normalize();
+      const px = playerGroup.position.x + fwd.x * 5;
+      const pz = playerGroup.position.z + fwd.z * 5;
+      const py = getTerrainY(px, pz);
+      if (py < 2.0 || py > 14) return;
+
+      // Check not too close to existing turrets/sites/buildings
+      const MIN_GAP = 8;
+      for (const t of turrets) {
+        if ((t.x - px) ** 2 + (t.z - pz) ** 2 < MIN_GAP * MIN_GAP) return;
+      }
+      for (const s of turretSites) {
+        if ((s.x - px) ** 2 + (s.z - pz) ** 2 < MIN_GAP * MIN_GAP) return;
+      }
+      for (const ba of buildingAttractors) {
+        if ((ba.x - px) ** 2 + (ba.z - pz) ** 2 < 6 * 6) return;
+      }
+      for (const f of farms) {
+        if ((f.x - px) ** 2 + (f.z - pz) ** 2 < 10 * 10) return;
+      }
+      // Check NPC building sites in progress
+      for (const npc of npcs) {
+        if (!npc.buildMesh) continue;
+        if ((npc.buildMesh.position.x - px) ** 2 + (npc.buildMesh.position.z - pz) ** 2 < 8 * 8) return;
+      }
+
+      const marker = createTurretSiteMarker(px, py, pz);
+      turretSites.push({
+        x: px, z: pz, y: py,
+        mesh: marker,
+        rocksDelivered: 0,
+        buildProgress: 0,
+        builderIdx: -1,
+        buildMesh: null,
+      });
+    }
+
+    // Zap beam pool
+    const _zapBeams = [];
+    const _zapPool = [];
+    const ZAP_COLORS = [
+      0xff4488, 0x44ffaa, 0xffaa22, 0x44aaff, 0xaa44ff, 0xff6644, 0x22ffcc
+    ];
+
+    function getZapBeam() {
+      if (_zapPool.length > 0) return _zapPool.pop();
+      const pts = [new THREE.Vector3(), new THREE.Vector3()];
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const mat = new THREE.LineBasicMaterial({
+        color: 0xffffff, linewidth: 2, transparent: true, opacity: 1.0
+      });
+      const line = new THREE.Line(geo, mat);
+      line.frustumCulled = false;
+      scene.add(line);
+      return { line, geo, mat };
+    }
+
+    function releaseZapBeam(zap) {
+      zap.line.visible = false;
+      _zapPool.push(zap);
+    }
+
+    function fireZapBeam(fromX, fromY, fromZ, toX, toY, toZ, color) {
+      const zap = getZapBeam();
+      const segments = 6;
+      const points = [];
+      for (let i = 0; i <= segments; i++) {
+        const t = i / segments;
+        const bx = fromX + (toX - fromX) * t;
+        const by = fromY + (toY - fromY) * t;
+        const bz = fromZ + (toZ - fromZ) * t;
+        if (i > 0 && i < segments) {
+          const jitter = 0.8;
+          points.push(new THREE.Vector3(
+            bx + (Math.random() - 0.5) * jitter,
+            by + (Math.random() - 0.5) * jitter,
+            bz + (Math.random() - 0.5) * jitter
+          ));
+        } else {
+          points.push(new THREE.Vector3(bx, by, bz));
+        }
+      }
+      zap.geo.dispose();
+      zap.geo = new THREE.BufferGeometry().setFromPoints(points);
+      zap.line.geometry = zap.geo;
+      zap.mat.color.setHex(color);
+      zap.mat.opacity = 1.0;
+      zap.line.visible = true;
+      _zapBeams.push({ beam: zap, timer: TURRET_ZAP_DURATION });
+    }
+
+    function completeTurretBuild(siteIdx) {
+      const site = turretSites[siteIdx];
+      if (site.mesh) {
+        scene.remove(site.mesh);
+        site.mesh.traverse(c => { if (c.geometry) c.geometry.dispose(); if (c.material) c.material.dispose(); });
+      }
+      if (site.buildMesh) {
+        scene.remove(site.buildMesh);
+        if (site.buildMesh.geometry) site.buildMesh.geometry.dispose();
+        if (site.buildMesh.material) site.buildMesh.material.dispose();
+      }
+      const mesh = createTurretMesh();
+      mesh.position.set(site.x, site.y, site.z);
+      scene.add(mesh);
+      turrets.push({
+        mesh,
+        x: site.x, y: site.y, z: site.z,
+        charge: TURRET_CHARGE_MAX,
+        zapCooldown: 0,
+        targetIdx: -1,
+        crystalPhase: Math.random() * Math.PI * 2,
+      });
+      turretSites.splice(siteIdx, 1);
+    }
+
+    function updateTurrets(dt) {
+      const t = performance.now() * 0.001;
+      const isNight = timeOfDay > 0.80 || timeOfDay < 0.25;
+      const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
+
+      // ── Animate turret site markers ──
+      for (let i = turretSites.length - 1; i >= 0; i--) {
+        const site = turretSites[i];
+        if (!site.mesh) continue;
+        const pulse = 0.4 + Math.sin(t * 2.0 + i) * 0.2;
+        site.mesh.userData.ringMat.opacity = pulse;
+        site.mesh.userData.baseMat.opacity = 0.2 + Math.sin(t * 1.5 + i) * 0.1;
+        site.mesh.children[1].rotation.z = t * 0.5;
+      }
+
+      // ── Update zap beams ──
+      for (let i = _zapBeams.length - 1; i >= 0; i--) {
+        const zb = _zapBeams[i];
+        zb.timer -= dt;
+        zb.beam.mat.opacity = Math.max(0, zb.timer / TURRET_ZAP_DURATION);
+        if (zb.timer <= 0) {
+          releaseZapBeam(zb.beam);
+          _zapBeams.splice(i, 1);
+        }
+      }
+
+      // ── Update active turrets ──
+      for (let ti = 0; ti < turrets.length; ti++) {
+        const tur = turrets[ti];
+        tur.zapCooldown = Math.max(0, tur.zapCooldown - dt);
+
+        // Crystal animation
+        tur.crystalPhase += dt * (1.5 + tur.charge * 2.0);
+        const crys = tur.mesh.userData.crystal;
+        const glow = tur.mesh.userData.glow;
+        crys.rotation.y = tur.crystalPhase;
+        crys.rotation.x = Math.sin(tur.crystalPhase * 0.7) * 0.3;
+
+        const chargeFrac = tur.charge / TURRET_CHARGE_MAX;
+        const hue = (t * 0.1 + ti * 0.3) % 1.0;
+        const crystalColor = new THREE.Color().setHSL(hue, 0.8, 0.5 + chargeFrac * 0.3);
+        const emissiveColor = new THREE.Color().setHSL(hue, 0.9, 0.3 + chargeFrac * 0.4);
+        tur.mesh.userData.crystalMat.color.copy(crystalColor);
+        tur.mesh.userData.crystalMat.emissive.copy(emissiveColor);
+        tur.mesh.userData.crystalMat.emissiveIntensity = 0.3 + chargeFrac * 1.5;
+        tur.mesh.userData.glowMat.emissiveIntensity = chargeFrac * 2.5;
+        tur.mesh.userData.glowMat.opacity = 0.1 + chargeFrac * 0.5;
+        const sc = 1.0 + Math.sin(tur.crystalPhase * 2) * 0.1 * chargeFrac;
+        glow.scale.setScalar(sc);
+
+        if (chargeFrac < 0.1) {
+          tur.mesh.userData.crystalMat.emissiveIntensity = 0.1;
+          tur.mesh.userData.glowMat.opacity = 0.05;
+        }
+
+        // ── Ghost recharge ──
+        if (ghostActive && tur.charge < TURRET_CHARGE_MAX) {
+          const gpx = playerGroup.position.x, gpz = playerGroup.position.z;
+          const d2 = (tur.x - gpx) ** 2 + (tur.z - gpz) ** 2;
+          if (d2 < TURRET_GHOST_RECHARGE_RANGE * TURRET_GHOST_RECHARGE_RANGE) {
+            const proximity = 1.0 - Math.sqrt(d2) / TURRET_GHOST_RECHARGE_RANGE;
+            tur.charge = Math.min(TURRET_CHARGE_MAX,
+              tur.charge + TURRET_GHOST_RECHARGE_RATE * proximity * dt);
+          }
+        }
+
+        // ── Slow passive day recharge ──
+        if (isDay && tur.charge < TURRET_CHARGE_MAX) {
+          tur.charge = Math.min(TURRET_CHARGE_MAX, tur.charge + 0.02 * dt);
+        }
+
+        // ── Night combat — zap wraiths ──
+        if (isNight && tur.charge > TURRET_CHARGE_PER_ZAP && tur.zapCooldown <= 0) {
+          let bestIdx = -1, bestD2 = TURRET_RANGE * TURRET_RANGE;
+          for (let ni = 0; ni < nightMobs.length; ni++) {
+            const nm = nightMobs[ni];
+            if (nm.state === 'dying') continue;
+            const d2 = (nm.x - tur.x) ** 2 + (nm.z - tur.z) ** 2;
+            if (d2 < bestD2) { bestD2 = d2; bestIdx = ni; }
+          }
+          if (bestIdx >= 0) {
+            const nm = nightMobs[bestIdx];
+            const zapColor = ZAP_COLORS[Math.floor(Math.random() * ZAP_COLORS.length)];
+            const fromY = tur.y + 3.8;
+            const toY = getTerrainY(nm.x, nm.z) + 2.0;
+            fireZapBeam(tur.x, fromY, tur.z, nm.x, toY, nm.z, zapColor);
+            nm.hp -= TURRET_ZAP_DAMAGE;
+            nm.mesh.userData.headMat.emissiveIntensity = 3.0;
+            if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; }
+            tur.charge -= TURRET_CHARGE_PER_ZAP;
+            tur.zapCooldown = TURRET_ZAP_COOLDOWN;
+          }
+        }
+      }
+    }
+
+    // ─────────────────────────────────────────
     const clock = new THREE.Clock();
     function animate() {
       requestAnimationFrame(animate);
@@ -7216,6 +7736,7 @@
       updateChimneySmoke(dt);
       updateContamination(dt);
       updatePlayerAttack(dt);
+      updateTurrets(dt);
 
       // Ghost cloud + player mesh visibility
       updateGhostCloud(dt);
