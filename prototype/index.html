@@ -44,7 +44,7 @@
 <body>
   <div id="info">
     WASD — move &nbsp;|&nbsp; Mouse — look<br>
-    1 / 2 / 3 — Day / Dusk / Night &nbsp;|&nbsp; T — auto cycle &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis
+    1 / 2 / 3 — Day / Dusk / Night &nbsp;|&nbsp; T — auto cycle &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; G — smoke &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis
   </div>
   <div id="time-indicator"></div>
   <div id="moon-indicator"><canvas id="moon-hud" width="24" height="24"></canvas><span id="moon-text"></span></div>
@@ -2232,6 +2232,11 @@
         for (const a of windDebugArrows) a.visible = false;
         _windDbgTimer = 99;
       }
+      if (e.key.toLowerCase() === 'g') {
+        smokeVisible = !smokeVisible;
+        smokePoints.visible = smokeVisible;
+        chimPoints.visible = smokeVisible;
+      }
       if (e.key.toLowerCase() === 'f') {
         faceDebugVisible = !faceDebugVisible;
         buildFaceDebugArrows();
@@ -2273,20 +2278,32 @@
       if (input.lengthSq() > 0) {
         input.normalize();
 
-        const speedMult = getPathSpeedAt(playerGroup.position.x, playerGroup.position.z);
-
-        const target = input.clone().multiplyScalar(MOVE_SPEED * speedMult);
-        playerVelocity.lerp(target, accelSmooth);
+        if (playerAirborne) {
+          // Airborne control scales with ghost power (New Moon=strong, Full Moon=weak)
+          const gp = typeof getGhostPower === 'function' ? getGhostPower() : 0.5;
+          // gp 1.0 (New Moon): ~50% move speed — can overpower the wind
+          // gp 0.25 (Full Moon): ~15% — gentle guidance, wind dominates
+          const airControl = 0.10 + gp * 0.40;
+          const nudge = input.clone().multiplyScalar(MOVE_SPEED * airControl);
+          playerVelocity.x += nudge.x * dt;
+          playerVelocity.z += nudge.z * dt;
+        } else {
+          const speedMult = getPathSpeedAt(playerGroup.position.x, playerGroup.position.z);
+          const target = input.clone().multiplyScalar(MOVE_SPEED * speedMult);
+          playerVelocity.lerp(target, accelSmooth);
+        }
         // Smooth rotation toward movement direction
         const targetAngle = Math.atan2(playerVelocity.x, playerVelocity.z);
         let angleDiff = targetAngle - playerFacingAngle;
-        // Wrap to [-PI, PI]
         while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
         while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
         playerFacingAngle += angleDiff * Math.min(1, 10 * dt);
         playerGroup.rotation.y = playerFacingAngle;
       } else {
-        playerVelocity.lerp(new THREE.Vector3(0, 0, 0), decelSmooth);
+        if (!playerAirborne) {
+          playerVelocity.lerp(new THREE.Vector3(0, 0, 0), decelSmooth);
+        }
+        // Airborne with no input: velocity persists (no drag toward zero)
       }
 
       playerGroup.position.x += playerVelocity.x * dt;
@@ -3007,6 +3024,7 @@
 
     let _chimSpawnT = 0;
     function updateChimneySmoke(dt) {
+      if (!smokeVisible) return;
       // Only emit during daytime (dawn through dusk)
       const dayActive = timeOfDay > 0.28 && timeOfDay < 0.72;
 
@@ -3301,11 +3319,13 @@
       return _swBuf;
     }
 
+    let smokeVisible = true;
     let _smokeSpawnT = 0;
     const SMOKE_SPAWN_RATE  = 0.0065; // one puff every ~65 ms ≈ 15/s
     const SMOKE_WIND_SPEED  = 20;   // world units per second per unit wind
 
     function updateSmoke(dt) {
+      if (!smokeVisible) return;
       // Spawn — rate scales with night glow (no smoke during bright day/full moon)
       const glowVal = smokeMat.uniforms.uNightGlow.value;
       const effectiveRate = glowVal < 0.01 ? Infinity : SMOKE_SPAWN_RATE / glowVal;
@@ -3338,20 +3358,19 @@
         const w    = windForSmoke(_sx[i], _sz[i], _sy[i], getTerrainY(_sx[i], _sz[i]), windTime);
         const drag = Math.min(life * 1.2, 1.0); // 0 = own momentum, 1 = wind-controlled
 
-        // Steer horizontal velocity toward ambient wind
-        _svx[i] += (w.dx * SMOKE_WIND_SPEED - _svx[i]) * drag * dt * 2.0;
-        _svz[i] += (w.dz * SMOKE_WIND_SPEED - _svz[i]) * drag * dt * 2.0;
+        // Steer horizontal velocity toward ambient wind (stronger pull)
+        _svx[i] += (w.dx * SMOKE_WIND_SPEED - _svx[i]) * drag * dt * 3.5;
+        _svz[i] += (w.dz * SMOKE_WIND_SPEED - _svz[i]) * drag * dt * 3.5;
         // Vertical wind steering — turbulence, slope updrafts, object deflection
-        _svy[i] += w.dy * SMOKE_WIND_SPEED * 0.5 * drag * dt;
+        _svy[i] += w.dy * SMOKE_WIND_SPEED * 0.7 * drag * dt;
 
         // ── Building attraction: structures pull in nearby smoke ──
-        // Wind competes with attraction — strong gusts blow smoke past homes
-        const ATTRACT_RANGE = 30;
-        const ATTRACT_STRENGTH = 5.0;
+        // Smoke trail is strongly drawn to buildings
+        const ATTRACT_RANGE = 35;
+        const ATTRACT_STRENGTH = 12.0;
         const windSpeed = Math.sqrt(w.dx * w.dx + w.dz * w.dz) * SMOKE_WIND_SPEED;
-        // Wind suppression: attraction fades as wind grows stronger
-        // At windSpeed ~4 attraction is full, at ~14+ it's nearly zero
-        const windSuppression = Math.max(0, 1.0 - (windSpeed - 4.0) / 10.0);
+        // Wind suppression is gentler — smoke is attracted even in moderate wind
+        const windSuppression = Math.max(0.15, 1.0 - (windSpeed - 6.0) / 14.0);
 
         let nearDist2 = ATTRACT_RANGE * ATTRACT_RANGE;
         let nearIdx = -1;
@@ -5741,33 +5760,38 @@
     //  Dense core + wispy outer shell, curl-noise swirling, wind-guided,
     //  coordinated breathing. One organism, not separate particles.
     // ─────────────────────────────────────────
-    const GHOST_MAX = 160;
-    const GHOST_CORE_R = 1.0;        // dense inner core radius
-    const GHOST_OUTER_R = 2.2;       // wispy outer reach
-    const GHOST_SPRING = 18.0;       // strong spring snap to formation
-    const GHOST_DAMP = 0.3;         // velocity damping (lower = more viscous)
+    const GHOST_MAX = 125;
+    const GHOST_MIN_SIZE_CORE = 0.3;
+    const GHOST_MAX_SIZE_CORE = 1;
+    const GHOST_MIN_SIZE_OUTER = 0.25;
+    const GHOST_MAX_SIZE_OUTER = 0.25;
+    const GHOST_CORE_R = 2;        // dense inner core radius
+    const GHOST_OUTER_R = 5;       // wispy outer reach
+    const GHOST_SPRING = 20.0;       // strong spring snap to formation
+    const GHOST_DAMP = 0.1;         // velocity damping (lower = more viscous)
     const GHOST_CURL_STR = 2.5;      // curl-noise swirl intensity
     const GHOST_CURL_SCALE = 0.6;    // spatial frequency of swirl
     const GHOST_CURL_SPEED = 0.4;    // swirl time evolution
     const GHOST_WIND_FACTOR = 0.3;   // wind push on cloud
-    const GHOST_BREATH_RATE = 1.2;   // breathing frequency (Hz)
+    const GHOST_BREATH_RATE = 1.3;   // breathing frequency (Hz)
     const GHOST_BREATH_AMP = 0.15;   // breathing expansion fraction
     const GHOST_OBS_RANGE = 4.0;     // obstacle avoidance trigger
     const GHOST_OBS_PUSH = 20.0;     // obstacle push + tangential slide
-    const GHOST_DRAIN_BLDG = 10.0;
+    const GHOST_DRAIN_BLDG = 20.0;
     const GHOST_DRAIN_WRAITH = 6.0;
-    const GHOST_REGEN_RATE = 4.0;
-    const GHOST_DRAIN_RATE_BLDG = 2.5;
+    const GHOST_REGEN_RATE = 2.0;
+    const GHOST_DRAIN_RATE_BLDG = 15.0;
     const GHOST_DRAIN_RATE_WRAITH = 5.0;
     const GHOST_ATTACK_RANGE = 5.0;
     const GHOST_ATTACK_DPS = 2.5;
-    const GHOST_LIGHT_COUNT = 2;
+    const GHOST_LIGHT_COUNT = 1;
 
     // Moon jump
     const MOON_GRAVITY = 2.5;
     const JUMP_VELOCITY = 10.0;
     let playerYVel = 0;
     let playerAirborne = false;
+    let _jumpLaunchFrame = false;
     let ghostActive = false;  // is ghost cloud currently active?
 
     // Ghost blob data (SoA)
@@ -5789,7 +5813,7 @@
 
     const _ghostGeo = new THREE.IcosahedronGeometry(0.1, 1);
     const _ghostMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
+      color: 0x8844ff,
       emissive: 0x8844ff,
       emissiveIntensity: 3.0,
       flatShading: true,
@@ -5857,8 +5881,8 @@
       const h = Math.random();
       _gbhue[i] = h < 0.88 ? 0.58 + h * 0.34 : 0.28 + (h - 0.88) * 1.5;
       _gbsz[i] = layer === 0
-        ? 0.10 + Math.random() * 0.10
-        : 0.05 + Math.random() * 0.07;
+        ? (GHOST_MIN_SIZE_CORE + Math.random() * GHOST_MAX_SIZE_CORE)
+        : (GHOST_MIN_SIZE_OUTER + Math.random() * GHOST_MAX_SIZE_OUTER);
     }
 
     function updateGhostCloud(dt) {
@@ -5888,11 +5912,14 @@
       const t = performance.now() * 0.001;
       const gp = getGhostPower();
       const ashen = getEffectiveAshenPower();
-      ghostMaxBlobs = Math.floor(GHOST_MAX * gp * ghostFade * Math.max(0.1, ashen));
+      // Max blobs based on ghost power (moon phase) and fade-in only
+      ghostMaxBlobs = Math.floor(GHOST_MAX * gp * ghostFade);
 
-      // ── Regeneration ──
+      // ── Regeneration — ashen drain slows regen rate, doesn't reduce cap ──
       if (ghostBlobCount < ghostMaxBlobs) {
-        const rate = ghostBlobCount < 20 ? 80 : GHOST_REGEN_RATE;
+        // Full ashen = full regen, drained ashen = much slower recovery
+        const regenMult = 0.15 + ashen * 0.85; // 0.15..1.0
+        const rate = GHOST_REGEN_RATE * regenMult;
         const toSpawn = Math.min(Math.ceil(rate * dt), ghostMaxBlobs - ghostBlobCount);
         let spawned = 0;
         for (let i = 0; i < GHOST_MAX && spawned < toSpawn; i++) {
@@ -5901,26 +5928,28 @@
         ghostBlobCount += spawned;
       }
 
-      // ── Building drain: sudden yank toward center + tangential curve ──
+      // ── Building drain: wind field pulls blobs in, consume on contact ──
+      // The wind vector field already has building attractor pull (getWindDebug §6).
+      // Here we just consume blobs that reach a building and apply per-blob wind
+      // near buildings so they actually feel the pull (shared wind is at player center).
       for (let bi = 0; bi < buildingAttractors.length; bi++) {
         const ba = buildingAttractors[bi];
         if (ba.destroyed) continue;
-        const bd = Math.sqrt((ba.x - px) ** 2 + (ba.z - pz) ** 2);
-        if (bd < GHOST_DRAIN_BLDG + 5) {
-          let drained = 0;
-          const drainBudget = GHOST_DRAIN_RATE_BLDG * dt;
-          for (let i = 0; i < GHOST_MAX && drained < drainBudget; i++) {
-            if (!_gbac[i]) continue;
-            const ddx = _gbx[i] - ba.x, ddz = _gbz[i] - ba.z;
-            const d2 = ddx * ddx + ddz * ddz;
-            if (d2 < GHOST_DRAIN_BLDG * GHOST_DRAIN_BLDG) {
-              const d = Math.sqrt(d2) + 0.1;
-              _gbvx[i] += (-ddx / d) * 35;
-              _gbvz[i] += (-ddz / d) * 35;
-              _gbvx[i] += (-ddz / d) * 15; // tangential curve
-              _gbvz[i] += (ddx / d) * 15;
-              if (d2 < 4) { _gbac[i] = 0; ghostBlobCount--; drained++; }
-            }
+        const bd2 = (ba.x - px) ** 2 + (ba.z - pz) ** 2;
+        if (bd2 > (GHOST_DRAIN_BLDG + 10) ** 2) continue;
+        for (let i = 0; i < GHOST_MAX; i++) {
+          if (!_gbac[i]) continue;
+          const ddx = _gbx[i] - ba.x, ddz = _gbz[i] - ba.z;
+          const d2 = ddx * ddx + ddz * ddz;
+          // Consume on contact
+          if (d2 < (ba.r + 1.0) * (ba.r + 1.0)) {
+            _gbac[i] = 0; ghostBlobCount--; continue;
+          }
+          // Per-blob wind near buildings — getWindDebug includes attractor pull
+          if (d2 < GHOST_DRAIN_BLDG * GHOST_DRAIN_BLDG) {
+            const bw = getWindDebug(_gbx[i], _gby[i], _gbz[i], windTime);
+            _gbvx[i] += bw.dx * SMOKE_WIND_SPEED * 0.8 * dt;
+            _gbvz[i] += bw.dz * SMOKE_WIND_SPEED * 0.8 * dt;
           }
         }
       }
@@ -6016,40 +6045,39 @@
         fx += (_curlCenter.x * cCos - _curlCenter.z * cSin) * 0.8;
         fz += (_curlCenter.x * cSin + _curlCenter.z * cCos) * 0.8;
 
-        // Obstacle avoidance (only for outer-layer blobs — core is shielded)
-        if (_gblayer[i] === 1) {
-          for (let bi = 0; bi < _nearBldg.length; bi++) {
-            const ba = _nearBldg[bi];
-            const odx = _gbx[i] - ba.x, odz = _gbz[i] - ba.z;
-            const od2 = odx * odx + odz * odz;
-            const thresh = ba.r + GHOST_OBS_RANGE;
-            if (od2 < thresh * thresh && od2 > 0.01) {
-              const od = Math.sqrt(od2);
-              const pen = 1.0 - od / thresh;
-              const push = GHOST_OBS_PUSH * pen * pen;
-              fx += (odx / od) * push + (-odz / od) * push * 0.7;
-              fz += (odz / od) * push + (odx / od) * push * 0.7;
-              if (_gby[i] < ba.y + 3) fy += push * 0.6;
-            }
+        // Obstacle avoidance — all blobs interact with buildings and trees
+        for (let bi = 0; bi < _nearBldg.length; bi++) {
+          const ba = _nearBldg[bi];
+          const odx = _gbx[i] - ba.x, odz = _gbz[i] - ba.z;
+          const od2 = odx * odx + odz * odz;
+          const thresh = ba.r + GHOST_OBS_RANGE;
+          if (od2 < thresh * thresh && od2 > 0.01) {
+            const od = Math.sqrt(od2);
+            const pen = 1.0 - od / thresh;
+            const push = GHOST_OBS_PUSH * pen * pen;
+            fx += (odx / od) * push + (-odz / od) * push * 0.7;
+            fz += (odz / od) * push + (odx / od) * push * 0.7;
+            if (_gby[i] < ba.y + 3) fy += push * 0.6;
           }
-          for (let ti = 0; ti < _nearTrees.length; ti++) {
-            const tp = _nearTrees[ti];
-            const odx = _gbx[i] - tp.x, odz = _gbz[i] - tp.z;
-            const od2 = odx * odx + odz * odz;
-            if (od2 < 6.25 && od2 > 0.01) {
-              const od = Math.sqrt(od2);
-              const pen = 1.0 - od / 2.5;
-              const push = GHOST_OBS_PUSH * 0.4 * pen;
-              fx += (odx / od) * push + (-odz / od) * push * 0.5;
-              fz += (odz / od) * push + (odx / od) * push * 0.5;
-            }
+        }
+        for (let ti = 0; ti < _nearTrees.length; ti++) {
+          const tp = _nearTrees[ti];
+          const odx = _gbx[i] - tp.x, odz = _gbz[i] - tp.z;
+          const od2 = odx * odx + odz * odz;
+          if (od2 < 6.25 && od2 > 0.01) {
+            const od = Math.sqrt(od2);
+            const pen = 1.0 - od / 2.5;
+            const push = GHOST_OBS_PUSH * 0.4 * pen;
+            fx += (odx / od) * push + (-odz / od) * push * 0.5;
+            fz += (odz / od) * push + (odx / od) * push * 0.5;
           }
         }
 
-        // Integrate
-        _gbvx[i] = (_gbvx[i] + fx * dt) * GHOST_DAMP;
-        _gbvy[i] = (_gbvy[i] + fy * dt) * GHOST_DAMP;
-        _gbvz[i] = (_gbvz[i] + fz * dt) * GHOST_DAMP;
+        // Integrate — frame-rate-independent damping
+        const damp = Math.pow(GHOST_DAMP, dt);
+        _gbvx[i] = (_gbvx[i] + fx * dt) * damp;
+        _gbvy[i] = (_gbvy[i] + fy * dt) * damp;
+        _gbvz[i] = (_gbvz[i] + fz * dt) * damp;
         _gbx[i] += _gbvx[i] * dt;
         _gby[i] += _gbvy[i] * dt;
         _gbz[i] += _gbvz[i] * dt;
@@ -6115,7 +6143,8 @@
           const h = _gbhue[bi] + Math.sin(t * 1.0 + li * 2.1) * 0.05;
           const c = hsvToColor(((h % 1) + 1) % 1, 0.8, 1.0);
           gl.light.color.copy(c);
-          gl.light.intensity = (100 + Math.sin(t * 1.8 + li * 1.5) * 40) * ghostFade * gp;
+          const blobRatio = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
+          gl.light.intensity = (100 + Math.sin(t * 1.8 + li * 1.5) * 40) * ghostFade * gp * blobRatio;
           gl.light.distance = 18 + gp * 8;
         }
       }
@@ -6123,19 +6152,37 @@
       // ── Moon jump ──
       if (ghostActive && keys[' '] && !playerAirborne) {
         playerAirborne = true;
+        _jumpLaunchFrame = true;
         playerYVel = JUMP_VELOCITY;
+        // Launch carries current horizontal velocity — no reset
       }
       if (playerAirborne) {
         playerYVel -= MOON_GRAVITY * dt;
-        // Wind pushes player in the air — stronger with altitude
+
+        // Space while already airborne = dive downward (skip launch frame)
+        if (keys[' '] && !_jumpLaunchFrame) {
+          playerYVel -= 12.0 * dt;
+        }
+        _jumpLaunchFrame = false;
+
+        // Wind drives airborne velocity — ghost power determines wind resistance
         const airGndY = getTerrainY(playerGroup.position.x, playerGroup.position.z);
         const airHag = Math.max(0, playerGroup.position.y - airGndY);
-        const airWindScale = Math.min(airHag / 8.0, 2.5); // ramps up with height, caps at 2.5x
+        const gp = getGhostPower();
+        // Wind ramps gently with altitude, capped modestly
+        const airWindScale = Math.min(airHag / 10.0, 1.5);
         const airWind = windForSmoke(playerGroup.position.x, playerGroup.position.z,
                                      playerGroup.position.y, airGndY, windTime);
-        playerVelocity.x += airWind.dx * SMOKE_WIND_SPEED * airWindScale * dt * 0.8;
-        playerVelocity.z += airWind.dz * SMOKE_WIND_SPEED * airWindScale * dt * 0.8;
-        playerYVel += airWind.dy * SMOKE_WIND_SPEED * airWindScale * dt * 0.3;
+        // Target velocity = wind vector scaled down (was way too strong)
+        const windTargetX = airWind.dx * SMOKE_WIND_SPEED * airWindScale * 0.4;
+        const windTargetZ = airWind.dz * SMOKE_WIND_SPEED * airWindScale * 0.4;
+        // Wind drag: strong ghost (gp=1) resists wind, weak ghost (gp=0.25) carried by it
+        // gp=1.0 → drag 0.3, gp=0.25 → drag 1.2
+        const windDrag = Math.min((1.5 - gp * 1.2) * dt, 0.85);
+        playerVelocity.x += (windTargetX - playerVelocity.x) * windDrag;
+        playerVelocity.z += (windTargetZ - playerVelocity.z) * windDrag;
+        // Vertical wind — gentle
+        playerYVel += airWind.dy * SMOKE_WIND_SPEED * airWindScale * dt * 0.25;
 
         playerGroup.position.y += playerYVel * dt;
         const groundY = getExactTerrainY(playerGroup.position.x, playerGroup.position.z);
@@ -6145,7 +6192,8 @@
         }
       }
 
-      playerNightLight.intensity = ghostFade * gp * 800;
+      const blobFrac = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
+      playerNightLight.intensity = ghostFade * gp * blobFrac * 300;
     }
 
     // ─────────────────────────────────────────
