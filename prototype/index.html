@@ -1287,7 +1287,7 @@
     const canopyAttractors = []; // { x, y, z, r, mats[], glowIntensity, glowColor }
 
     function createSettlement(center, palette, buildingCount) {
-      const group = new THREE.Group();
+      const settlementGroup = new THREE.Group();
       // Buildings in a cluster
       for (let i = 0; i < buildingCount; i++) {
         const angle = (i / buildingCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.5;
@@ -1301,7 +1301,7 @@
         // Place on terrain
         const wy = getTerrainY(center.x + bx, center.y + bz);
         building.position.y = wy;
-        group.add(building);
+        settlementGroup.add(building);
         // Register as smoke attractor (world space)
         const dims = building.userData.dims;
         // Compute window light positions in world space — one per windowed face, offset outward
@@ -1340,6 +1340,8 @@
           contaminated: false, vineGroup: null,
           dims: { w: dims.w, h: dims.h, d: dims.d },
           groundY: wy, rotation: building.rotation.y,
+          food: 0, foodBagMesh: null,
+          buildingMesh: building,
         });
         // Hard wind blocker — buildings act as solid obstacles
         // Register all 4 vertical faces of the building box in world space.
@@ -1380,7 +1382,7 @@
         const wallGY = getTerrainY(center.x + wx, center.y + wz);
         wall.position.set(wx, wallGY, wz);
         wall.rotation.y = angle + Math.PI / 2;
-        group.add(wall);
+        settlementGroup.add(wall);
         // Register both long faces of the wall (±Z in wall local space).
         // wallRot = angle + PI/2.  Local ±Z world normals:
         //   +Z → (-cos(angle), 0, -sin(angle))
@@ -1396,8 +1398,8 @@
           collisionBoxes.push({ cx: center.x + wx, cz: center.y + wz, hw: wallLen / 2 + 0.3, hd: 0.4 + 0.3, cosR: Math.cos(wallRot), sinR: Math.sin(wallRot) });
         }
       }
-      group.position.set(center.x, 0, center.y);
-      return group;
+      settlementGroup.position.set(center.x, 0, center.y);
+      return settlementGroup;
     }
 
     // ─────────────────────────────────────────
@@ -1710,6 +1712,7 @@
           NPC_SEEK_ROCK = 9,
           NPC_FARM_WALK_TREE = 10, NPC_FARM_CHOP = 11, NPC_FARM_WALK_SITE = 12,
           NPC_FARM_BUILD = 13, NPC_FARM_TEND = 14,
+          NPC_FARM_HARVEST = 15, NPC_FARM_DELIVER = 16,
           NPC_TURRET_WALK_ROCK = 20, NPC_TURRET_GATHER_ROCK = 21,
           NPC_TURRET_WALK_SITE = 22, NPC_TURRET_BUILD = 23,
           NPC_TURRET_SEEK_ROCK = 24;
@@ -1718,7 +1721,11 @@
     const FARM_WOOD_NEEDED  = 2;    // wood trips to build a farm
     const FARM_BUILD_TIME   = 8.0;  // seconds to construct
     const FARM_TEND_INTERVAL = 6;   // seconds between tending cycles
-    const farms = [];               // { mesh, x, z, tenderIdx, growthStage (0-3) }
+    const FARM_HARVEST_TIME = 3.0;  // seconds to harvest corn
+    const CORN_TEND_CYCLES_MIN = 1; // min tend cycles corn stays ripe
+    const CORN_TEND_CYCLES_MAX = 2; // max tend cycles before harvest
+    const farms = [];               // { mesh, x, z, tenderIdx, growthStage (0-4), cornCyclesLeft }
+    let lastMoonCyclePhase = -1;    // track full moon cycle for food consumption
     const ROCK_TRIPS  = 1; // rock trips for foundation
     const WOOD_TRIPS  = 1;  // wood trips for walls (per-tree trips are dynamic based on size)
 
@@ -3104,6 +3111,7 @@
       const BLDG_CHIMNEY_HORIZ = 6.0;   // horizontal radius of chimney suction
       for (let bi = 0; bi < buildingAttractors.length; bi++) {
         const ba = buildingAttractors[bi];
+        if (ba.destroyed) continue;
         const adx = ba.x - wx, adz = ba.z - wz;
         const ad2 = adx * adx + adz * adz;
         if (ad2 > BLDG_ATTRACT_RANGE * BLDG_ATTRACT_RANGE) continue;
@@ -3585,7 +3593,7 @@
         _chimSpawnT = 0;
         for (let bi = 0; bi < buildingAttractors.length; bi++) {
           const b = buildingAttractors[bi];
-          if (b.hearth <= 0) continue;
+          if (b.destroyed || b.hearth <= 0) continue;
           // Emission probability scales with hearth score
           if (Math.random() > b.hearth * 0.4) continue;
           const ci = _chimHead;
@@ -3840,6 +3848,7 @@
       const OBJ_VERT_RANGE = 25;
       for (let bi = 0; bi < buildingAttractors.length; bi++) {
         const ba = buildingAttractors[bi];
+        if (ba.destroyed) continue;
         const odx = wx - ba.x, odz = wz - ba.z;
         const od2 = odx * odx + odz * odz;
         if (od2 > OBJ_VERT_RANGE * OBJ_VERT_RANGE) continue;
@@ -3896,6 +3905,7 @@
 
       for (let bi = 0; bi < buildingAttractors.length; bi++) {
         const ba = buildingAttractors[bi];
+        if (ba.destroyed) continue;
         if (ba.charge > 0.001) {
           if (autoCycle) {
             const drainRate = 1.0 / (MAX_DRAIN_TIME * Math.max(ba.charge, 0.05));
@@ -4292,6 +4302,8 @@
         // Turret building
         turretSiteIdx: -1,
         turretRocksCarried: 0,
+        // Farm delivery
+        deliverHomeIdx: -1,
       });
       // Assign farmer role to some non-builders
       const newNpc = npcs[npcs.length - 1];
@@ -4328,6 +4340,43 @@
         if (d2 < bestD2) { bestD2 = d2; best = i; }
       }
       return best;
+    }
+
+    // ── Corn bag mesh — small sack placed next to fed homes ──
+    function createCornBagMesh() {
+      const g = new THREE.Group();
+      // Sack body — rounded cylinder
+      const sackGeo = new THREE.CylinderGeometry(0.3, 0.35, 0.5, 6);
+      const sackMat = new THREE.MeshStandardMaterial({
+        color: 0xc4a44a, flatShading: true, roughness: 0.9
+      });
+      const sack = new THREE.Mesh(sackGeo, sackMat);
+      sack.position.y = 0.25;
+      sack.castShadow = true;
+      g.add(sack);
+      // Tied top — small sphere
+      const topGeo = new THREE.SphereGeometry(0.18, 4, 4);
+      const topMat = new THREE.MeshStandardMaterial({
+        color: 0x8a6a20, flatShading: true
+      });
+      const top = new THREE.Mesh(topGeo, topMat);
+      top.position.y = 0.55;
+      top.scale.y = 0.6;
+      g.add(top);
+      // A few corn ears poking out the top
+      for (let i = 0; i < 3; i++) {
+        const earGeo = new THREE.CylinderGeometry(0.04, 0.03, 0.2, 4);
+        const earMat = new THREE.MeshStandardMaterial({
+          color: 0xeedd44, flatShading: true
+        });
+        const ear = new THREE.Mesh(earGeo, earMat);
+        const ang = (i / 3) * Math.PI * 2 + Math.random() * 0.5;
+        ear.position.set(Math.cos(ang) * 0.1, 0.65, Math.sin(ang) * 0.1);
+        ear.rotation.z = (Math.random() - 0.5) * 0.6;
+        ear.rotation.x = (Math.random() - 0.5) * 0.3;
+        g.add(ear);
+      }
+      return g;
     }
 
     // ── Farm mesh — fenced crop plot ──
@@ -4388,7 +4437,49 @@
       }
       cropGroup.visible = false; // hidden until tended
       g.add(cropGroup);
+      // Corn group — yellow ears on stalks, shown when ripe (stage 4)
+      const cornGroup = new THREE.Group();
+      for (let r = -2; r <= 2; r++) {
+        for (let c = -3; c <= 3; c++) {
+          const stalk = new THREE.Group();
+          const stalkX = c * 0.95 + (Math.random() - 0.5) * 0.2;
+          const stalkZ = r * 1.2 + (Math.random() - 0.5) * 0.2;
+          // Tall stalk
+          const stalkMesh = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.03, 0.04, 1.2, 4),
+            new THREE.MeshStandardMaterial({ color: 0x558833, flatShading: true })
+          );
+          stalkMesh.position.y = 0.6;
+          stalk.add(stalkMesh);
+          // Corn ear — yellow cylinder with rounded ends
+          const earGeo = new THREE.CylinderGeometry(0.08, 0.06, 0.3, 5);
+          const earMat = new THREE.MeshStandardMaterial({
+            color: 0xeedd44, emissive: 0x554400, emissiveIntensity: 0.15,
+            flatShading: true
+          });
+          const ear = new THREE.Mesh(earGeo, earMat);
+          ear.position.set(0.06, 0.85 + Math.random() * 0.15, 0);
+          ear.rotation.z = 0.4 + Math.random() * 0.3;
+          stalk.add(ear);
+          // Leaf
+          const leafGeo = new THREE.PlaneGeometry(0.35, 0.08);
+          const leafMat = new THREE.MeshStandardMaterial({
+            color: 0x66aa33, flatShading: true, side: THREE.DoubleSide
+          });
+          const leaf = new THREE.Mesh(leafGeo, leafMat);
+          leaf.position.set(-0.1, 0.7, 0);
+          leaf.rotation.z = -0.6;
+          leaf.rotation.y = Math.random() * Math.PI;
+          stalk.add(leaf);
+          stalk.position.set(stalkX, 0.2, stalkZ);
+          stalk.castShadow = true;
+          cornGroup.add(stalk);
+        }
+      }
+      cornGroup.visible = false;
+      g.add(cornGroup);
       g.userData.cropGroup = cropGroup;
+      g.userData.cornGroup = cornGroup;
       g.userData.soilMat = soilMat;
       g.position.set(x, gy, z);
       return g;
@@ -4524,6 +4615,28 @@
         if (score > bestScore) { bestScore = score; bestX = cx; bestZ = cz; }
       }
       return { x: bestX, z: bestZ };
+    }
+
+    // Remove collision boxes and wind faces belonging to a destroyed building
+    function removeDestroyedBuildingPhysics(bx, bz, dims) {
+      const hw = dims.w / 2 + 1.0;
+      const hd = dims.d / 2 + 1.0;
+      const maxR = Math.max(hw, hd) + 2.0;
+      const maxR2 = maxR * maxR;
+      // Remove collision boxes near this building
+      for (let ci = collisionBoxes.length - 1; ci >= 0; ci--) {
+        const cb = collisionBoxes[ci];
+        if ((cb.cx - bx) ** 2 + (cb.cz - bz) ** 2 < maxR2) {
+          collisionBoxes.splice(ci, 1);
+        }
+      }
+      // Remove wind faces near this building
+      for (let fi = windFaces.length - 1; fi >= 0; fi--) {
+        const wf = windFaces[fi];
+        if ((wf.cx - bx) ** 2 + (wf.cz - bz) ** 2 < maxR2) {
+          windFaces.splice(fi, 1);
+        }
+      }
     }
 
     // Find the building attractor nearest to a world position
@@ -4706,6 +4819,19 @@
             if (!npc.isBuilder) {
               // ── Farmer: build a farm then tend it ──
               if (npc.isFarmer) {
+                // Resume food delivery if carrying corn
+                if (npc.carrying && npc.deliverHomeIdx >= 0) {
+                  const ba = buildingAttractors[npc.deliverHomeIdx];
+                  if (ba && !ba.destroyed && ba.food < 1) {
+                    npc.targetX = ba.x;
+                    npc.targetZ = ba.z;
+                    npc.state = NPC_FARM_DELIVER;
+                    break;
+                  }
+                  // Target home gone or fed — drop food, go tend
+                  npc.carrying = false;
+                  npc.deliverHomeIdx = -1;
+                }
                 // Already has a farm — tend it
                 if (npc.farmIdx >= 0) {
                   const farm = farms[npc.farmIdx];
@@ -5166,6 +5292,8 @@
                 contaminated: false, vineGroup: null,
                 dims: { w: bw, h: bh, d: bd },
                 groundY: bgy, rotation: nb.rotation.y,
+                food: 0, foodBagMesh: null,
+                buildingMesh: nb,
               });
               // Register collision box for player avoidance
               collisionBoxes.push({
@@ -5393,6 +5521,7 @@
                 x: npc.siteX, z: npc.siteZ,
                 tenderIdx: npcs.indexOf(npc),
                 growthStage: 0,
+                cornCyclesLeft: 0,
                 destroyed: false,
               });
               npc.farmIdx = farmIdx;
@@ -5411,11 +5540,10 @@
               npc.timer = 10;
               break;
             }
-            // Walk to farm if not there (ignore path speed boost)
+            // Walk to farm if not there
             const dxF = farm.x - npc.x, dzF = farm.z - npc.z;
             const distToFarm = Math.sqrt(dxF * dxF + dzF * dzF);
             if (distToFarm > 3.0) {
-              // Walk toward farm at slow fixed speed (no path boost)
               const walkSpd = 3.5;
               const step = Math.min(walkSpd * dt, distToFarm);
               npc.x += (dxF / distToFarm) * step;
@@ -5430,7 +5558,7 @@
             } else {
               // Slowly amble around the farm
               npc.timer -= dt;
-              npc.walkPhase += dt * 0.5; // very slow rotation
+              npc.walkPhase += dt * 0.5;
               const tendAng = npc.walkPhase;
               npc.x = farm.x + Math.cos(tendAng) * 3;
               npc.z = farm.z + Math.sin(tendAng) * 3;
@@ -5438,30 +5566,177 @@
               npc.mesh.position.z = npc.z;
               npc.mesh.position.y = getTerrainY(npc.x, npc.z);
               npc.mesh.rotation.y = tendAng + Math.PI * 0.5;
-              // Gentle leg movement
               npc.mesh.userData.legL.rotation.x = Math.sin(tendAng * 3) * 0.15;
               npc.mesh.userData.legR.rotation.x = Math.sin(tendAng * 3 + Math.PI) * 0.15;
-              // Grow crops over time
-              if (farm.growthStage < 3 && npc.timer <= 0) {
-                farm.growthStage++;
-                npc.timer = FARM_TEND_INTERVAL;
-                const crops = farm.mesh.userData.cropGroup;
-                crops.visible = true;
-                // Scale crops with growth
-                const s = farm.growthStage / 3;
-                crops.children.forEach(c => {
-                  c.scale.setScalar(s);
-                  c.material.color.setHex(
-                    farm.growthStage === 1 ? 0x55993a :
-                    farm.growthStage === 2 ? 0x66aa40 : 0x88cc44
-                  );
-                });
+              if (npc.timer <= 0) {
+                if (farm.growthStage < 3) {
+                  // Green crop growth stages 1-3
+                  farm.growthStage++;
+                  npc.timer = FARM_TEND_INTERVAL;
+                  const crops = farm.mesh.userData.cropGroup;
+                  crops.visible = true;
+                  const s = farm.growthStage / 3;
+                  crops.children.forEach(c => {
+                    c.scale.setScalar(s);
+                    c.material.color.setHex(
+                      farm.growthStage === 1 ? 0x55993a :
+                      farm.growthStage === 2 ? 0x66aa40 : 0x88cc44
+                    );
+                  });
+                } else if (farm.growthStage === 3) {
+                  // Transition to corn (stage 4) — hide green crops, show corn
+                  farm.growthStage = 4;
+                  farm.cornCyclesLeft = CORN_TEND_CYCLES_MIN +
+                    Math.floor(Math.random() * (CORN_TEND_CYCLES_MAX - CORN_TEND_CYCLES_MIN + 1));
+                  npc.timer = FARM_TEND_INTERVAL;
+                  farm.mesh.userData.cropGroup.visible = false;
+                  farm.mesh.userData.cornGroup.visible = true;
+                } else if (farm.growthStage === 4) {
+                  // Corn is ripe — count down tend cycles
+                  farm.cornCyclesLeft--;
+                  if (farm.cornCyclesLeft <= 0) {
+                    // Time to harvest!
+                    npc.state = NPC_FARM_HARVEST;
+                    npc.timer = FARM_HARVEST_TIME;
+                  } else {
+                    npc.timer = FARM_TEND_INTERVAL;
+                  }
+                }
               }
+            }
+            break;
+          }
+
+          case NPC_FARM_HARVEST: {
+            const farm = npc.farmIdx >= 0 ? farms[npc.farmIdx] : null;
+            if (!farm || farm.destroyed) {
+              npc.farmIdx = -1;
+              npc.state = NPC_IDLE;
+              npc.timer = 10;
+              break;
+            }
+            npc.timer -= dt;
+            // Harvesting animation — bend repeatedly
+            npc.mesh.children[0].rotation.x = Math.sin(performance.now() * 0.008) * 0.4;
+            if (npc.timer <= 0) {
+              npc.mesh.children[0].rotation.x = 0;
+              npc.carrying = true;
+              // Hide corn, reset farm to stage 0
+              farm.mesh.userData.cornGroup.visible = false;
+              farm.mesh.userData.cropGroup.visible = false;
+              farm.growthStage = 0;
+              // Find nearest home without food
+              let bestHome = -1, bestD2 = Infinity;
+              for (let bi = 0; bi < buildingAttractors.length; bi++) {
+                const ba = buildingAttractors[bi];
+                if (ba.destroyed || ba.contaminated) continue;
+                if (ba.food >= 1) continue; // already has food
+                const d2 = (ba.x - farm.x) ** 2 + (ba.z - farm.z) ** 2;
+                if (d2 < bestD2) { bestD2 = d2; bestHome = bi; }
+              }
+              if (bestHome >= 0) {
+                npc.deliverHomeIdx = bestHome;
+                npc.targetX = buildingAttractors[bestHome].x;
+                npc.targetZ = buildingAttractors[bestHome].z;
+                npc.state = NPC_FARM_DELIVER;
+              } else {
+                // No hungry homes — just go back to tending
+                npc.carrying = false;
+                npc.state = NPC_FARM_TEND;
+                npc.timer = FARM_TEND_INTERVAL;
+              }
+            }
+            break;
+          }
+
+          case NPC_FARM_DELIVER: {
+            if (moveNPC(npc, npc.targetX, npc.targetZ, dt) === 0) {
+              npc.carrying = false;
+              // Deliver food to the home
+              const bi = npc.deliverHomeIdx;
+              if (bi >= 0 && bi < buildingAttractors.length) {
+                const ba = buildingAttractors[bi];
+                if (!ba.destroyed && ba.food < 1) {
+                  ba.food = 1;
+                  // Create corn bag mesh next to the home
+                  if (!ba.foodBagMesh) {
+                    ba.foodBagMesh = createCornBagMesh();
+                    scene.add(ba.foodBagMesh);
+                  }
+                  // Position the bag next to the building
+                  const bagAngle = ba.rotation + Math.PI * 0.5;
+                  const bagDist = Math.max(ba.dims.w, ba.dims.d) * 0.5 + 0.8;
+                  ba.foodBagMesh.position.set(
+                    ba.x + Math.cos(bagAngle) * bagDist,
+                    ba.groundY,
+                    ba.z + Math.sin(bagAngle) * bagDist
+                  );
+                  ba.foodBagMesh.visible = true;
+                }
+              }
+              npc.deliverHomeIdx = -1;
+              // Go back to farm
+              npc.state = NPC_FARM_TEND;
+              npc.timer = FARM_TEND_INTERVAL;
             }
             break;
           }
         }
       }
+    }
+
+    let _lastFoodCheckPhase = -1; // tracks last phase when food was checked
+    function updateNPCsHomes(dt) {
+      // Fire once when moon transitions from Waning Crescent (7) → New Moon (0)
+      if (moonPhaseIndex === 0 && _lastFoodCheckPhase === 7) {
+        for (let bi = 0; bi < buildingAttractors.length; bi++) {
+          const ba = buildingAttractors[bi];
+          if (ba.destroyed) continue;
+          if (ba.food > 0) {
+            ba.food = 0;
+            if (ba.foodBagMesh) ba.foodBagMesh.visible = false;
+          } else {
+            // Starvation — no food → destroy building and its NPC
+            ba.destroyed = true;
+            removeDestroyedBuildingPhysics(ba.x, ba.z, ba.dims);
+            // Hide building mesh
+            if (ba.buildingMesh) {
+              ba.buildingMesh.visible = false;
+            }
+            // Remove corn bag if any
+            if (ba.foodBagMesh) {
+              scene.remove(ba.foodBagMesh);
+              ba.foodBagMesh = null;
+            }
+            // Remove vines if contaminated
+            if (ba.vineGroup) {
+              scene.remove(ba.vineGroup);
+              ba.vineGroup.traverse(c => {
+                if (c.geometry) c.geometry.dispose();
+                if (c.material) c.material.dispose();
+              });
+              ba.vineGroup = null;
+            }
+            // Kill the NPC whose home this is
+            for (let ni = npcs.length - 1; ni >= 0; ni--) {
+              const npc = npcs[ni];
+              const d2 = (npc.homeX - ba.x) ** 2 + (npc.homeZ - ba.z) ** 2;
+              if (d2 < 4) {
+                scene.remove(npc.mesh);
+                npc.mesh.traverse(c => {
+                  if (c.geometry) c.geometry.dispose();
+                  if (c.material) c.material.dispose();
+                });
+                if (npc.farmIdx >= 0 && farms[npc.farmIdx]) {
+                  farms[npc.farmIdx].tenderIdx = -1;
+                }
+                npcs.splice(ni, 1);
+              }
+            }
+          }
+        }
+      }
+      _lastFoodCheckPhase = moonPhaseIndex;
     }
 
     // ─────────────────────────────────────────
@@ -6013,16 +6288,9 @@
                 hp -= dt * (SQ_BUILDING_MAX_HP / SQ_ATTACK_TIME);
                 buildingHP.set(sq.attackTargetIdx, hp);
                 if (hp <= 0) {
-                  scene.traverse(child => {
-                    if (child.isMesh && child.parent && child.parent.isGroup
-                        && child.parent !== scene) {
-                      const p = child.parent.position || child.position;
-                      if (Math.abs(p.x - ba.x) < 1 && Math.abs(p.z - ba.z) < 1) {
-                        child.parent.visible = false;
-                      }
-                    }
-                  });
                   ba.destroyed = true;
+                  if (ba.buildingMesh) ba.buildingMesh.visible = false;
+                  removeDestroyedBuildingPhysics(ba.x, ba.z, ba.dims);
                   sq.state = SQ_FLEE;
                   sq.fleeAngle = Math.random() * Math.PI * 2;
                   sq.fleeChangeTimer = 1 + Math.random() * 2;
@@ -7726,6 +7994,7 @@
 
       // NPCs + Mobs
       updateNPCs(dt);
+      updateNPCsHomes(dt);
       updateSquirrels(dt);
       updateGrowingTrees(dt);
       updateNightMobs(dt);
