@@ -2344,6 +2344,7 @@
     let pointerLocked = false;
     renderer.domElement.addEventListener('click', () => {
       renderer.domElement.requestPointerLock();
+      if (!SFX.initialized) SFX.init();
     });
     document.addEventListener('pointerlockchange', () => {
       pointerLocked = document.pointerLockElement === renderer.domElement;
@@ -2358,6 +2359,667 @@
     let mouseDown = false;
     document.addEventListener('mousedown', e => { if (e.button === 0 && pointerLocked) mouseDown = true; });
     document.addEventListener('mouseup', e => { if (e.button === 0) mouseDown = false; });
+
+    // ─────────────────────────────────────────
+    //  PROCEDURAL AUDIO ENGINE
+    // ─────────────────────────────────────────
+    const SFX = {
+      ctx: null, master: null, sfxGain: null, musicGain: null,
+      initialized: false,
+      _noiseBuf: null,
+      active: [],
+      MAX_CONCURRENT: 12,
+      _cooldowns: {},
+
+      init() {
+        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = 0.3;
+        this.master.connect(this.ctx.destination);
+        this.sfxGain = this.ctx.createGain();
+        this.sfxGain.gain.value = 1.0;
+        this.sfxGain.connect(this.master);
+        this.musicGain = this.ctx.createGain();
+        this.musicGain.gain.value = 1.0;
+        this.musicGain.connect(this.master);
+        // Cache white noise buffer (2 seconds)
+        const sr = this.ctx.sampleRate;
+        const buf = this.ctx.createBuffer(1, sr * 2, sr);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        this._noiseBuf = buf;
+        this.initialized = true;
+        // Mute on tab blur
+        document.addEventListener('visibilitychange', () => {
+          if (!this.ctx) return;
+          this.master.gain.setTargetAtTime(document.hidden ? 0 : 0.3, this.ctx.currentTime, 0.1);
+        });
+        // Start ambient layers
+        this._startWindLayer();
+        this._startNightLayer();
+      },
+
+      canPlay() { return this.active.length < this.MAX_CONCURRENT; },
+
+      _trackSound(id) {
+        this.active.push(id);
+        return id;
+      },
+      _untrackSound(id) {
+        const idx = this.active.indexOf(id);
+        if (idx >= 0) this.active.splice(idx, 1);
+      },
+
+      _cooldown(name, ms) {
+        const now = performance.now();
+        if (this._cooldowns[name] && now - this._cooldowns[name] < ms) return false;
+        this._cooldowns[name] = now;
+        return true;
+      },
+
+      // Helper: create noise source
+      _noise(duration) {
+        const src = this.ctx.createBufferSource();
+        src.buffer = this._noiseBuf;
+        src.loop = false;
+        return src;
+      },
+
+      // Helper: create noise source (looping)
+      _noiseLoop() {
+        const src = this.ctx.createBufferSource();
+        src.buffer = this._noiseBuf;
+        src.loop = true;
+        return src;
+      },
+
+      // Helper: quick one-shot oscillator
+      _osc(type, freq, gainVal, attack, decay, dest) {
+        const t = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        osc.type = type;
+        osc.frequency.value = freq;
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(gainVal, t + attack);
+        g.gain.exponentialRampToValueAtTime(0.001, t + attack + decay);
+        osc.connect(g);
+        g.connect(dest || this.sfxGain);
+        osc.start(t);
+        osc.stop(t + attack + decay + 0.01);
+        return osc;
+      },
+
+      // ── Ambient layers ──
+
+      // Wind
+      _windSrc: null, _windFilter: null, _windGain: null,
+      _startWindLayer() {
+        const src = this._noiseLoop();
+        const flt = this.ctx.createBiquadFilter();
+        flt.type = 'bandpass';
+        flt.frequency.value = 400;
+        flt.Q.value = 0.8;
+        const g = this.ctx.createGain();
+        g.gain.value = 0.08;
+        src.connect(flt);
+        flt.connect(g);
+        g.connect(this.musicGain);
+        src.start();
+        this._windSrc = src;
+        this._windFilter = flt;
+        this._windGain = g;
+      },
+
+      // Ghost hum
+      _ghostOsc1: null, _ghostOsc2: null, _ghostGain: null, _ghostFilter: null, _ghostActive: false,
+      _startGhostHum() {
+        if (this._ghostActive) return;
+        const t = this.ctx.currentTime;
+        const o1 = this.ctx.createOscillator();
+        o1.type = 'sine'; o1.frequency.value = 80;
+        const o2 = this.ctx.createOscillator();
+        o2.type = 'sine'; o2.frequency.value = 123;
+        const flt = this.ctx.createBiquadFilter();
+        flt.type = 'lowpass'; flt.frequency.value = 400;
+        const g = this.ctx.createGain();
+        g.gain.value = 0;
+        o1.connect(flt); o2.connect(flt);
+        flt.connect(g);
+        g.connect(this.musicGain);
+        o1.start(t); o2.start(t);
+        this._ghostOsc1 = o1; this._ghostOsc2 = o2;
+        this._ghostGain = g; this._ghostFilter = flt;
+        this._ghostActive = true;
+      },
+      _stopGhostHum() {
+        if (!this._ghostActive) return;
+        const t = this.ctx.currentTime;
+        this._ghostGain.gain.setTargetAtTime(0, t, 0.3);
+        const o1 = this._ghostOsc1, o2 = this._ghostOsc2;
+        setTimeout(() => { try { o1.stop(); o2.stop(); } catch(e){} }, 1000);
+        this._ghostActive = false;
+      },
+
+      // Night ambient
+      _nightSrc: null, _nightGain: null, _nightFilter1: null,
+      _startNightLayer() {
+        const src = this._noiseLoop();
+        const f1 = this.ctx.createBiquadFilter();
+        f1.type = 'bandpass'; f1.frequency.value = 300; f1.Q.value = 0.3;
+        const f2 = this.ctx.createBiquadFilter();
+        f2.type = 'bandpass'; f2.frequency.value = 600; f2.Q.value = 0.3;
+        const g = this.ctx.createGain();
+        g.gain.value = 0;
+        src.connect(f1); f1.connect(f2); f2.connect(g);
+        g.connect(this.musicGain);
+        src.start();
+        this._nightSrc = src; this._nightGain = g;
+      },
+      _nightPingTimer: 0,
+
+      // Ambient update (called every frame)
+      updateAmbient(dt, _timeOfDay, _ghostFade, _windTime) {
+        if (!this.ctx) return;
+        const t = this.ctx.currentTime;
+
+        // Wind intensity modulation
+        if (this._windFilter) {
+          const isDay = _timeOfDay > 0.3 && _timeOfDay < 0.7;
+          const windBase = isDay ? 0.08 : 0.12;
+          const windFreq = 300 + Math.sin(_windTime * 0.2) * 200;
+          this._windFilter.frequency.setTargetAtTime(windFreq, t, 0.5);
+          this._windGain.gain.setTargetAtTime(windBase + Math.sin(_windTime * 0.1) * 0.03, t, 0.3);
+        }
+
+        // Ghost hum
+        if (_ghostFade > 0.01) {
+          if (!this._ghostActive) this._startGhostHum();
+          if (this._ghostGain) {
+            this._ghostGain.gain.setTargetAtTime(_ghostFade * 0.12, t, 0.2);
+          }
+        } else if (this._ghostActive) {
+          this._stopGhostHum();
+        }
+
+        // Night ambient crossfade
+        if (this._nightGain) {
+          const nightFade = (_timeOfDay > 0.75 || _timeOfDay < 0.25) ? 1.0
+            : (_timeOfDay >= 0.65 && _timeOfDay <= 0.75) ? (_timeOfDay - 0.65) / 0.1
+            : (_timeOfDay >= 0.25 && _timeOfDay <= 0.35) ? 1.0 - (_timeOfDay - 0.25) / 0.1
+            : 0;
+          this._nightGain.gain.setTargetAtTime(nightFade * 0.04, t, 0.5);
+
+          // Occasional sparkle pings at night
+          this._nightPingTimer -= dt;
+          if (nightFade > 0.3 && this._nightPingTimer <= 0) {
+            this._nightPingTimer = 3 + Math.random() * 5;
+            const freq = 800 + Math.random() * 1200;
+            this._osc('sine', freq, 0.008, 0.01, 0.4 + Math.random() * 0.3, this.musicGain);
+          }
+        }
+      },
+
+      // ── One-shot sounds ──
+
+      // Day/night transition
+      _transitionCooldown: false,
+      transition(type) {
+        if (!this.ctx || this._transitionCooldown) return;
+        this._transitionCooldown = true;
+        setTimeout(() => { this._transitionCooldown = false; }, 5000);
+        const t = this.ctx.currentTime;
+        const fromF = type === 'dusk' ? 100 : 200;
+        const toF = type === 'dusk' ? 200 : 100;
+        const o1 = this.ctx.createOscillator();
+        o1.type = 'sine'; o1.frequency.setValueAtTime(fromF, t);
+        o1.frequency.linearRampToValueAtTime(toF, t + 3);
+        const o2 = this.ctx.createOscillator();
+        o2.type = 'triangle'; o2.frequency.setValueAtTime(fromF + 5, t);
+        o2.frequency.linearRampToValueAtTime(toF + 5, t + 3);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.06, t + 0.5);
+        g.gain.setValueAtTime(0.06, t + 2.5);
+        g.gain.linearRampToValueAtTime(0, t + 3);
+        o1.connect(g); o2.connect(g);
+        g.connect(this.sfxGain);
+        o1.start(t); o2.start(t);
+        o1.stop(t + 3.1); o2.stop(t + 3.1);
+      },
+
+      // Jump launch — upward whoosh
+      jumpLaunch() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('jump', 300)) return;
+        const id = this._trackSound('jump');
+        const t = this.ctx.currentTime;
+        // Sine sweep up
+        const o = this.ctx.createOscillator();
+        o.type = 'sine';
+        o.frequency.setValueAtTime(150, t);
+        o.frequency.exponentialRampToValueAtTime(400, t + 0.3);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.12, t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+        o.connect(g); g.connect(this.sfxGain);
+        o.start(t); o.stop(t + 0.45);
+        // Noise whoosh
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'bandpass'; nf.frequency.value = 1000; nf.Q.value = 2;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0, t);
+        ng.gain.linearRampToValueAtTime(0.08, t + 0.02);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.4);
+        o.onended = () => this._untrackSound(id);
+      },
+
+      // Landing — soft thud
+      land() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('land', 200)) return;
+        const id = this._trackSound('land');
+        const t = this.ctx.currentTime;
+        const o = this.ctx.createOscillator();
+        o.type = 'sine'; o.frequency.value = 60;
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.15, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+        o.connect(g); g.connect(this.sfxGain);
+        o.start(t); o.stop(t + 0.2);
+        // Noise thud
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'lowpass'; nf.frequency.value = 300;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0.1, t);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.35);
+        o.onended = () => this._untrackSound(id);
+      },
+
+      // Turret zap — electric crack
+      turretZap() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('zap', 50)) return;
+        const id = this._trackSound('zap');
+        const t = this.ctx.currentTime;
+        const startF = 700 + Math.random() * 200;
+        const o = this.ctx.createOscillator();
+        o.type = 'square';
+        o.frequency.setValueAtTime(startF, t);
+        o.frequency.exponentialRampToValueAtTime(200, t + 0.08);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.1, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+        o.connect(g); g.connect(this.sfxGain);
+        o.start(t); o.stop(t + 0.2);
+        // Crack noise
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'bandpass'; nf.frequency.value = 2000; nf.Q.value = 4;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0.08, t);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.15);
+        o.onended = () => this._untrackSound(id);
+      },
+
+      // Wraith spawn — eerie rising moan
+      wraithSpawn() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('wSpawn', 3000)) return;
+        const id = this._trackSound('wSpawn');
+        const t = this.ctx.currentTime;
+        const o1 = this.ctx.createOscillator();
+        o1.type = 'sine';
+        o1.frequency.setValueAtTime(60, t);
+        o1.frequency.linearRampToValueAtTime(150, t + 1.5);
+        const o2 = this.ctx.createOscillator();
+        o2.type = 'sine';
+        o2.frequency.setValueAtTime(67, t);
+        o2.frequency.linearRampToValueAtTime(157, t + 1.5);
+        const flt = this.ctx.createBiquadFilter();
+        flt.type = 'bandpass'; flt.frequency.value = 200; flt.Q.value = 0.5;
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.07, t + 0.5);
+        g.gain.setValueAtTime(0.07, t + 1.0);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 1.8);
+        o1.connect(flt); o2.connect(flt); flt.connect(g); g.connect(this.sfxGain);
+        o1.start(t); o2.start(t);
+        o1.stop(t + 2); o2.stop(t + 2);
+        o1.onended = () => this._untrackSound(id);
+      },
+
+      // Wraith death — descending wail
+      wraithDie() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('wDie', 200)) return;
+        const id = this._trackSound('wDie');
+        const t = this.ctx.currentTime;
+        const o = this.ctx.createOscillator();
+        o.type = 'sine';
+        o.frequency.setValueAtTime(200, t);
+        o.frequency.exponentialRampToValueAtTime(50, t + 0.8);
+        // Vibrato LFO
+        const lfo = this.ctx.createOscillator();
+        lfo.type = 'sine'; lfo.frequency.value = 8;
+        const lfoG = this.ctx.createGain();
+        lfoG.gain.value = 20;
+        lfo.connect(lfoG); lfoG.connect(o.frequency);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.12, t + 0.05);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.8);
+        o.connect(g); g.connect(this.sfxGain);
+        o.start(t); lfo.start(t);
+        o.stop(t + 0.85); lfo.stop(t + 0.85);
+        // Noise layer
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'lowpass'; nf.frequency.value = 400;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0.04, t);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.7);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.75);
+        o.onended = () => this._untrackSound(id);
+      },
+
+      // Ghost consumes wraith — rising absorption tone
+      ghostConsume() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('gCon', 200)) return;
+        const id = this._trackSound('gCon');
+        const t = this.ctx.currentTime;
+        const o = this.ctx.createOscillator();
+        o.type = 'sine';
+        o.frequency.setValueAtTime(100, t);
+        o.frequency.exponentialRampToValueAtTime(300, t + 0.4);
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.1, t + 0.05);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+        o.connect(g); g.connect(this.sfxGain);
+        o.start(t); o.stop(t + 0.55);
+        // Shimmer
+        const o2 = this.ctx.createOscillator();
+        o2.type = 'triangle'; o2.frequency.value = 1200;
+        const lfo = this.ctx.createOscillator();
+        lfo.type = 'sine'; lfo.frequency.value = 15;
+        const lfoG = this.ctx.createGain();
+        lfoG.gain.value = 0.06;
+        lfo.connect(lfoG);
+        const g2 = this.ctx.createGain();
+        g2.gain.setValueAtTime(0, t);
+        g2.gain.linearRampToValueAtTime(0.04, t + 0.05);
+        g2.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+        lfoG.connect(g2.gain);
+        o2.connect(g2); g2.connect(this.sfxGain);
+        o2.start(t); lfo.start(t);
+        o2.stop(t + 0.55); lfo.stop(t + 0.55);
+        o.onended = () => this._untrackSound(id);
+      },
+
+      // Sword swing — metallic whoosh
+      swordSwing() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('sword', 250)) return;
+        const id = this._trackSound('sword');
+        const t = this.ctx.currentTime;
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'bandpass';
+        nf.frequency.value = 1300 + Math.random() * 400;
+        nf.Q.value = 1.5;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0, t);
+        ng.gain.linearRampToValueAtTime(0.1, t + 0.02);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.18);
+        // Metallic ring
+        this._osc('triangle', 800, 0.02, 0.01, 0.08, this.sfxGain);
+        n.onended = () => this._untrackSound(id);
+      },
+
+      // Vine snap — organic squelch
+      vineSnap() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('vine', 150)) return;
+        const id = this._trackSound('vine');
+        const t = this.ctx.currentTime;
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'bandpass';
+        nf.frequency.setValueAtTime(800, t);
+        nf.frequency.exponentialRampToValueAtTime(200, t + 0.1);
+        nf.Q.value = 2;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0.1, t);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.2);
+        // Pop
+        this._osc('sine', 300, 0.08, 0.005, 0.03, this.sfxGain);
+        n.onended = () => this._untrackSound(id);
+      },
+
+      // Building cleansed — ascending arpeggio chime
+      buildingCleansed() {
+        if (!this.ctx || !this.canPlay()) return;
+        const id = this._trackSound('cleansed');
+        const t = this.ctx.currentTime;
+        const notes = [523, 659, 784]; // C5, E5, G5
+        notes.forEach((freq, i) => {
+          const o = this.ctx.createOscillator();
+          o.type = 'sine'; o.frequency.value = freq;
+          const g = this.ctx.createGain();
+          const start = t + i * 0.08;
+          g.gain.setValueAtTime(0, start);
+          g.gain.linearRampToValueAtTime(0.08, start + 0.01);
+          g.gain.exponentialRampToValueAtTime(0.001, start + 0.35);
+          o.connect(g); g.connect(this.sfxGain);
+          o.start(start); o.stop(start + 0.4);
+          // Octave shimmer
+          const o2 = this.ctx.createOscillator();
+          o2.type = 'sine'; o2.frequency.value = freq * 2;
+          const g2 = this.ctx.createGain();
+          g2.gain.setValueAtTime(0, start);
+          g2.gain.linearRampToValueAtTime(0.02, start + 0.01);
+          g2.gain.exponentialRampToValueAtTime(0.001, start + 0.3);
+          o2.connect(g2); g2.connect(this.sfxGain);
+          o2.start(start); o2.stop(start + 0.35);
+          if (i === 2) o.onended = () => this._untrackSound(id);
+        });
+      },
+
+      // Ghost cleanse building — shimmering scatter of pings
+      ghostCleanse() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('gClean', 400)) return;
+        const id = this._trackSound('gClean');
+        const t = this.ctx.currentTime;
+        for (let i = 0; i < 5; i++) {
+          const freq = 400 + Math.random() * 400;
+          const start = t + i * 0.04;
+          this._osc('sine', freq, 0.06, 0.005, 0.08, this.sfxGain);
+        }
+        // Highpass noise scatter
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'highpass'; nf.frequency.value = 1000;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0.05, t);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.35);
+        n.onended = () => this._untrackSound(id);
+      },
+
+      // Ashen drain hit — dark oppressive pulse
+      ashenHit() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('ashen', 300)) return;
+        const id = this._trackSound('ashen');
+        const t = this.ctx.currentTime;
+        // Low thud with distortion
+        const o = this.ctx.createOscillator();
+        o.type = 'sine'; o.frequency.value = 50;
+        const ws = this.ctx.createWaveShaper();
+        const curve = new Float32Array(256);
+        for (let i = 0; i < 256; i++) { const x = (i / 128) - 1; curve[i] = (Math.PI + 3) * x / (Math.PI + 3 * Math.abs(x)); }
+        ws.curve = curve;
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.15, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+        o.connect(ws); ws.connect(g); g.connect(this.sfxGain);
+        o.start(t); o.stop(t + 0.3);
+        // Detuned beating pair
+        const o2 = this.ctx.createOscillator();
+        o2.type = 'sine'; o2.frequency.value = 130;
+        const o3 = this.ctx.createOscillator();
+        o3.type = 'sine'; o3.frequency.value = 137;
+        const g2 = this.ctx.createGain();
+        g2.gain.setValueAtTime(0.06, t);
+        g2.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+        o2.connect(g2); o3.connect(g2); g2.connect(this.sfxGain);
+        o2.start(t); o3.start(t);
+        o2.stop(t + 0.35); o3.stop(t + 0.35);
+        o.onended = () => this._untrackSound(id);
+      },
+
+      // Contaminate building — ominous creeping swell
+      contaminate() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('contam', 2000)) return;
+        const id = this._trackSound('contam');
+        const t = this.ctx.currentTime;
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'lowpass'; nf.frequency.value = 300;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0, t);
+        ng.gain.linearRampToValueAtTime(0.08, t + 0.5);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 1.0);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 1.1);
+        // Low sine bed
+        this._osc('sine', 80, 0.06, 0.3, 0.7, this.sfxGain);
+        n.onended = () => this._untrackSound(id);
+      },
+
+      // Footstep — quick soft thud
+      _stepTimer: 0,
+      footstep() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('foot', 280)) return;
+        const id = this._trackSound('foot');
+        const t = this.ctx.currentTime;
+        const cutoff = 180 + Math.random() * 40;
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'lowpass'; nf.frequency.value = cutoff; nf.Q.value = 0.5;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0.06, t);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.1);
+        n.onended = () => this._untrackSound(id);
+      },
+
+      // NPC chop — distant axe hit (distance-attenuated)
+      chop(dist) {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('chop', 100)) return;
+        const vol = 0.12 * Math.max(0, 1 - dist / 40);
+        if (vol < 0.005) return;
+        const id = this._trackSound('chop');
+        const t = this.ctx.currentTime;
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'bandpass'; nf.frequency.value = 1200; nf.Q.value = 3;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(vol, t);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.1);
+        // Thunk
+        this._osc('sine', 150, vol * 0.5, 0.005, 0.06, this.sfxGain);
+        n.onended = () => this._untrackSound(id);
+      },
+
+      // Building complete — warm chime
+      buildComplete(dist) {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('bldComp', 1000)) return;
+        const vol = 0.1 * Math.max(0, 1 - (dist || 0) / 60);
+        if (vol < 0.005) return;
+        const id = this._trackSound('bldComp');
+        const t = this.ctx.currentTime;
+        // G4 + D5
+        [392, 587].forEach(freq => {
+          const o = this.ctx.createOscillator();
+          o.type = 'sine'; o.frequency.value = freq;
+          const flt = this.ctx.createBiquadFilter();
+          flt.type = 'lowpass'; flt.frequency.value = 2000;
+          const g = this.ctx.createGain();
+          g.gain.setValueAtTime(0, t);
+          g.gain.linearRampToValueAtTime(vol, t + 0.05);
+          g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+          o.connect(flt); flt.connect(g); g.connect(this.sfxGain);
+          o.start(t); o.stop(t + 0.55);
+        });
+        setTimeout(() => this._untrackSound(id), 600);
+      },
+
+      // Turret placement — structural thud
+      turretPlace() {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('tPlace', 500)) return;
+        const id = this._trackSound('tPlace');
+        const t = this.ctx.currentTime;
+        this._osc('sine', 100, 0.12, 0.01, 0.12, this.sfxGain);
+        const n = this._noise();
+        const nf = this.ctx.createBiquadFilter();
+        nf.type = 'bandpass'; nf.frequency.value = 800; nf.Q.value = 1;
+        const ng = this.ctx.createGain();
+        ng.gain.setValueAtTime(0.06, t);
+        ng.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+        n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
+        n.start(t); n.stop(t + 0.12);
+        n.onended = () => this._untrackSound(id);
+      },
+
+      // Squirrel plant — tiny pop
+      squirrelPlant(dist) {
+        if (!this.ctx || !this.canPlay()) return;
+        const vol = 0.06 * Math.max(0, 1 - (dist || 0) / 30);
+        if (vol < 0.005) return;
+        this._osc('sine', 600, vol, 0.005, 0.05, this.sfxGain);
+      },
+
+      // NPC yay — cheerful two-note exclamation
+      npcYay(dist) {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('yay', 500)) return;
+        const vol = 0.1 * Math.max(0, 1 - (dist || 0) / 50);
+        if (vol < 0.005) return;
+        const id = this._trackSound('yay');
+        const t = this.ctx.currentTime;
+        // Rising two-note: A4 → D5
+        const o1 = this.ctx.createOscillator();
+        o1.type = 'triangle'; o1.frequency.value = 440;
+        const g1 = this.ctx.createGain();
+        g1.gain.setValueAtTime(0, t);
+        g1.gain.linearRampToValueAtTime(vol, t + 0.02);
+        g1.gain.setValueAtTime(vol, t + 0.1);
+        g1.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+        o1.connect(g1); g1.connect(this.sfxGain);
+        o1.start(t); o1.stop(t + 0.2);
+        const o2 = this.ctx.createOscillator();
+        o2.type = 'triangle'; o2.frequency.value = 587;
+        const g2 = this.ctx.createGain();
+        g2.gain.setValueAtTime(0, t + 0.12);
+        g2.gain.linearRampToValueAtTime(vol * 1.1, t + 0.14);
+        g2.gain.setValueAtTime(vol * 1.1, t + 0.28);
+        g2.gain.exponentialRampToValueAtTime(0.001, t + 0.45);
+        o2.connect(g2); g2.connect(this.sfxGain);
+        o2.start(t + 0.12); o2.stop(t + 0.5);
+        o2.onended = () => this._untrackSound(id);
+      },
+    };
 
     // ─────────────────────────────────────────
     //  DAY/NIGHT CYCLE + LIGHTING PRESETS
@@ -2765,6 +3427,9 @@
           const speedMult = getPathSpeedAt(playerGroup.position.x, playerGroup.position.z);
           const target = input.clone().multiplyScalar(MOVE_SPEED * speedMult);
           playerVelocity.lerp(target, accelSmooth);
+          // Footstep sound
+          SFX._stepTimer += dt;
+          if (SFX._stepTimer > 0.35 && !ghostActive) { SFX.footstep(); SFX._stepTimer = 0; }
         }
         // Smooth rotation toward movement direction
         const targetAngle = Math.atan2(playerVelocity.x, playerVelocity.z);
@@ -5160,6 +5825,11 @@
             const treeMaxTrips = getTreeMaxTrips(npc.treeIdx);
             // Rhythmic chop animation
             npc.mesh.children[0].rotation.z = Math.sin(npc.timer * 8) * 0.2 * (1 - chopProg);
+            // Chop sound at animation peaks
+            if (Math.sin(npc.timer * 8) > 0.95) {
+              const cd = Math.sqrt((npc.x - playerGroup.position.x) ** 2 + (npc.z - playerGroup.position.z) ** 2);
+              if (cd < 40) SFX.chop(cd);
+            }
             // Progressive tree shrink: each visit removes 1/treeMaxTrips of the tree
             if (npc.treeIdx >= 0 && windTrees[npc.treeIdx] && !windTrees[npc.treeIdx].chopped) {
               const tg = windTrees[npc.treeIdx].group;
@@ -5315,6 +5985,7 @@
               nb.position.set(npc.siteX, bgy, npc.siteZ);
               nb.rotation.y = Math.random() * Math.PI * 2;
               scene.add(nb);
+              { const bd = Math.sqrt((npc.siteX - playerGroup.position.x) ** 2 + (npc.siteZ - playerGroup.position.z) ** 2); SFX.buildComplete(bd); }
               // Register wind faces for new building
               const { w: bw, h: bh, d: bd } = nb.userData.dims;
               const rot = nb.rotation.y, cR = Math.cos(rot), sR = Math.sin(rot);
@@ -6268,6 +6939,7 @@
             if (sq.timer <= 0) {
               sq.hasNut = false;
               plantTreeAt(sq.targetX, sq.targetZ);
+              { const sd = Math.sqrt((sq.x - playerGroup.position.x) ** 2 + (sq.z - playerGroup.position.z) ** 2); SFX.squirrelPlant(sd); }
               sq.state = SQ_IDLE;
               sq.timer = 15 + Math.random() * 20;
             }
@@ -6630,6 +7302,7 @@
         if (_nmSpawnTimer >= NM_SPAWN_INTERVAL) {
           _nmSpawnTimer = 0;
           spawnWraith();
+          SFX.wraithSpawn();
         }
       }
 
@@ -6685,6 +7358,7 @@
           if (nm.hp <= 0) {
             nm.state = 'dying';
             nm.alpha = 1;
+            SFX.wraithDie();
             continue;
           }
         }
@@ -6822,6 +7496,7 @@
         if (nm.attackCooldown <= 0) {
           if (nm.state === 'attack_player' && distToPlayer < NM_ATTACK_RANGE) {
             ashenDrain = Math.min(0.9, ashenDrain + ASHEN_DRAIN_PER_HIT);
+            SFX.ashenHit();
             nm.attackCooldown = NM_ATTACK_COOLDOWN;
           }
           // Kill outdoor NPC on contact
@@ -6849,7 +7524,7 @@
                   ba.windowMats[mi].color.setScalar(0);
                   ba.windowMats[mi].emissive && ba.windowMats[mi].emissive.setScalar(0);
                 }
-                if (!ba.contaminated) contaminateBuilding(ba);
+                if (!ba.contaminated) { SFX.contaminate(); contaminateBuilding(ba); }
                 nm.attackCooldown = NM_ATTACK_COOLDOWN;
                 nm.homeTargetIdx = -1;
               }
@@ -7160,6 +7835,8 @@
               nm.state = 'dying'; nm.alpha = 1;
               // Ghost consumes wraith — grow in size
               ghostBonusMax += GHOST_WRAITH_BONUS;
+              SFX.wraithDie();
+              SFX.ghostConsume();
             }
           }
         }
@@ -7183,6 +7860,7 @@
               }
               ghostBlobCount -= removed;
               decontaminateBuilding(ba);
+              SFX.ghostCleanse();
               ghostCleanseCooldown = 0.5;
             }
             break;
@@ -7346,6 +8024,7 @@
         playerAirborne = true;
         _jumpLaunchFrame = true;
         playerYVel = JUMP_VELOCITY;
+        SFX.jumpLaunch();
         // Launch carries current horizontal velocity — no reset
       }
       if (playerAirborne) {
@@ -7381,6 +8060,7 @@
         if (playerGroup.position.y <= groundY) {
           playerGroup.position.y = groundY;
           playerAirborne = false; playerYVel = 0; smoothedY = groundY;
+          SFX.land();
         }
       }
 
@@ -7535,12 +8215,16 @@
         ba.vineMeshes = null;
       }
 
-      // Reset window tint to yellow
+      // Reset window tint to warm yellow
       for (let mi = 0; mi < ba.windowMats.length; mi++) {
         const wm = ba.windowMats[mi];
-        const wp = 0.15 + Math.sin(t * 1.2 + mi) * 0.1;
-        wm.color.setRGB(wp, wp * 0.9, 0);
+        wm.color.setRGB(0.9, 0.75, 0.1);
+        if (wm.emissive) wm.emissive.setRGB(0.4, 0.3, 0.0);
       }
+
+      // NPC yay sound
+      const d = Math.sqrt((ba.x - playerGroup.position.x) ** 2 + (ba.z - playerGroup.position.z) ** 2);
+      SFX.npcYay(d);
     }
 
     function updateContamination(dt) {
@@ -7653,6 +8337,7 @@
           const swingT = (swingTimer % SWING_DURATION) / SWING_DURATION; // 0→1 per swing
           const windUp = Math.min(swingT * 3, 1.0);
           const strike = Math.max(0, Math.min((swingT - 0.33) * 3, 1.0));
+          if (strike > 0 && strike < 0.2) SFX.swordSwing();
           swordGroup.rotation.z = -0.3 - windUp * 1.2 + strike * 2.0;
           swordGroup.rotation.x = -0.3 - windUp * 0.6 + strike * 0.9;
 
@@ -7670,7 +8355,9 @@
           if (swingT > 0.5 && !swingLanded) {
             swingLanded = true;
             const cleansed = removeOneVine(ba);
+            SFX.vineSnap();
             if (cleansed) {
+              SFX.buildingCleansed();
               attackTargetIdx = -1;
               isAttacking = false;
               swingTimer = 0;
@@ -7811,6 +8498,7 @@
       }
 
       const marker = createTurretSiteMarker(px, py, pz);
+      SFX.turretPlace();
       turretSites.push({
         x: px, z: pz, y: py,
         mesh: marker,
@@ -7986,9 +8674,10 @@
             const fromY = tur.y + 3.8;
             const toY = getTerrainY(nm.x, nm.z) + 2.0;
             fireZapBeam(tur.x, fromY, tur.z, nm.x, toY, nm.z, zapColor);
+            SFX.turretZap();
             nm.hp -= TURRET_ZAP_DAMAGE;
             nm.mesh.userData.headMat.emissiveIntensity = 3.0;
-            if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; }
+            if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; SFX.wraithDie(); }
             tur.charge -= TURRET_CHARGE_PER_ZAP;
             tur.zapCooldown = TURRET_ZAP_COOLDOWN;
           }
@@ -8009,12 +8698,14 @@
       const isDay = timeOfDay > 0.3 && timeOfDay < 0.7;
       // Advance moon phase on day→night transition
       if (lastDayState && !isDay) {
+        SFX.transition('dusk');
         dayCounter++;
         if (dayCounter >= DAYS_PER_PHASE) {
           dayCounter = 0;
           moonPhaseIndex = (moonPhaseIndex + 1) % MOON_PHASES.length;
         }
       }
+      if (!lastDayState && isDay) SFX.transition('dawn');
       lastDayState = isDay;
       applyLighting(timeOfDay);
       updateTimeDisplay();
@@ -8025,6 +8716,7 @@
       // Wind
       updateWind(dt);
       updateWindDebug(dt);
+      if (SFX.initialized) SFX.updateAmbient(dt, timeOfDay, ghostFade, windTime);
 
       // Smoke night glow — inversely proportional to moon brightness
       const nightFac = (timeOfDay <= 0.25 || timeOfDay >= 0.75)
