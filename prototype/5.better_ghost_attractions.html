@@ -43,8 +43,8 @@
 </head>
 <body>
   <div id="info">
-    WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Hold LMB — attack (cleanse) &nbsp;|&nbsp; F — place turret<br>
-    1 / 2 / 3 — Day / Dusk / Night &nbsp;|&nbsp; T — auto cycle &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; G — smoke &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis &nbsp;|&nbsp; B — collision boxes
+    WASD — move &nbsp;|&nbsp; Mouse — look<br>
+    1 / 2 / 3 — Day / Dusk / Night &nbsp;|&nbsp; T — auto cycle &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; G — smoke &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis
   </div>
   <div id="time-indicator"></div>
   <div id="moon-indicator"><canvas id="moon-hud" width="24" height="24"></canvas><span id="moon-text"></span></div>
@@ -230,195 +230,6 @@
 
     const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 1.0, 1200);
     camera.updateProjectionMatrix();
-
-    // ─────────────────────────────────────────
-    //  DEFERRED LIGHT ACCUMULATION PASS
-    //  Renders scene to FBO with depth, then a fullscreen pass computes
-    //  point-light contributions per-pixel from a uniform array.
-    //  This replaces the SpotLight/PointLight pool for buildings.
-    // ─────────────────────────────────────────
-    const DEFERRED_MAX_LIGHTS = 128;
-    // Light data packed into a DataTexture: 3 texels per light
-    // texel 0: (x, y, z, intensity)  texel 1: (r, g, b, range)  texel 2: (dirX, dirY, dirZ, cosConeAngle)
-    const _dlTexWidth = DEFERRED_MAX_LIGHTS * 3;
-    const _dlData = new Float32Array(_dlTexWidth * 4); // RGBA per texel
-    const _dlDataTex = new THREE.DataTexture(_dlData, _dlTexWidth, 1, THREE.RGBAFormat, THREE.FloatType);
-    _dlDataTex.minFilter = THREE.NearestFilter;
-    _dlDataTex.magFilter = THREE.NearestFilter;
-    _dlDataTex.needsUpdate = true;
-    let _dlCount = 0;
-
-    const _deferredColorTarget = new THREE.WebGLRenderTarget(
-      window.innerWidth, window.innerHeight, {
-        minFilter: THREE.LinearFilter,
-        magFilter: THREE.LinearFilter,
-        format: THREE.RGBAFormat,
-        type: THREE.HalfFloatType,
-      }
-    );
-    _deferredColorTarget.depthTexture = new THREE.DepthTexture(
-      window.innerWidth, window.innerHeight,
-      THREE.UnsignedIntType
-    );
-    _deferredColorTarget.depthTexture.format = THREE.DepthFormat;
-
-    // Fullscreen quad geometry
-    const _fsQuadGeo = new THREE.PlaneGeometry(2, 2);
-
-    const _lightAccumMat = new THREE.ShaderMaterial({
-      uniforms: {
-        tColor:       { value: _deferredColorTarget.texture },
-        tDepth:       { value: _deferredColorTarget.depthTexture },
-        tLights:      { value: _dlDataTex },
-        uInvProjView: { value: new THREE.Matrix4() },
-        uCamPos:      { value: new THREE.Vector3() },
-        uLightCount:  { value: 0 },
-        uLightTexWidth: { value: _dlTexWidth },
-        uResolution:  { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
-      },
-      vertexShader: `
-        varying vec2 vUv;
-        void main() {
-          vUv = uv;
-          gl_Position = vec4(position.xy, 0.0, 1.0);
-        }
-      `,
-      fragmentShader: `
-        precision highp float;
-        uniform sampler2D tColor;
-        uniform sampler2D tDepth;
-        uniform sampler2D tLights;
-        uniform mat4 uInvProjView;
-        uniform vec3 uCamPos;
-        uniform int uLightCount;
-        uniform float uLightTexWidth;
-        uniform vec2 uResolution;
-        varying vec2 vUv;
-
-        vec3 worldPosFromDepth(float depth, vec2 uv) {
-          vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
-          vec4 wp = uInvProjView * ndc;
-          return wp.xyz / wp.w;
-        }
-
-        void main() {
-          vec4 sceneColor = texture2D(tColor, vUv);
-          float depth = texture2D(tDepth, vUv).r;
-
-          if (depth >= 0.9999) {
-            gl_FragColor = sceneColor;
-            return;
-          }
-
-          vec3 worldPos = worldPosFromDepth(depth, vUv);
-          // Screen-space normals from depth
-          vec2 texel = 1.0 / uResolution;
-          vec3 wpL = worldPosFromDepth(texture2D(tDepth, vUv - vec2(texel.x, 0.0)).r, vUv - vec2(texel.x, 0.0));
-          vec3 wpR = worldPosFromDepth(texture2D(tDepth, vUv + vec2(texel.x, 0.0)).r, vUv + vec2(texel.x, 0.0));
-          vec3 wpU = worldPosFromDepth(texture2D(tDepth, vUv + vec2(0.0, texel.y)).r, vUv + vec2(0.0, texel.y));
-          vec3 wpD = worldPosFromDepth(texture2D(tDepth, vUv - vec2(0.0, texel.y)).r, vUv - vec2(0.0, texel.y));
-          vec3 normal = normalize(cross(wpR - wpL, wpU - wpD));
-
-          vec3 lightAccum = vec3(0.0);
-          vec3 viewDir = normalize(uCamPos - worldPos);
-          float invW = 1.0 / uLightTexWidth;
-
-          for (int i = 0; i < ${DEFERRED_MAX_LIGHTS}; i++) {
-            if (i >= uLightCount) break;
-            // Read 3 texels per light from data texture
-            float t0 = (float(i * 3) + 0.5) * invW;
-            float t1 = (float(i * 3 + 1) + 0.5) * invW;
-            float t2 = (float(i * 3 + 2) + 0.5) * invW;
-            vec4 d0 = texture2D(tLights, vec2(t0, 0.5)); // xyz=pos, w=intensity
-            vec4 d1 = texture2D(tLights, vec2(t1, 0.5)); // xyz=color, w=range
-            vec4 d2 = texture2D(tLights, vec2(t2, 0.5)); // xyz=coneDir, w=cosConeAngle
-
-            vec3 toLight = d0.xyz - worldPos;
-            float dist = length(toLight);
-            if (dist > d1.w) continue;
-
-            vec3 lightDir = toLight / dist;
-            float att = clamp(1.0 - dist / d1.w, 0.0, 1.0);
-            att = att * att * d0.w / (dist * dist + 1.0);
-
-            // Cone attenuation — d2.w is cosConeAngle (> -0.99 means spot light)
-            float cosOuter = d2.w;
-            if (cosOuter > -0.99) {
-              vec3 coneDir = normalize(d2.xyz);
-              float cosAngle = dot(-lightDir, coneDir);
-              // Smooth falloff from inner (cosOuter + 0.15) to outer edge
-              float coneFade = smoothstep(cosOuter, cosOuter + 0.15, cosAngle);
-              att *= coneFade;
-            }
-
-            float NdotL = max(dot(normal, lightDir), 0.0);
-            vec3 halfDir = normalize(lightDir + viewDir);
-            float spec = pow(max(dot(normal, halfDir), 0.0), 16.0) * 0.15;
-
-            lightAccum += d1.xyz * att * (NdotL + spec);
-          }
-
-          gl_FragColor = vec4(sceneColor.rgb + lightAccum, sceneColor.a);
-        }
-      `,
-      depthWrite: false,
-      depthTest: false,
-      transparent: false,
-    });
-
-    const _lightAccumMesh = new THREE.Mesh(_fsQuadGeo, _lightAccumMat);
-    const _lightAccumScene = new THREE.Scene();
-    const _lightAccumCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-    _lightAccumScene.add(_lightAccumMesh);
-
-    const _invProjView = new THREE.Matrix4();
-    function deferredLightsClear() { _dlCount = 0; }
-    function deferredLightPush(x, y, z, r, g, b, intensity, range, dirX, dirY, dirZ, cosCone) {
-      if (_dlCount >= DEFERRED_MAX_LIGHTS) return;
-      const base = _dlCount * 3 * 4; // 3 texels × 4 channels (RGBA)
-      // Texel 0: position + intensity
-      _dlData[base]     = x;
-      _dlData[base + 1] = y;
-      _dlData[base + 2] = z;
-      _dlData[base + 3] = intensity;
-      // Texel 1: color + range
-      _dlData[base + 4] = r;
-      _dlData[base + 5] = g;
-      _dlData[base + 6] = b;
-      _dlData[base + 7] = range;
-      // Texel 2: cone direction + cosine of outer half-angle (-1 = point light)
-      _dlData[base + 8]  = dirX  !== undefined ? dirX  : 0;
-      _dlData[base + 9]  = dirY  !== undefined ? dirY  : 0;
-      _dlData[base + 10] = dirZ  !== undefined ? dirZ  : 0;
-      _dlData[base + 11] = cosCone !== undefined ? cosCone : -1; // -1 = omnidirectional
-      _dlCount++;
-    }
-    function deferredLightsRender() {
-      if (_dlCount === 0) {
-        renderer.render(scene, camera);
-        return;
-      }
-
-      // Upload light data texture
-      _dlDataTex.needsUpdate = true;
-
-      // Render scene to FBO first — this updates camera.matrixWorldInverse
-      renderer.setRenderTarget(_deferredColorTarget);
-      renderer.render(scene, camera);
-
-      // Now compute inverse proj-view from the up-to-date camera matrices
-      _invProjView.copy(camera.projectionMatrix).multiply(camera.matrixWorldInverse);
-      _invProjView.invert();
-      _lightAccumMat.uniforms.uInvProjView.value.copy(_invProjView);
-      _lightAccumMat.uniforms.uCamPos.value.copy(camera.position);
-      _lightAccumMat.uniforms.uLightCount.value = _dlCount;
-      // Composite — disable tone mapping to avoid double-apply
-      const prevToneMapping = renderer.toneMapping;
-      renderer.toneMapping = THREE.NoToneMapping;
-      renderer.setRenderTarget(null);
-      renderer.render(_lightAccumScene, _lightAccumCam);
-      renderer.toneMapping = prevToneMapping;
-    }
 
     // ─────────────────────────────────────────
     //  LIGHTING
@@ -851,7 +662,6 @@
       }
       group.userData.canopyMats = group.children.slice(1).map(c => c.material);
       group.userData.canopyH = trunkH + height * 0.35;
-      group.userData.trunkR = trunkR;
       return group;
     }
 
@@ -914,7 +724,6 @@
       }
       group.userData.canopyMats = group.children.slice(1).map(c => c.material);
       group.userData.canopyH = trunkH * 0.85 + height * 0.25;
-      group.userData.trunkR = trunkR;
       return group;
     }
 
@@ -947,7 +756,6 @@
       group.add(cone);
       group.userData.canopyMats = [coneMat];
       group.userData.canopyH = trunkH * 0.7 + coneH * 0.4;
-      group.userData.trunkR = trunkR;
       return group;
     }
 
@@ -1027,108 +835,6 @@
       }
       group.userData.canopyMats = oakCanopyMats;
       group.userData.canopyH = trunkH + height * 0.25;
-      group.userData.trunkR = trunkR;
-      return group;
-    }
-
-    // Ancient giant tree — rare, massive trunk with buttress roots and sprawling canopy
-    function createAncientTree(height, palette) {
-      const group = new THREE.Group();
-      const trunkH = height * 0.4;
-      const trunkR = height * 0.09; // very thick trunk
-      // Main trunk — wide base tapering
-      const trunkGeo = new THREE.CylinderGeometry(trunkR * 0.55, trunkR * 1.4, trunkH, 8);
-      const trunkMat = new THREE.MeshStandardMaterial({
-        color: palette.trunk.clone().offsetHSL(0, -0.04, -0.08),
-        flatShading: true, roughness: 0.95
-      });
-      const trunk = new THREE.Mesh(trunkGeo, trunkMat);
-      trunk.position.y = trunkH / 2;
-      trunk.castShadow = true;
-      group.add(trunk);
-
-      // Buttress roots — thick fins radiating from base
-      const rootCount = 4 + Math.floor(Math.random() * 3);
-      for (let i = 0; i < rootCount; i++) {
-        const angle = (i / rootCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.4;
-        const rootLen = trunkR * (1.8 + Math.random() * 1.2);
-        const rootH = trunkH * (0.25 + Math.random() * 0.15);
-        const rootW = trunkR * (0.3 + Math.random() * 0.2);
-        const rootGeo = new THREE.BoxGeometry(rootW, rootH, rootLen);
-        const root = new THREE.Mesh(rootGeo, trunkMat);
-        root.position.set(
-          Math.cos(angle) * trunkR * 0.8,
-          rootH * 0.35,
-          Math.sin(angle) * trunkR * 0.8
-        );
-        root.rotation.y = angle;
-        root.rotation.x = 0.2 + Math.random() * 0.2; // roots angle outward/down
-        root.castShadow = true;
-        group.add(root);
-      }
-
-      // Major branches
-      const branchCount = 4 + Math.floor(Math.random() * 3);
-      for (let i = 0; i < branchCount; i++) {
-        const angle = (i / branchCount) * Math.PI * 2 + Math.random() * 0.5;
-        const branchLen = height * (0.18 + Math.random() * 0.12);
-        const branchR = trunkR * (0.25 + Math.random() * 0.15);
-        const branchGeo = new THREE.CylinderGeometry(branchR * 0.3, branchR, branchLen, 5);
-        const branch = new THREE.Mesh(branchGeo, trunkMat);
-        branch.position.set(
-          Math.cos(angle) * trunkR * 0.4,
-          trunkH * (0.6 + Math.random() * 0.3),
-          Math.sin(angle) * trunkR * 0.4
-        );
-        branch.rotation.z = (0.4 + Math.random() * 0.5) * (Math.cos(angle) > 0 ? -1 : 1);
-        branch.rotation.y = angle;
-        branch.castShadow = true;
-        group.add(branch);
-      }
-
-      // Massive canopy — many large overlapping blobs
-      const blobCount = 5 + Math.floor(Math.random() * 4);
-      const ancientCanopyMats = [];
-      for (let b = 0; b < blobCount; b++) {
-        const blobR = height * (0.22 + Math.random() * 0.18);
-        let blobGeo = new THREE.IcosahedronGeometry(blobR, 1);
-        if (blobGeo.index) blobGeo = blobGeo.toNonIndexed();
-        const bp = blobGeo.attributes.position;
-        const seed = Math.random() * 100;
-        const ySquash = 0.4 + Math.random() * 0.15;
-        for (let vi = 0; vi < bp.count; vi += 3) {
-          const vx = bp.getX(vi), vz = bp.getZ(vi);
-          const n = 1 + simplex2(vx * 1.0 + seed, vz * 1.0) * 0.35;
-          for (let v = 0; v < 3; v++) {
-            bp.setX(vi + v, bp.getX(vi + v) * n * 1.3);
-            bp.setY(vi + v, bp.getY(vi + v) * ySquash);
-            bp.setZ(vi + v, bp.getZ(vi + v) * n * 1.3);
-          }
-        }
-        blobGeo.computeVertexNormals();
-        const blobMat = new THREE.MeshStandardMaterial({
-          color: palette.tree.clone().offsetHSL(
-            (Math.random() - 0.5) * 0.06,
-            Math.random() * 0.06,
-            (Math.random() - 0.5) * 0.1
-          ),
-          flatShading: true
-        });
-        const blob = new THREE.Mesh(blobGeo, blobMat);
-        ancientCanopyMats.push(blobMat);
-        const spreadAngle = Math.random() * Math.PI * 2;
-        const spreadDist = height * (0.08 + Math.random() * 0.2);
-        blob.position.set(
-          Math.cos(spreadAngle) * spreadDist,
-          trunkH + blobR * 0.25 + Math.random() * height * 0.12,
-          Math.sin(spreadAngle) * spreadDist
-        );
-        blob.castShadow = true;
-        group.add(blob);
-      }
-      group.userData.canopyMats = ancientCanopyMats;
-      group.userData.canopyH = trunkH + height * 0.3;
-      group.userData.trunkR = trunkR * 1.4;
       return group;
     }
 
@@ -1159,7 +865,6 @@
         branch.castShadow = true;
         group.add(branch);
       }
-      group.userData.trunkR = trunkR;
       return group;
     }
 
@@ -1236,14 +941,10 @@
             if (face === 0) {
               // +Z face
               pane.position.set(spanOff, yOff, d / 2 + 0.02);
-            } else if (face === 1) {
-              // +X face
-              pane.position.set(w / 2 + 0.02, yOff, spanOff);
-              pane.rotation.y = Math.PI / 2;
             } else {
-              // -X face
-              pane.position.set(-(w / 2 + 0.02), yOff, spanOff);
-              pane.rotation.y = -Math.PI / 2;
+              // +X face
+              pane.position.set(faceAxis / 2 + 0.02, yOff, spanOff);
+              pane.rotation.y = Math.PI / 2;
             }
             group.add(pane);
           }
@@ -1278,16 +979,11 @@
 
     // Building world positions — smoke is attracted to these
     const buildingAttractors = []; // { x, y, z, r } — world pos + effective radius
-    // Collision boxes for daytime player collision — oriented bounding boxes
-    // { cx, cz, hw, hd, cosR, sinR } — center, half-widths in local axes, rotation
-    const collisionBoxes = [];
-    // Tree trunk colliders — circular cylinders { x, z, r }
-    const trunkColliders = [];
     // Tree canopy attractors — smoke drawn to canopies, which glow on consumption
     const canopyAttractors = []; // { x, y, z, r, mats[], glowIntensity, glowColor }
 
     function createSettlement(center, palette, buildingCount) {
-      const settlementGroup = new THREE.Group();
+      const group = new THREE.Group();
       // Buildings in a cluster
       for (let i = 0; i < buildingCount; i++) {
         const angle = (i / buildingCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.5;
@@ -1301,47 +997,25 @@
         // Place on terrain
         const wy = getTerrainY(center.x + bx, center.y + bz);
         building.position.y = wy;
-        settlementGroup.add(building);
+        group.add(building);
         // Register as smoke attractor (world space)
         const dims = building.userData.dims;
-        // Compute window light positions in world space — one per windowed face, offset outward
-        const rot = building.rotation.y;
-        const cosR = Math.cos(rot), sinR = Math.sin(rot);
-        const wcx = center.x + bx, wcz = center.y + bz;
-        const winY = wy + dims.h * 0.45; // mid-window height
-        // Match wind face transform convention exactly
-        const windowLights = [
-          // +Z face — local (0,0,1) → world (sinR, 0, cosR)
-          { x: wcx + (dims.d/2 + 0.8)*sinR, z: wcz + (dims.d/2 + 0.8)*cosR, y: winY,
-            nx: sinR, ny: -0.3, nz: cosR },
-          // +X face — local (1,0,0) → world (cosR, 0, -sinR)
-          { x: wcx + (dims.w/2 + 0.8)*cosR, z: wcz - (dims.w/2 + 0.8)*sinR, y: winY,
-            nx: cosR, ny: -0.3, nz: -sinR },
-          // -X face — local (-1,0,0) → world (-cosR, 0, sinR)
-          { x: wcx - (dims.w/2 + 0.8)*cosR, z: wcz + (dims.w/2 + 0.8)*sinR, y: winY,
-            nx: -cosR, ny: -0.3, nz: sinR },
-        ];
         buildingAttractors.push({
           x: center.x + bx,
           y: wy + dims.h * 0.5,
           z: center.y + bz,
           r: Math.max(dims.w, dims.d) * 0.6, // consumption radius
           windowMats: building.userData.windowMats || [],
-          windowLights: windowLights,
           glowIntensity: 0,
           glowColor: new THREE.Color(0, 0, 0),
-          charge: 1.0 + Math.random() * 3,        // accumulated smoke charge (1-4)
-          chargeMax: 10.0,    // 1.0 = fully charged = 3 in-game hours of glow
+          charge: 0,        // accumulated smoke charge (0–1)
+          chargeMax: 1.0,    // 1.0 = fully charged = 3 in-game hours of glow
+          // hearth score: 0 = no chimney, 0.3–1.0 = hearth intensity
+          // bigger buildings with larger roofs smoke more (forges, bakeries)
           hearth: Math.random() < 0.35
             ? (0.3 + Math.random() * 0.7) * Math.min(1, (dims.w * dims.d) / 20)
             : 0,
-          roofY: wy + dims.h + dims.h * 0.5 * 0.4,
-          settlementX: center.x, settlementZ: center.y,
-          contaminated: false, vineGroup: null,
-          dims: { w: dims.w, h: dims.h, d: dims.d },
-          groundY: wy, rotation: building.rotation.y,
-          food: 0, foodBagMesh: null,
-          buildingMesh: building,
+          roofY: wy + dims.h + dims.h * 0.5 * 0.4, // top of roof
         });
         // Hard wind blocker — buildings act as solid obstacles
         // Register all 4 vertical faces of the building box in world space.
@@ -1360,15 +1034,6 @@
           // -Z face
           windFaces.push({ cx: wcx + (bd/2)*sinR, cz: wcz - (bd/2)*cosR, nx: sinR,  nz: -cosR, halfExtent: bw/2, height: bh, groundY: wy });
         }
-        // Register collision box for player collision (daytime)
-        collisionBoxes.push({ 
-          cx: center.x + bx, 
-          cz: center.y + bz, 
-          hw: dims.w / 2 + 0.3, 
-          hd: dims.d / 2 + 0.3, 
-          cosR: Math.cos(rot), 
-          sinR: Math.sin(rot) 
-        });
       }
       // Perimeter wall fragments
       const wallCount = 4 + Math.floor(Math.random() * 3);
@@ -1382,7 +1047,7 @@
         const wallGY = getTerrainY(center.x + wx, center.y + wz);
         wall.position.set(wx, wallGY, wz);
         wall.rotation.y = angle + Math.PI / 2;
-        settlementGroup.add(wall);
+        group.add(wall);
         // Register both long faces of the wall (±Z in wall local space).
         // wallRot = angle + PI/2.  Local ±Z world normals:
         //   +Z → (-cos(angle), 0, -sin(angle))
@@ -1393,13 +1058,9 @@
           windFaces.push({ cx: wcx, cz: wcz, nx: -cosA, nz: -sinA, halfExtent: wallLen * 0.5, height: wallH, groundY: wallGY });
           windFaces.push({ cx: wcx, cz: wcz, nx:  cosA, nz:  sinA, halfExtent: wallLen * 0.5, height: wallH, groundY: wallGY });
         }
-        // Register wall collision box (wallRot = angle + PI/2; wall geometry is length x 0.8)
-        { const wallRot = angle + Math.PI / 2;
-          collisionBoxes.push({ cx: center.x + wx, cz: center.y + wz, hw: wallLen / 2 + 0.3, hd: 0.4 + 0.3, cosR: Math.cos(wallRot), sinR: Math.sin(wallRot) });
-        }
       }
-      settlementGroup.position.set(center.x, 0, center.y);
-      return settlementGroup;
+      group.position.set(center.x, 0, center.y);
+      return group;
     }
 
     // ─────────────────────────────────────────
@@ -1711,39 +1372,15 @@
           NPC_WANDER = 6, NPC_WALK_ROCK = 7, NPC_GATHER_ROCK = 8,
           NPC_SEEK_ROCK = 9,
           NPC_FARM_WALK_TREE = 10, NPC_FARM_CHOP = 11, NPC_FARM_WALK_SITE = 12,
-          NPC_FARM_BUILD = 13, NPC_FARM_TEND = 14,
-          NPC_FARM_HARVEST = 15, NPC_FARM_DELIVER = 16,
-          NPC_TURRET_WALK_ROCK = 20, NPC_TURRET_GATHER_ROCK = 21,
-          NPC_TURRET_WALK_SITE = 22, NPC_TURRET_BUILD = 23,
-          NPC_TURRET_SEEK_ROCK = 24;
+          NPC_FARM_BUILD = 13, NPC_FARM_TEND = 14;
     const NPC_BUILDER_RATIO = 0.50; // fraction of NPCs that are builders (configurable)
     const NPC_FARMER_RATIO  = 0.20; // fraction of non-builders that become farmers
     const FARM_WOOD_NEEDED  = 2;    // wood trips to build a farm
     const FARM_BUILD_TIME   = 8.0;  // seconds to construct
     const FARM_TEND_INTERVAL = 6;   // seconds between tending cycles
-    const FARM_HARVEST_TIME = 3.0;  // seconds to harvest corn
-    const CORN_TEND_CYCLES_MIN = 1; // min tend cycles corn stays ripe
-    const CORN_TEND_CYCLES_MAX = 2; // max tend cycles before harvest
-    const farms = [];               // { mesh, x, z, tenderIdx, growthStage (0-4), cornCyclesLeft }
-    let lastMoonCyclePhase = -1;    // track full moon cycle for food consumption
-    const ROCK_TRIPS  = 1; // rock trips for foundation
-    const WOOD_TRIPS  = 1;  // wood trips for walls (per-tree trips are dynamic based on size)
-
-    // ── Turret system ──
-    const turrets = [];             // active turrets
-    const turretSites = [];         // player-placed turret markers awaiting construction
-    const TURRET_ROCK_TRIPS = 2;   // rocks needed to build a turret
-    const TURRET_BUILD_TIME = 8.0; // seconds to construct
-    const TURRET_RANGE = 35;       // attack range
-    const TURRET_ZAP_COOLDOWN = 1.5; // seconds between zaps
-    const TURRET_ZAP_DAMAGE = 3.0;   // damage per zap, instantly kills a wraith
-    const TURRET_CHARGE_MAX = 1.0;
-    const TURRET_CHARGE_PER_ZAP = 0.08; // charge consumed per zap
-    const TURRET_GHOST_RECHARGE_RANGE = 8.0; // ghost must be within this range
-    const TURRET_GHOST_RECHARGE_RATE = 0.25; // charge per second when ghost nearby
-    const TURRET_MAX_ZAPS = 3;     // max concurrent zap beams
-    const TURRET_ZAP_DURATION = 0.25; // seconds a zap beam is visible
-    const TURRET_PLACEMENT_RANGE = 12; // max distance from player to place
+    const farms = [];               // { mesh, x, z, tenderIdx, growthStage (0-3) }
+    const ROCK_TRIPS  = 3; // rock trips for foundation
+    const WOOD_TRIPS  = 3;  // wood trips for walls (per-tree trips are dynamic based on size)
 
     // Two noise layers for varied forest density
     for (let i = 0; i < 2200; i++) {
@@ -1780,24 +1417,21 @@
       const pal = inKingdomB ? PALETTE.B : PALETTE.A;
 
       if (inKingdomB) {
-        // Kingdom B: mostly pines & cypress, some dead, rare ancients
-        if (height > 32 && roll < 0.08) tree = createAncientTree(height * 1.6, PALETTE.B);
-        else if (roll < 0.55)      tree = createPineTree(height, PALETTE.B);
+        // Kingdom B: mostly pines & cypress, some dead
+        if (roll < 0.55)      tree = createPineTree(height, PALETTE.B);
         else if (roll < 0.80) tree = createCypressTree(height * 0.9, PALETTE.B);
         else if (roll < 0.92) tree = createBroadleafTree(height * 0.8, PALETTE.B);
         else                  tree = createDeadTree(height * 0.6, PALETTE.B);
       } else if (inKingdomA) {
-        // Kingdom A: mostly broadleaf & oaks, some others, rare ancients
-        if (height > 30 && roll < 0.10) tree = createAncientTree(height * 1.6, PALETTE.A);
-        else if (roll < 0.40)      tree = createBroadleafTree(height, PALETTE.A);
+        // Kingdom A: mostly broadleaf & oaks, some others
+        if (roll < 0.40)      tree = createBroadleafTree(height, PALETTE.A);
         else if (roll < 0.60) tree = createOakTree(height * 1.1, PALETTE.A);
         else if (roll < 0.80) tree = createPineTree(height * 0.85, PALETTE.A);
         else if (roll < 0.93) tree = createCypressTree(height * 0.75, PALETTE.A);
         else                  tree = createDeadTree(height * 0.55, PALETTE.A);
       } else {
-        // Wilderness — full mix, rare ancients
-        if (height > 28 && roll < 0.06) tree = createAncientTree(height * 1.8, pal);
-        else if (roll < 0.25)      tree = createPineTree(height, pal);
+        // Wilderness — full mix
+        if (roll < 0.25)      tree = createPineTree(height, pal);
         else if (roll < 0.50) tree = createBroadleafTree(height, pal);
         else if (roll < 0.65) tree = createOakTree(height * 1.05, pal);
         else if (roll < 0.80) tree = createCypressTree(height * 0.85, pal);
@@ -1817,14 +1451,10 @@
         phase: Math.random() * Math.PI * 2,    // unique phase offset
         flex: (0.6 + Math.random() * 0.8) / Math.max(height, 12), // smaller trees flex more
         wx: x, wz: z,                           // world position for wind field lookup
-        height: height,                          // original tree height (for durability)
-        trunkR: (tree.userData.trunkR || height * 0.025) * scaleVar // collision radius
+        height: height                           // original tree height (for durability)
       });
-      // Register trunk collider for hard collision
-      const tColR = (tree.userData.trunkR || height * 0.025) * scaleVar;
-      trunkColliders.push({ x: x, z: z, r: tColR });
       // Soft wind blocker — radius scales with canopy size, strength with density
-      windInfluencers.push({ x, z, type: 0, radius: height * 0.22, strength: 0.12 + density * 0.10, height, groundY: y });
+      windInfluencers.push({ x, z, type: 0, radius: height * 0.22, strength: 0.32 + density * 0.22, height, groundY: y });
       // Register canopy as smoke attractor (if tree has foliage)
       if (tree.userData.canopyMats && tree.userData.canopyMats.length > 0) {
         canopyAttractors.push({
@@ -2120,8 +1750,20 @@
       spawnNPC(b.x, b.z, isB ? PALETTE.B : PALETTE.A, isB ? 1 : 0);
     }
 
-    // Building lights now handled by deferred light accumulation pass.
-    // Every lit building gets its own deferred point light — no pool limit.
+    // Shared SpotLight pool for building window glow — only top N brightest get real lights
+    const BLDG_SPOT_COUNT = 4;
+    const bldgSpots = [];
+    for (let i = 0; i < BLDG_SPOT_COUNT; i++) {
+      const sl = new THREE.SpotLight(0xffcc77, 0, 30, Math.PI * 0.45, 0.6, 1.2);
+      sl.castShadow = false;
+      // Always visible — toggling .visible causes shader recompiles.
+      // Use intensity=0 to "turn off" instead.
+      sl.position.set(0, -1000, 0);
+      sl.target.position.set(0, -1010, 0);
+      scene.add(sl);
+      scene.add(sl.target);
+      bldgSpots.push(sl);
+    }
 
     // Eclipse point — subtle stone circle at world center
     const eclipseGroup = new THREE.Group();
@@ -2173,49 +1815,6 @@
       legs.push(leg);
     }
 
-    // Sword — held in right hand, visible during daytime
-    const swordGroup = new THREE.Group();
-    // Blade — large luminous blue
-    const bladeGeo = new THREE.BoxGeometry(0.18, 3.2, 0.05);
-    const bladeMat = new THREE.MeshStandardMaterial({
-      color: 0x4488ff, emissive: 0x2266ee, emissiveIntensity: 1.2,
-      metalness: 0.9, roughness: 0.15, flatShading: true,
-      transparent: true, opacity: 0.92,
-    });
-    const blade = new THREE.Mesh(bladeGeo, bladeMat);
-    blade.position.y = 1.7;
-    swordGroup.add(blade);
-    // Blade edge glow
-    const edgeGeo = new THREE.BoxGeometry(0.04, 3.0, 0.08);
-    const edgeMat = new THREE.MeshStandardMaterial({
-      color: 0x88ccff, emissive: 0x55aaff, emissiveIntensity: 2.0,
-      transparent: true, opacity: 0.5, flatShading: true,
-    });
-    const edgeGlow = new THREE.Mesh(edgeGeo, edgeMat);
-    edgeGlow.position.y = 1.7;
-    swordGroup.add(edgeGlow);
-    // Guard
-    const guardGeo = new THREE.BoxGeometry(0.7, 0.14, 0.14);
-    const guardMat = new THREE.MeshStandardMaterial({
-      color: 0x3355aa, emissive: 0x1133aa, emissiveIntensity: 0.6,
-      flatShading: true, metalness: 0.7
-    });
-    const guard = new THREE.Mesh(guardGeo, guardMat);
-    guard.position.y = 0.1;
-    swordGroup.add(guard);
-    // Grip
-    const gripGeo = new THREE.CylinderGeometry(0.07, 0.08, 0.6, 5);
-    const gripMat = new THREE.MeshStandardMaterial({ color: 0x2a1a08, flatShading: true });
-    const grip = new THREE.Mesh(gripGeo, gripMat);
-    grip.position.y = -0.25;
-    swordGroup.add(grip);
-    swordGroup.position.set(0.8, 1.6, 0.3); // right side of body
-    swordGroup.rotation.z = 0.2; // slight outward angle at rest
-    swordGroup.visible = false;
-    playerGroup.add(swordGroup);
-    let swordSwingPhase = 0;
-    let isAttacking = false;
-
     // Raycaster for exact terrain surface Y
     const terrainRay = new THREE.Raycaster();
     const rayOrigin = new THREE.Vector3();
@@ -2234,7 +1833,10 @@
     playerGroup.position.set(startX, getExactTerrainY(startX, startZ), startZ);
     scene.add(playerGroup);
 
-    // (player night light removed — ghost lights handle all night illumination)
+    // Player night light — subtle luminous glow around the player at night
+    const playerNightLight = new THREE.PointLight(0x6688cc, 0, 10000, 2);
+    playerNightLight.position.set(0, 2, 0); // above player's head
+    playerGroup.add(playerNightLight);
 
     // ─────────────────────────────────────────
     //  CAMERA CONTROLLER — 65° top-down, third person
@@ -2353,11 +1955,6 @@
       cameraPitch  = Math.max(-0.3, Math.min(Math.PI / 2 - 0.05, cameraPitch + e.movementY * 0.003));
     });
 
-    // Mouse button tracking (for attack hold)
-    let mouseDown = false;
-    document.addEventListener('mousedown', e => { if (e.button === 0 && pointerLocked) mouseDown = true; });
-    document.addEventListener('mouseup', e => { if (e.button === 0) mouseDown = false; });
-
     // ─────────────────────────────────────────
     //  DAY/NIGHT CYCLE + LIGHTING PRESETS
     // ─────────────────────────────────────────
@@ -2463,10 +2060,9 @@
       _bgColor.copy(presetA.bgColor).lerp(presetB.bgColor, blend);
       scene.background = _bgColor;
 
-      // Sun direction follows time — full sinusoidal arc
-      // t=0.25 sunrise (angle=0), t=0.5 noon (angle=π/2), t=0.75 sunset (angle=π)
-      const sunAngle = (t - 0.25) * Math.PI * 2;
-      const sunY = Math.sin(sunAngle) * 100;
+      // Sun direction follows time
+      const sunAngle = (t - 0.25) * Math.PI; // rises east, sets west
+      const sunY = Math.sin(sunAngle) * 100 + 20;
       dirLight.position.set(
         Math.cos(sunAngle) * 120,
         Math.max(sunY, -10), // don't let the sun go far below the horizon
@@ -2608,12 +2204,11 @@
 
     // Key overrides for lighting
     window.addEventListener('keydown', e => {
-      if (e.key === '1') { autoCycle = false; timeOfDay = 0.5;  lastDayState = true; }
-      if (e.key === '2') { autoCycle = false; timeOfDay = 0.72; lastDayState = false; }
-      if (e.key === '3') { autoCycle = false; timeOfDay = 0.0;  lastDayState = false; }
-      if (e.key === '4') { autoCycle = false; timeOfDay = 0.25; lastDayState = false; }
+      if (e.key === '1') { autoCycle = false; timeOfDay = 0.5; }
+      if (e.key === '2') { autoCycle = false; timeOfDay = 0.72; }
+      if (e.key === '3') { autoCycle = false; timeOfDay = 0.0; }
+      if (e.key === '4') { autoCycle = false; timeOfDay = 0.25; }
       if (e.key.toLowerCase() === 't') { autoCycle = !autoCycle; }
-      if (e.key.toLowerCase() === 'f') { placeTurretSite(); }
       if (e.key.toLowerCase() === 'm') {
         moonPhaseIndex = (moonPhaseIndex + 1) % MOON_PHASES.length;
         lastDrawnPhase = -1; // force shadow redraw
@@ -2642,9 +2237,9 @@
         smokePoints.visible = smokeVisible;
         chimPoints.visible = smokeVisible;
       }
-      if (e.key.toLowerCase() === 'b') {
-        collisionDebugVisible = !collisionDebugVisible;
-        buildCollisionDebugBoxes();
+      if (e.key.toLowerCase() === 'f') {
+        faceDebugVisible = !faceDebugVisible;
+        buildFaceDebugArrows();
       }
       if (e.key.toLowerCase() === 'p') {
         pathDebugActive = !pathDebugActive;
@@ -2665,72 +2260,6 @@
     let smoothedY = getTerrainY(0, 0); // smoothed ground height
     let _playerTrampAccum = 0;
     let playerFacingAngle = 0;
-
-    // Resolve player vs tree trunk collision — circular push-out
-    function resolvePlayerTrunkCollisions() {
-      const px = playerGroup.position.x, pz = playerGroup.position.z;
-      for (let i = 0, len = trunkColliders.length; i < len; i++) {
-        const tc = trunkColliders[i];
-        const dx = px - tc.x, dz = pz - tc.z;
-        const d2 = dx * dx + dz * dz;
-        const minDist = tc.r + 0.4; // player radius ~0.4
-        if (d2 >= minDist * minDist || d2 < 0.0001) continue;
-        const d = Math.sqrt(d2);
-        const nx = dx / d, nz = dz / d;
-        const pen = minDist - d;
-        playerGroup.position.x += nx * pen;
-        playerGroup.position.z += nz * pen;
-        // Kill velocity into trunk
-        const vDot = playerVelocity.x * nx + playerVelocity.z * nz;
-        if (vDot < 0) {
-          playerVelocity.x -= vDot * nx;
-          playerVelocity.z -= vDot * nz;
-        }
-      }
-    }
-
-    // Resolve player vs OBB collision — push player out of overlapping boxes
-    function resolvePlayerBuildingCollisions() {
-      // At night, expand collision boxes so ghost core can't get close to buildings
-      const _nightPad = ghostActive ? GHOST_BUILDING_DISTANCE_MIN : 0;
-      for (let i = 0, len = collisionBoxes.length; i < len; i++) {
-        const b = collisionBoxes[i];
-        // Transform player into box local space (inverse rotation = transpose)
-        const dx = playerGroup.position.x - b.cx;
-        const dz = playerGroup.position.z - b.cz;
-        const localX =  dx * b.cosR - dz * b.sinR;
-        const localZ =  dx * b.sinR + dz * b.cosR;
-        // Check overlap
-        const overlapX = (b.hw + _nightPad) - Math.abs(localX);
-        const overlapZ = (b.hd + _nightPad) - Math.abs(localZ);
-        if (overlapX <= 0 || overlapZ <= 0) continue;
-        // Push out along the axis with smallest overlap
-        if (overlapX < overlapZ) {
-          const sign = localX > 0 ? 1 : -1;
-          const pushLocal = sign * overlapX;
-          // Local X axis in world: (cosR, -sinR)
-          playerGroup.position.x += pushLocal * b.cosR;
-          playerGroup.position.z -= pushLocal * b.sinR;
-          // Kill velocity component along push direction
-          const vDot = playerVelocity.x * b.cosR - playerVelocity.z * b.sinR;
-          if (vDot * sign < 0) {
-            playerVelocity.x -= vDot * b.cosR;
-            playerVelocity.z += vDot * b.sinR;
-          }
-        } else {
-          const sign = localZ > 0 ? 1 : -1;
-          const pushLocal = sign * overlapZ;
-          // Local Z axis in world: (sinR, cosR)
-          playerGroup.position.x += pushLocal * b.sinR;
-          playerGroup.position.z += pushLocal * b.cosR;
-          const vDot = playerVelocity.x * b.sinR + playerVelocity.z * b.cosR;
-          if (vDot * sign < 0) {
-            playerVelocity.x -= vDot * b.sinR;
-            playerVelocity.z -= vDot * b.cosR;
-          }
-        }
-      }
-    }
 
     function updatePlayer(dt) {
       const forward = new THREE.Vector3(-Math.sin(cameraYaw), 0, -Math.cos(cameraYaw));
@@ -2774,25 +2303,11 @@
         if (!playerAirborne) {
           playerVelocity.lerp(new THREE.Vector3(0, 0, 0), decelSmooth);
         }
-        // Ghost idle drift — wind pushes the ghost when no input
-        if (ghostActive && !playerAirborne) {
-          const gw = getWindDebug(playerGroup.position.x, playerGroup.position.y + 2,
-                                   playerGroup.position.z, windTime);
-          const driftStr = SMOKE_WIND_SPEED * 1.25;
-          playerVelocity.x += (gw.dx * driftStr - playerVelocity.x) * Math.min(1, 2.0 * dt);
-          playerVelocity.z += (gw.dz * driftStr - playerVelocity.z) * Math.min(1, 2.0 * dt);
-        }
+        // Airborne with no input: velocity persists (no drag toward zero)
       }
 
       playerGroup.position.x += playerVelocity.x * dt;
       playerGroup.position.z += playerVelocity.z * dt;
-
-      // Building collision — always active so ghost core can't enter buildings
-      resolvePlayerBuildingCollisions();
-      // Tree trunk collision — daytime only (ghost blobs avoid trunks via obstacle avoidance)
-      if (timeOfDay > 0.25 && timeOfDay < 0.75) {
-        resolvePlayerTrunkCollisions();
-      }
 
       // Player trampling
       const _pSpeed = playerVelocity.length();
@@ -3105,23 +2620,16 @@
 
       // 6b. Building center attractor — radial pull from further out
       // Effect decays with height above building so upper layers see prevailing wind.
-      // Buildings also create a strong downward suction above their roofline,
-      // pulling smoke from the sky down into the building (chimney effect).
       const BLDG_ATTRACT_RANGE = 25.0;
-      const BLDG_CHIMNEY_HEIGHT = 50.0; // suction zone extends ~1 building height above roof
-      const BLDG_CHIMNEY_PULL = 18.0;    // downward pull strength
-      const BLDG_CHIMNEY_HORIZ = 6.0;   // horizontal radius of chimney suction
       for (let bi = 0; bi < buildingAttractors.length; bi++) {
         const ba = buildingAttractors[bi];
-        if (ba.destroyed) continue;
         const adx = ba.x - wx, adz = ba.z - wz;
         const ad2 = adx * adx + adz * adz;
         if (ad2 > BLDG_ATTRACT_RANGE * BLDG_ATTRACT_RANGE) continue;
         const ad = Math.sqrt(ad2);
         if (ad < 0.5) continue;
         // Height above building top — attractor fades out above roofline
-        const roofTop = ba.y + ba.r;
-        const aboveRoof = Math.max(0, wy - roofTop);
+        const aboveRoof = Math.max(0, wy - (ba.y + ba.r));
         const heightFade = 1.0 / (1.0 + aboveRoof * aboveRoof * 0.08);
         if (heightFade < 0.03) continue;
         const proximity = 1.0 - ad / BLDG_ATTRACT_RANGE;
@@ -3133,24 +2641,6 @@
         // Updraft near building (only near roofline)
         const vertDist = Math.abs(wy - ba.y);
         if (vertDist < 8) dy += proximity * 0.5 * heightFade;
-
-        // ── Chimney suction: strong downward pull above roofline ──
-        // Pulls smoke from the sky down into the building.
-        // Active within a narrow column above the roof, fading with horizontal distance
-        // and with height above the chimney zone ceiling.
-        if (aboveRoof > 0 && ad < BLDG_CHIMNEY_HORIZ) {
-          const horizF = 1.0 - ad / BLDG_CHIMNEY_HORIZ; // 1 at center, 0 at edge
-          // Vertical envelope: strongest just above roof, fades at chimney top
-          const chimneyF = aboveRoof < BLDG_CHIMNEY_HEIGHT
-            ? 1.0 - (aboveRoof / BLDG_CHIMNEY_HEIGHT) * 0.5 // gentle fade within zone
-            : Math.exp(-(aboveRoof - BLDG_CHIMNEY_HEIGHT) * 0.3); // rapid falloff above
-          const suctionStr = horizF * horizF * chimneyF * BLDG_CHIMNEY_PULL;
-          dy -= suctionStr; // pull DOWN
-          // Also pull horizontally toward building center within chimney zone
-          dx += adx * invAd * suctionStr * 0.4;
-          dz += adz * invAd * suctionStr * 0.4;
-        }
-
         if (proximity > 0.25 && heightFade > 0.2) attracted = true;
       }
 
@@ -3338,41 +2828,6 @@
     const windFaceGroup = new THREE.Group();
     scene.add(windFaceGroup);
 
-    // ─────────────────────────────────────────
-    //  COLLISION BOX DEBUG (toggle B)
-    //  Draws wireframe oriented bounding boxes for every collision box.
-    // ─────────────────────────────────────────
-    let collisionDebugVisible = false;
-    const collisionDebugGroup = new THREE.Group();
-    scene.add(collisionDebugGroup);
-
-    function buildCollisionDebugBoxes() {
-      // Clear previous
-      while (collisionDebugGroup.children.length > 0) {
-        const child = collisionDebugGroup.children[0];
-        child.geometry?.dispose();
-        child.material?.dispose();
-        collisionDebugGroup.remove(child);
-      }
-      if (!collisionDebugVisible) return;
-
-      const mat = new THREE.LineBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.8, depthTest: false });
-
-      for (const b of collisionBoxes) {
-        // Full-width and full-depth (hw/hd are half extents)
-        const geo = new THREE.BoxGeometry(b.hw * 2, 6, b.hd * 2);
-        const wireframe = new THREE.LineSegments(
-          new THREE.EdgesGeometry(geo),
-          mat
-        );
-        geo.dispose();
-        const gy = getTerrainY(b.cx, b.cz);
-        wireframe.position.set(b.cx, gy + 3, b.cz);
-        wireframe.rotation.y = Math.atan2(b.sinR, b.cosR);
-        collisionDebugGroup.add(wireframe);
-      }
-    }
-
     function buildFaceDebugArrows() {
       // Dispose and remove previous arrows
       while (windFaceGroup.children.length > 0) {
@@ -3548,21 +3003,15 @@
         }
       `,
       fragmentShader: `
-        uniform float uDimFactor;
         varying float vAlpha;
         void main() {
           vec2 c = gl_PointCoord - 0.5;
           float r = length(c) * 2.0;
           if (r > 1.0) discard;
-          float a = vAlpha * (1.0 - smoothstep(0.15, 1.0, r)) * uDimFactor;
-          // Darken color at night so it blends with dark sky
-          float grey = mix(0.35, 0.92, uDimFactor);
-          gl_FragColor = vec4(grey, grey * 0.98, grey * 0.96, a);
+          float a = vAlpha * (1.0 - smoothstep(0.15, 1.0, r));
+          gl_FragColor = vec4(0.92, 0.90, 0.88, a);
         }
       `,
-      uniforms: {
-        uDimFactor: { value: 1.0 },
-      },
       transparent: true,
       depthWrite: false,
       blending: THREE.NormalBlending,
@@ -3579,15 +3028,6 @@
       // Only emit during daytime (dawn through dusk)
       const dayActive = timeOfDay > 0.28 && timeOfDay < 0.72;
 
-      // Dim chimney smoke at night — smoothly fade opacity and darken color
-      // Day (0.3-0.7) = full, transitions (0.2-0.3, 0.7-0.8) = fade, night = very dim
-      let chimDim;
-      if (timeOfDay > 0.3 && timeOfDay < 0.7) chimDim = 1.0;
-      else if (timeOfDay >= 0.25 && timeOfDay <= 0.3) chimDim = (timeOfDay - 0.25) / 0.05;
-      else if (timeOfDay >= 0.7 && timeOfDay <= 0.75) chimDim = 1.0 - (timeOfDay - 0.7) / 0.05;
-      else chimDim = 0.12; // very faint at night
-      chimMat.uniforms.uDimFactor.value = chimDim;
-
       // Spawn — each building's hearth score drives emission rate
       // hearth 0.3 → ~1 puff/s, hearth 1.0 → ~4 puffs/s
       _chimSpawnT += dt;
@@ -3595,7 +3035,7 @@
         _chimSpawnT = 0;
         for (let bi = 0; bi < buildingAttractors.length; bi++) {
           const b = buildingAttractors[bi];
-          if (b.destroyed || b.hearth <= 0) continue;
+          if (b.hearth <= 0) continue;
           // Emission probability scales with hearth score
           if (Math.random() > b.hearth * 0.4) continue;
           const ci = _chimHead;
@@ -3607,7 +3047,7 @@
           _cvy[ci] = (0.5 + b.hearth * 0.5) + Math.random() * 0.4;
           _cvz[ci] = (Math.random() - 0.5) * 0.3;
           _cli[ci] = 0;
-          _cml[ci] = 4.0 + b.hearth * 3.0 + Math.random() * 3.0;
+          _cml[ci] = 4.0 + b.hearth * 3.0 + Math.random() * 3.0; // hotter hearths → longer-lasting plumes
           _cac[ci] = 1;
           _cgS[ci] = (0.3 + b.hearth * 0.4); // start size scales with hearth
         }
@@ -3850,7 +3290,6 @@
       const OBJ_VERT_RANGE = 25;
       for (let bi = 0; bi < buildingAttractors.length; bi++) {
         const ba = buildingAttractors[bi];
-        if (ba.destroyed) continue;
         const odx = wx - ba.x, odz = wz - ba.z;
         const od2 = odx * odx + odz * odz;
         if (od2 > OBJ_VERT_RANGE * OBJ_VERT_RANGE) continue;
@@ -3872,7 +3311,6 @@
         if (roofDist < 5) {
           dy += simplex2(wx * 0.12 + t * 0.4 + bi, wz * 0.12) * proximity * 0.4;
         }
-
       }
 
       _swBuf.dx = bx;
@@ -3885,68 +3323,6 @@
     let _smokeSpawnT = 0;
     const SMOKE_SPAWN_RATE  = 0.0065; // one puff every ~65 ms ≈ 15/s
     const SMOKE_WIND_SPEED  = 20;   // world units per second per unit wind
-
-    // ── Building glow decay + deferred light push (runs every frame, even with smoke off) ──
-    const _warmWinTmp = new THREE.Color();
-    function updateBuildingLights(dt) {
-      deferredLightsClear();
-      const MAX_DRAIN_TIME = 0.250 / CYCLE_SPEED;
-
-      // Lights on from mid-dusk (0.73) through night to dawn start (0.23)
-      // Smooth fade: ramp up 0.70→0.75, ramp down 0.22→0.27
-      let lightsFade;
-      if (timeOfDay > 0.75 || timeOfDay < 0.22) {
-        lightsFade = 1.0; // full on at night
-      } else if (timeOfDay >= 0.70 && timeOfDay <= 0.75) {
-        lightsFade = (timeOfDay - 0.70) / 0.05; // fade in during mid-dusk
-      } else if (timeOfDay >= 0.22 && timeOfDay <= 0.27) {
-        lightsFade = 1.0 - (timeOfDay - 0.22) / 0.05; // fade out at dawn
-      } else {
-        lightsFade = 0; // off during day
-      }
-
-      for (let bi = 0; bi < buildingAttractors.length; bi++) {
-        const ba = buildingAttractors[bi];
-        if (ba.destroyed) continue;
-        if (ba.charge > 0.001) {
-          if (autoCycle) {
-            const drainRate = 1.0 / (MAX_DRAIN_TIME * Math.max(ba.charge, 0.05));
-            ba.charge = Math.max(0, ba.charge - drainRate * dt);
-          }
-          ba.glowIntensity = Math.min(ba.charge * 1.2, 1.0);
-
-          // Apply time-of-day fade to visible glow
-          const visGlow = ba.glowIntensity * lightsFade;
-          const warmWinColor = _warmWinTmp.set(1.0, 0.85, 0.4);
-          for (let mi = 0; mi < ba.windowMats.length; mi++) {
-            ba.windowMats[mi].color.copy(warmWinColor).multiplyScalar(visGlow);
-          }
-          // One light per windowed wall face, offset outward from the building
-          if (visGlow > 0.01) {
-            const wl = ba.windowLights;
-            if (wl) {
-              for (let wi = 0; wi < wl.length; wi++) {
-                deferredLightPush(
-                  wl[wi].x, wl[wi].y, wl[wi].z,
-                  1.0, 0.85, 0.4,    // warm yellow
-                  visGlow * 12.0,
-                  1500 + visGlow * 10,
-                  wl[wi].nx, wl[wi].ny, wl[wi].nz,
-                  0.35  // cos(~70°) — cone half-angle for window light
-                );
-              }
-            }
-          }
-        } else if (ba.charge > 0 || ba.glowIntensity > 0) {
-          ba.charge = 0;
-          ba.glowIntensity = 0;
-          const dark = new THREE.Color(0x1a1a22);
-          for (let mi = 0; mi < ba.windowMats.length; mi++) {
-            ba.windowMats[mi].color.copy(dark);
-          }
-        }
-      }
-    }
 
     function updateSmoke(dt) {
       if (!smokeVisible) return;
@@ -3979,7 +3355,7 @@
         const life = _sli[i];
 
         // Sample wind — smoke is carried more strongly as it cools and slows
-        const w    = windForSmoke(_sx[i], _sz[i], _sy[i], groundRef, windTime);
+        const w    = windForSmoke(_sx[i], _sz[i], _sy[i], getTerrainY(_sx[i], _sz[i]), windTime);
         const drag = Math.min(life * 1.2, 1.0); // 0 = own momentum, 1 = wind-controlled
 
         // Steer horizontal velocity toward ambient wind (stronger pull)
@@ -4075,14 +3451,11 @@
         _sz[i] += _svz[i] * dt;
 
         // Opacity: snappy fade-in, long plateau, graceful fade-out
-        // Night smoke is more diffuse — lower opacity, softer
-        const nightDiffuse = glowVal; // 0 = day, 1 = deep night
         const fadeIn  = Math.min(life * 14.0, 1.0);
         const fadeOut = 1.0 - Math.pow(Math.max(0, (life - 0.50) / 0.50), 1.8);
-        const alpha   = fadeIn * fadeOut * (0.50 - nightDiffuse * 0.20);
+        const alpha   = fadeIn * fadeOut * 0.50;
 
         // Size grows as smoke disperses, but shrinks with distance from camera
-        // Night smoke spreads larger (more diffuse)
         const cam = camera.position;
         const dx = _sx[i] - cam.x;
         const dy = _sy[i] - cam.y;
@@ -4090,8 +3463,7 @@
         const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
         // Perspective: further = smaller, but clamp min/max for visibility
         const perspective = Math.max(0.18, Math.min(1.0, 18.0 / (dist + 1)));
-        const nightSizeBoost = 1.0 + nightDiffuse * 0.6;
-        const size = _ssi[i] * (0.45 + life * 3.2) * perspective * nightSizeBoost;
+        const size = _ssi[i] * (0.45 + life * 3.2) * perspective;
 
         _gPos[pi3]   = _sx[i];
         _gPos[pi3+1] = _sy[i];
@@ -4178,8 +3550,69 @@
         }
       }
 
+      // ── Building window glow decay — drain scales with charge level ──
+      // 3 in-game hours = 0.125 of day cycle. At CYCLE_SPEED=0.015, that's ~8.3s real.
+      // 6 in-game hours = 0.250 of day cycle. At CYCLE_SPEED=0.015, that's ~16.7s real.
+      // Full charge drains in ~8.3s; low charge drains much faster.
+      // Drain pauses when clock is paused.
+      const MAX_DRAIN_TIME = 0.250 / CYCLE_SPEED;
+      const _bldgTop = new Float32Array(BLDG_SPOT_COUNT).fill(-1);
+      const _bldgIdx = new Int32Array(BLDG_SPOT_COUNT).fill(-1);
+      _bldgTop.fill(-1); _bldgIdx.fill(-1);
+
+      for (let bi = 0; bi < buildingAttractors.length; bi++) {
+        const ba = buildingAttractors[bi];
+        if (ba.charge > 0.001) {
+          // Only drain when clock is running
+          if (autoCycle) {
+            const drainRate = 1.0 / (MAX_DRAIN_TIME * Math.max(ba.charge, 0.05));
+            ba.charge = Math.max(0, ba.charge - drainRate * dt);
+          }
+          ba.glowIntensity = Math.min(ba.charge * 1.2, 1.0);
+          for (let mi = 0; mi < ba.windowMats.length; mi++) {
+            ba.windowMats[mi].color.copy(ba.glowColor).multiplyScalar(ba.glowIntensity);
+          }
+          // Track top N for SpotLight assignment
+          let minJ = 0;
+          for (let j = 1; j < BLDG_SPOT_COUNT; j++) {
+            if (_bldgTop[j] < _bldgTop[minJ]) minJ = j;
+          }
+          if (ba.glowIntensity > _bldgTop[minJ]) {
+            _bldgTop[minJ] = ba.glowIntensity;
+            _bldgIdx[minJ] = bi;
+          }
+        } else if (ba.charge > 0 || ba.glowIntensity > 0) {
+          ba.charge = 0;
+          ba.glowIntensity = 0;
+          const dark = new THREE.Color(0x1a1a22);
+          for (let mi = 0; mi < ba.windowMats.length; mi++) {
+            ba.windowMats[mi].color.copy(dark);
+          }
+        }
+      }
+
+      // Assign shared SpotLight pool to top-N brightest buildings
+      for (let si = 0; si < BLDG_SPOT_COUNT; si++) {
+        const sl = bldgSpots[si];
+        const bi = _bldgIdx[si];
+        if (bi < 0) {
+          // No building to light — zero intensity, park far away
+          sl.intensity = 0;
+          continue;
+        }
+        const ba = buildingAttractors[bi];
+        sl.position.set(ba.x, ba.y + 2, ba.z);
+        sl.target.position.set(ba.x, ba.y - 10, ba.z);
+        sl.color.copy(ba.glowColor);
+        sl.intensity = ba.glowIntensity * 8.0;
+        sl.distance = 20 + ba.glowIntensity * 10;
+      }
+
       // Update smoke glow lights — smoothly track particles, pulsate colors
       const nightGlow = smokeMat.uniforms.uNightGlow.value;
+
+      // Update player night light intensity
+      playerNightLight.intensity = nightGlow * 1000;
 
       if (nightGlow < 0.05) {
         for (let li = 0; li < SMOKE_LIGHT_COUNT; li++) {
@@ -4346,11 +3779,6 @@
         // Memory: last-used resource indices (persists across days)
         lastRockIdx: -1,
         lastTreeIdx: -1,
-        // Turret building
-        turretSiteIdx: -1,
-        turretRocksCarried: 0,
-        // Farm delivery
-        deliverHomeIdx: -1,
       });
       // Assign farmer role to some non-builders
       const newNpc = npcs[npcs.length - 1];
@@ -4387,43 +3815,6 @@
         if (d2 < bestD2) { bestD2 = d2; best = i; }
       }
       return best;
-    }
-
-    // ── Corn bag mesh — small sack placed next to fed homes ──
-    function createCornBagMesh() {
-      const g = new THREE.Group();
-      // Sack body — rounded cylinder
-      const sackGeo = new THREE.CylinderGeometry(0.3, 0.35, 0.5, 6);
-      const sackMat = new THREE.MeshStandardMaterial({
-        color: 0xc4a44a, flatShading: true, roughness: 0.9
-      });
-      const sack = new THREE.Mesh(sackGeo, sackMat);
-      sack.position.y = 0.25;
-      sack.castShadow = true;
-      g.add(sack);
-      // Tied top — small sphere
-      const topGeo = new THREE.SphereGeometry(0.18, 4, 4);
-      const topMat = new THREE.MeshStandardMaterial({
-        color: 0x8a6a20, flatShading: true
-      });
-      const top = new THREE.Mesh(topGeo, topMat);
-      top.position.y = 0.55;
-      top.scale.y = 0.6;
-      g.add(top);
-      // A few corn ears poking out the top
-      for (let i = 0; i < 3; i++) {
-        const earGeo = new THREE.CylinderGeometry(0.04, 0.03, 0.2, 4);
-        const earMat = new THREE.MeshStandardMaterial({
-          color: 0xeedd44, flatShading: true
-        });
-        const ear = new THREE.Mesh(earGeo, earMat);
-        const ang = (i / 3) * Math.PI * 2 + Math.random() * 0.5;
-        ear.position.set(Math.cos(ang) * 0.1, 0.65, Math.sin(ang) * 0.1);
-        ear.rotation.z = (Math.random() - 0.5) * 0.6;
-        ear.rotation.x = (Math.random() - 0.5) * 0.3;
-        g.add(ear);
-      }
-      return g;
     }
 
     // ── Farm mesh — fenced crop plot ──
@@ -4484,49 +3875,7 @@
       }
       cropGroup.visible = false; // hidden until tended
       g.add(cropGroup);
-      // Corn group — yellow ears on stalks, shown when ripe (stage 4)
-      const cornGroup = new THREE.Group();
-      for (let r = -2; r <= 2; r++) {
-        for (let c = -3; c <= 3; c++) {
-          const stalk = new THREE.Group();
-          const stalkX = c * 0.95 + (Math.random() - 0.5) * 0.2;
-          const stalkZ = r * 1.2 + (Math.random() - 0.5) * 0.2;
-          // Tall stalk
-          const stalkMesh = new THREE.Mesh(
-            new THREE.CylinderGeometry(0.03, 0.04, 1.2, 4),
-            new THREE.MeshStandardMaterial({ color: 0x558833, flatShading: true })
-          );
-          stalkMesh.position.y = 0.6;
-          stalk.add(stalkMesh);
-          // Corn ear — yellow cylinder with rounded ends
-          const earGeo = new THREE.CylinderGeometry(0.08, 0.06, 0.3, 5);
-          const earMat = new THREE.MeshStandardMaterial({
-            color: 0xeedd44, emissive: 0x554400, emissiveIntensity: 0.15,
-            flatShading: true
-          });
-          const ear = new THREE.Mesh(earGeo, earMat);
-          ear.position.set(0.06, 0.85 + Math.random() * 0.15, 0);
-          ear.rotation.z = 0.4 + Math.random() * 0.3;
-          stalk.add(ear);
-          // Leaf
-          const leafGeo = new THREE.PlaneGeometry(0.35, 0.08);
-          const leafMat = new THREE.MeshStandardMaterial({
-            color: 0x66aa33, flatShading: true, side: THREE.DoubleSide
-          });
-          const leaf = new THREE.Mesh(leafGeo, leafMat);
-          leaf.position.set(-0.1, 0.7, 0);
-          leaf.rotation.z = -0.6;
-          leaf.rotation.y = Math.random() * Math.PI;
-          stalk.add(leaf);
-          stalk.position.set(stalkX, 0.2, stalkZ);
-          stalk.castShadow = true;
-          cornGroup.add(stalk);
-        }
-      }
-      cornGroup.visible = false;
-      g.add(cornGroup);
       g.userData.cropGroup = cropGroup;
-      g.userData.cornGroup = cornGroup;
       g.userData.soilMat = soilMat;
       g.position.set(x, gy, z);
       return g;
@@ -4562,61 +3911,15 @@
         for (let fi = 0; fi < farms.length; fi++) {
           if ((sx - farms[fi].x) ** 2 + (sz - farms[fi].z) ** 2 < MIN_FARM_GAP * MIN_FARM_GAP) { tooClose = true; break; }
         }
-        if (tooClose) continue;
-        // Check distance from turrets and turret sites
-        for (let ti = 0; ti < turrets.length; ti++) {
-          if ((sx - turrets[ti].x) ** 2 + (sz - turrets[ti].z) ** 2 < 10 * 10) { tooClose = true; break; }
-        }
-        if (tooClose) continue;
-        for (let si = 0; si < turretSites.length; si++) {
-          if ((sx - turretSites[si].x) ** 2 + (sz - turretSites[si].z) ** 2 < 10 * 10) { tooClose = true; break; }
-        }
-        if (tooClose) continue;
-        // Check distance from NPC building sites in progress
-        for (let ni = 0; ni < npcs.length; ni++) {
-          const bm = npcs[ni].buildMesh;
-          if (!bm) continue;
-          if ((sx - bm.position.x) ** 2 + (sz - bm.position.z) ** 2 < MIN_FARM_GAP * MIN_FARM_GAP) { tooClose = true; break; }
-        }
         if (!tooClose) return { x: sx, z: sz, y: sy };
       }
       return null;
     }
 
-    function isSiteTooClose(sx, sz, minGap, siteRadius) {
-      for (let other = 0; other < npcs.length; other++) {
-        const bm = npcs[other].buildMesh;
-        if (!bm) continue;
-        const ddx = sx - bm.position.x, ddz = sz - bm.position.z;
-        if (ddx * ddx + ddz * ddz < (minGap + siteRadius) ** 2) return true;
-      }
-      for (let bi = 0; bi < buildingAttractors.length; bi++) {
-        const ba = buildingAttractors[bi];
-        const ddx = sx - ba.x, ddz = sz - ba.z;
-        if (ddx * ddx + ddz * ddz < (minGap + ba.r) ** 2) return true;
-      }
-      for (let fi = 0; fi < farms.length; fi++) {
-        const f = farms[fi];
-        const ddx = sx - f.x, ddz = sz - f.z;
-        if (ddx * ddx + ddz * ddz < (minGap + 6) ** 2) return true;
-      }
-      for (let ti = 0; ti < turrets.length; ti++) {
-        const t = turrets[ti];
-        const ddx = sx - t.x, ddz = sz - t.z;
-        if (ddx * ddx + ddz * ddz < (minGap + 3) ** 2) return true;
-      }
-      for (let si = 0; si < turretSites.length; si++) {
-        const s = turretSites[si];
-        const ddx = sx - s.x, ddz = sz - s.z;
-        if (ddx * ddx + ddz * ddz < (minGap + 3) ** 2) return true;
-      }
-      return false;
-    }
-
     function pickBuildSite(npc) {
       const siteRotation = Math.random() * Math.PI * 2;
-      const MIN_BLDG_GAP = 5.5;
-      const BLD_SITE_RADIUS = 15;
+      const MIN_BLDG_GAP = 5.5; // minimum distance between building centers
+      const BLD_SITE_RADIUS = 15; // 5x5x5 build site footprint
       for (let a = 0; a < 20; a++) {
         const ang = Math.random() * Math.PI * 2;
         const d = 10 + Math.random() * 14;
@@ -4624,9 +3927,22 @@
         const sz = npc.homeZ + Math.sin(ang) * d;
         const sy = getTerrainY(sx, sz);
         if (sy < 2.0 || sy > 14) continue;
-        if (!isSiteTooClose(sx, sz, MIN_BLDG_GAP, BLD_SITE_RADIUS))
-          return { x: sx, z: sz, y: sy, rot: siteRotation };
+        // Check against all existing buildings
+        let tooClose = false;
+        for (let other = 0; other < npcs.length; other++) {
+          const bm = npcs[other].buildMesh;
+          if (!bm) continue; // not all npcs have a buildmesh
+          const ddx = sx - bm.x, ddz = sz - bm.z;
+          if (ddx * ddx + ddz * ddz < (MIN_BLDG_GAP + BLD_SITE_RADIUS) ** 2) { tooClose = true; break; }
+        }
+        for (let bi = 0; bi < buildingAttractors.length; bi++) {
+          const ba = buildingAttractors[bi];
+          const ddx = sx - ba.x, ddz = sz - ba.z;
+          if (ddx * ddx + ddz * ddz < (MIN_BLDG_GAP + ba.r) ** 2) { tooClose = true; break; }
+        }
+        if (!tooClose) return { x: sx, z: sz, y: sy, rot: siteRotation };
       }
+      // Fallback: try further from home
       for (let a = 0; a < 10; a++) {
         const ang = Math.random() * Math.PI * 2;
         const d = 20 + Math.random() * 15;
@@ -4634,10 +3950,21 @@
         const sz = npc.homeZ + Math.sin(ang) * d;
         const sy = getTerrainY(sx, sz);
         if (sy < 2.0 || sy > 14) continue;
-        if (!isSiteTooClose(sx, sz, MIN_BLDG_GAP, BLD_SITE_RADIUS))
-          return { x: sx, z: sz, y: sy, rot: siteRotation };
+        let tooClose = false;
+        for (let other = 0; other < npcs.length; other++) {
+          const bm = npcs[other].buildMesh;
+          if (!bm) continue; // not all npcs have a buildmesh
+          const ddx = sx - bm.x, ddz = sz - bm.z;
+          if (ddx * ddx + ddz * ddz < (MIN_BLDG_GAP + BLD_SITE_RADIUS) ** 2) { tooClose = true; break; }
+        }
+        for (let bi = 0; bi < buildingAttractors.length; bi++) {
+          const ba = buildingAttractors[bi];
+          const ddx = sx - ba.x, ddz = sz - ba.z;
+          if (ddx * ddx + ddz * ddz < (MIN_BLDG_GAP + ba.r) ** 2) { tooClose = true; break; }
+        }
+        if (!tooClose) return { x: sx, z: sz, y: sy, rot: siteRotation };
       }
-      return null;
+      return null; // no valid site found
     }
 
     // Pick a waypoint biased toward higher terrain (gradient ascent).
@@ -4664,54 +3991,11 @@
       return { x: bestX, z: bestZ };
     }
 
-    // Remove collision boxes and wind faces belonging to a destroyed building
-    function removeDestroyedBuildingPhysics(bx, bz, dims) {
-      const hw = dims.w / 2 + 1.0;
-      const hd = dims.d / 2 + 1.0;
-      const maxR = Math.max(hw, hd) + 2.0;
-      const maxR2 = maxR * maxR;
-      // Remove collision boxes near this building
-      for (let ci = collisionBoxes.length - 1; ci >= 0; ci--) {
-        const cb = collisionBoxes[ci];
-        if ((cb.cx - bx) ** 2 + (cb.cz - bz) ** 2 < maxR2) {
-          collisionBoxes.splice(ci, 1);
-        }
-      }
-      // Remove wind faces near this building
-      for (let fi = windFaces.length - 1; fi >= 0; fi--) {
-        const wf = windFaces[fi];
-        if ((wf.cx - bx) ** 2 + (wf.cz - bz) ** 2 < maxR2) {
-          windFaces.splice(fi, 1);
-        }
-      }
-    }
-
-    // Find the building attractor nearest to a world position
-    function findHomeBuildingIdx(hx, hz) {
-      let best = -1, bestD2 = 100 * 100;
-      for (let bi = 0; bi < buildingAttractors.length; bi++) {
-        const ba = buildingAttractors[bi];
-        const d2 = (ba.x - hx) ** 2 + (ba.z - hz) ** 2;
-        if (d2 < bestD2) { bestD2 = d2; best = bi; }
-      }
-      return best;
-    }
-
-    function isNpcHomeContaminated(npc) {
-      if (npc._homeBldgIdx === undefined) {
-        npc._homeBldgIdx = findHomeBuildingIdx(npc.homeX, npc.homeZ);
-      }
-      const idx = npc._homeBldgIdx;
-      return idx >= 0 && buildingAttractors[idx].contaminated;
-    }
-
     function moveNPC(npc, tx, tz, dt) {
       const dx = tx - npc.x, dz = tz - npc.z;
       const dist = Math.sqrt(dx * dx + dz * dz);
       if (dist < 1.5) return 0;
-      // Contaminated home debuff: NPCs move at 30% speed
-      const contamSlow = isNpcHomeContaminated(npc) ? 0.3 : 1.0;
-      const baseStep = Math.min(NPC_SPEED * contamSlow * dt, dist);
+      const baseStep = Math.min(NPC_SPEED * dt, dist);
       const straightNx = dx / dist, straightNz = dz / dist;
 
       // ── Path-aware steering: sample candidate directions, pick best ──
@@ -4765,7 +4049,7 @@
         }
       } else {
         const speedMult = getPathSpeedAt(npc.x, npc.z);
-        const step = Math.min(NPC_SPEED * contamSlow * speedMult * dt, dist);
+        const step = Math.min(NPC_SPEED * speedMult * dt, dist);
         npc.x += bestNx * step; npc.z += bestNz * step;
       }
 
@@ -4798,7 +4082,7 @@
         npc.mesh.userData.woodBundle.visible = npc.carrying;
 
         // At dusk, interrupt active NPCs and send them home
-        if (isDusk && npc.state !== NPC_IDLE && npc.state !== NPC_GOING_HOME && npc.state !== NPC_BUILD && npc.state !== NPC_FARM_BUILD && npc.state !== NPC_TURRET_BUILD) {
+        if (isDusk && npc.state !== NPC_IDLE && npc.state !== NPC_GOING_HOME && npc.state !== NPC_BUILD && npc.state !== NPC_FARM_BUILD) {
           // npc.carrying = false; // do not drop resources at dusk — let them bring it home
           npc.mesh.children[0].rotation.x = 0;
           npc.mesh.children[0].rotation.z = 0;
@@ -4842,43 +4126,9 @@
               npc.mesh.position.set(npc.homeX, getTerrainY(npc.homeX, npc.homeZ), npc.homeZ);
             }
 
-            // Contaminated home — NPC won't work, just lingers near home
-            if (isNpcHomeContaminated(npc)) {
-              const _contamHome2 = true;
-              let wx2, wz2, wy2;
-              for (let tries = 0; tries < 8; tries++) {
-                const ang = Math.random() * Math.PI * 2;
-                const wd = 2 + Math.random() * 4;
-                wx2 = npc.homeX + Math.cos(ang) * wd;
-                wz2 = npc.homeZ + Math.sin(ang) * wd;
-                wy2 = getTerrainY(wx2, wz2);
-                if (wy2 >= 2.0) break;
-              }
-              if (wy2 >= 2.0) {
-                npc.targetX = wx2; npc.targetZ = wz2;
-                npc.state = NPC_WANDER;
-              } else {
-                npc.timer = 3 + Math.random() * 5;
-              }
-              break;
-            }
-
             if (!npc.isBuilder) {
               // ── Farmer: build a farm then tend it ──
               if (npc.isFarmer) {
-                // Resume food delivery if carrying corn
-                if (npc.carrying && npc.deliverHomeIdx >= 0) {
-                  const ba = buildingAttractors[npc.deliverHomeIdx];
-                  if (ba && !ba.destroyed && ba.food < 1) {
-                    npc.targetX = ba.x;
-                    npc.targetZ = ba.z;
-                    npc.state = NPC_FARM_DELIVER;
-                    break;
-                  }
-                  // Target home gone or fed — drop food, go tend
-                  npc.carrying = false;
-                  npc.deliverHomeIdx = -1;
-                }
                 // Already has a farm — tend it
                 if (npc.farmIdx >= 0) {
                   const farm = farms[npc.farmIdx];
@@ -4943,12 +4193,10 @@
                 break;
               }
               // ── Wanderer: stroll to a random point near home (avoid water) ──
-              // If home is contaminated, stay very close to it
-              const _contamHome = isNpcHomeContaminated(npc);
               let wx, wz, wy;
               for (let tries = 0; tries < 8; tries++) {
                 const ang = Math.random() * Math.PI * 2;
-                const wd = _contamHome ? (2 + Math.random() * 4) : (8 + Math.random() * 20);
+                const wd = 8 + Math.random() * 20;
                 wx = npc.homeX + Math.cos(ang) * wd;
                 wz = npc.homeZ + Math.sin(ang) * wd;
                 wy = getTerrainY(wx, wz);
@@ -4998,46 +4246,6 @@
                 npc.state = NPC_WALK_TREE;
               }
               break;
-            }
-            // ── Check for turret sites needing builders ──
-            {
-              let bestTurretSite = -1, bestTD2 = 60 * 60;
-              for (let si = 0; si < turretSites.length; si++) {
-                const ts = turretSites[si];
-                if (ts.builderIdx >= 0) continue; // already assigned
-                const td2 = (ts.x - npc.homeX) ** 2 + (ts.z - npc.homeZ) ** 2;
-                if (td2 < bestTD2) { bestTD2 = td2; bestTurretSite = si; }
-              }
-              if (bestTurretSite >= 0) {
-                const ts = turretSites[bestTurretSite];
-                ts.builderIdx = i; // claim this site
-                npc.turretSiteIdx = bestTurretSite;
-                npc.turretRocksCarried = 0;
-                // Create construction placeholder
-                const bm = new THREE.Mesh(
-                  new THREE.CylinderGeometry(1.2, 1.5, 3.0, 8),
-                  new THREE.MeshStandardMaterial({ color: 0x9a9a8a, flatShading: true, roughness: 0.9 })
-                );
-                bm.scale.y = 0.05;
-                bm.position.set(ts.x, ts.y + 0.08, ts.z);
-                bm.castShadow = true;
-                scene.add(bm);
-                ts.buildMesh = bm;
-                // Go get rocks
-                if (npc.lastRockIdx >= 0 && !depletedRocks.has(npc.lastRockIdx)) {
-                  npc.rockIdx = npc.lastRockIdx;
-                  npc.targetX = rockPositions[npc.lastRockIdx].x;
-                  npc.targetZ = rockPositions[npc.lastRockIdx].z;
-                  npc.state = NPC_TURRET_WALK_ROCK;
-                } else {
-                  npc.seekRadius = 25;
-                  npc.seekAttempts = 0;
-                  const wp = pickUphillWaypoint(npc.x, npc.z, npc.seekRadius);
-                  npc.targetX = wp.x; npc.targetZ = wp.z;
-                  npc.state = NPC_TURRET_SEEK_ROCK;
-                }
-                break;
-              }
             }
             // Start a new building project
             const site = pickBuildSite(npc);
@@ -5315,38 +4523,12 @@
                 { cx: npc.siteX+(bd/2)*sR, cz: npc.siteZ-(bd/2)*cR, nx:sR, nz:-cR, halfExtent:bw/2, height:bh, groundY:bgy }
               );
               // Register smoke attractor
-              const winY = bgy + bh * 0.45;
-              const nwl = [
-                // +Z face — local (0,0,1) → world (sR, 0, cR)
-                { x: npc.siteX + (bd/2+0.8)*sR, z: npc.siteZ + (bd/2+0.8)*cR, y: winY,
-                  nx: sR, ny: -0.3, nz: cR },
-                // +X face — local (1,0,0) → world (cR, 0, -sR)
-                { x: npc.siteX + (bw/2+0.8)*cR, z: npc.siteZ - (bw/2+0.8)*sR, y: winY,
-                  nx: cR, ny: -0.3, nz: -sR },
-                // -X face — local (-1,0,0) → world (-cR, 0, sR)
-                { x: npc.siteX - (bw/2+0.8)*cR, z: npc.siteZ + (bw/2+0.8)*sR, y: winY,
-                  nx: -cR, ny: -0.3, nz: sR },
-              ];
               buildingAttractors.push({
                 x: npc.siteX, y: bgy + bh * 0.5, z: npc.siteZ,
                 r: Math.max(bw, bd) * 0.6,
                 windowMats: nb.userData.windowMats || [],
-                windowLights: nwl,
                 glowIntensity: 0, glowColor: new THREE.Color(0, 0, 0),
-                charge: 0, chargeMax: 1.0,
-                roofY: bgy + bh + bh * 0.5 * 0.4,
-                settlementX: npc.siteX, settlementZ: npc.siteZ,
-                contaminated: false, vineGroup: null,
-                dims: { w: bw, h: bh, d: bd },
-                groundY: bgy, rotation: nb.rotation.y,
-                food: 0, foodBagMesh: null,
-                buildingMesh: nb,
-              });
-              // Register collision box for player avoidance
-              collisionBoxes.push({
-                cx: npc.siteX, cz: npc.siteZ,
-                hw: bw / 2 + 0.3, hd: bd / 2 + 0.3,
-                cosR: cR, sinR: sR
+                charge: 0, chargeMax: 1.0
               });
               // Spawn new NPC at the new home
               spawnNPC(npc.siteX, npc.siteZ, npc.palette, npc.kingdomIdx);
@@ -5355,141 +4537,6 @@
               npc.mesh.position.set(npc.homeX, getTerrainY(npc.homeX, npc.homeZ), npc.homeZ);
               npc.state = NPC_IDLE;
               npc.timer = 10 + Math.random() * 20;
-            }
-            break;
-          }
-
-          // ── Turret builder states ──
-          case NPC_TURRET_SEEK_ROCK: {
-            if (moveNPC(npc, npc.targetX, npc.targetZ, dt) === 0) {
-              // Look for a rock deposit nearby
-              const ri = findNearestRock(npc.x, npc.z, npc.seekRadius);
-              if (ri >= 0) {
-                npc.rockIdx = ri;
-                npc.targetX = rockPositions[ri].x;
-                npc.targetZ = rockPositions[ri].z;
-                npc.state = NPC_TURRET_WALK_ROCK;
-              } else {
-                npc.seekAttempts++;
-                if (npc.seekAttempts > 5) {
-                  npc.seekRadius = Math.min(npc.seekRadius + 15, 80);
-                  npc.seekAttempts = 0;
-                }
-                const wp = pickUphillWaypoint(npc.x, npc.z, npc.seekRadius);
-                npc.targetX = wp.x; npc.targetZ = wp.z;
-              }
-            }
-            break;
-          }
-
-          case NPC_TURRET_WALK_ROCK: {
-            if (moveNPC(npc, npc.targetX, npc.targetZ, dt) === 0) {
-              npc.state = NPC_TURRET_GATHER_ROCK;
-              npc.timer = NPC_GATHER_TIME;
-              npc.lastRockIdx = npc.rockIdx;
-            }
-            break;
-          }
-
-          case NPC_TURRET_GATHER_ROCK: {
-            npc.timer -= dt;
-            // Hammering animation
-            npc.mesh.children[0].rotation.x = Math.sin(performance.now() * 0.008) * 0.4;
-            if (npc.timer <= 0) {
-              npc.mesh.children[0].rotation.x = 0;
-              npc.carrying = true;
-              if (npc.turretSiteIdx >= 0 && npc.turretSiteIdx < turretSites.length) {
-                const ts = turretSites[npc.turretSiteIdx];
-                npc.targetX = ts.x;
-                npc.targetZ = ts.z;
-                npc.state = NPC_TURRET_WALK_SITE;
-              } else {
-                npc.carrying = false;
-                npc.state = NPC_IDLE;
-                npc.timer = 5;
-              }
-              // Deplete rock
-              if (npc.rockIdx >= 0) {
-                if (!rockDurability) { /* safety */ }
-                else if (rockDurability[npc.rockIdx] !== undefined) {
-                  rockDurability[npc.rockIdx]--;
-                  if (rockDurability[npc.rockIdx] <= 0) depletedRocks.add(npc.rockIdx);
-                }
-              }
-            }
-            break;
-          }
-
-          case NPC_TURRET_WALK_SITE: {
-            if (moveNPC(npc, npc.targetX, npc.targetZ, dt) === 0) {
-              npc.carrying = false;
-              if (npc.turretSiteIdx >= 0 && npc.turretSiteIdx < turretSites.length) {
-                const ts = turretSites[npc.turretSiteIdx];
-                ts.rocksDelivered++;
-                // Grow the placeholder
-                if (ts.buildMesh) {
-                  ts.buildMesh.scale.y = Math.min(1, 0.05 + ts.rocksDelivered / TURRET_ROCK_TRIPS * 0.4);
-                  ts.buildMesh.position.y = ts.y + 1.5 * ts.buildMesh.scale.y;
-                }
-                if (ts.rocksDelivered >= TURRET_ROCK_TRIPS) {
-                  // Enough rocks — start building
-                  npc.state = NPC_TURRET_BUILD;
-                  npc.timer = TURRET_BUILD_TIME;
-                } else {
-                  // Go get more rocks
-                  if (npc.lastRockIdx >= 0 && !depletedRocks.has(npc.lastRockIdx)) {
-                    npc.rockIdx = npc.lastRockIdx;
-                    npc.targetX = rockPositions[npc.lastRockIdx].x;
-                    npc.targetZ = rockPositions[npc.lastRockIdx].z;
-                    npc.state = NPC_TURRET_WALK_ROCK;
-                  } else {
-                    npc.seekRadius = 25;
-                    npc.seekAttempts = 0;
-                    const wp = pickUphillWaypoint(npc.x, npc.z, npc.seekRadius);
-                    npc.targetX = wp.x; npc.targetZ = wp.z;
-                    npc.state = NPC_TURRET_SEEK_ROCK;
-                  }
-                }
-              } else {
-                npc.state = NPC_IDLE;
-                npc.timer = 5;
-              }
-            }
-            break;
-          }
-
-          case NPC_TURRET_BUILD: {
-            npc.timer -= dt;
-            // Circle the turret site while building
-            if (npc.turretSiteIdx >= 0 && npc.turretSiteIdx < turretSites.length) {
-              const ts = turretSites[npc.turretSiteIdx];
-              const ba2 = (TURRET_BUILD_TIME - npc.timer) * 1.2;
-              npc.x = ts.x + Math.cos(ba2) * 3;
-              npc.z = ts.z + Math.sin(ba2) * 3;
-              npc.mesh.position.x = npc.x;
-              npc.mesh.position.z = npc.z;
-              npc.mesh.position.y = getTerrainY(npc.x, npc.z);
-              npc.mesh.rotation.y = ba2 + Math.PI;
-              npc.walkPhase += dt * 6;
-              npc.mesh.userData.legL.rotation.x = Math.sin(npc.walkPhase) * 0.3;
-              npc.mesh.userData.legR.rotation.x = Math.sin(npc.walkPhase + Math.PI) * 0.3;
-              // Grow placeholder
-              if (ts.buildMesh) {
-                const bp = 1 - npc.timer / TURRET_BUILD_TIME;
-                ts.buildMesh.scale.y = 0.4 + bp * 0.6;
-                ts.buildMesh.position.y = ts.y + 1.5 * ts.buildMesh.scale.y;
-              }
-              if (npc.timer <= 0) {
-                const sIdx = npc.turretSiteIdx;
-                completeTurretBuild(sIdx);
-                // Adjust our index if the splice changed things
-                npc.turretSiteIdx = -1;
-                npc.state = NPC_IDLE;
-                npc.timer = 10 + Math.random() * 15;
-              }
-            } else {
-              npc.state = NPC_IDLE;
-              npc.timer = 5;
             }
             break;
           }
@@ -5568,7 +4615,6 @@
                 x: npc.siteX, z: npc.siteZ,
                 tenderIdx: npcs.indexOf(npc),
                 growthStage: 0,
-                cornCyclesLeft: 0,
                 destroyed: false,
               });
               npc.farmIdx = farmIdx;
@@ -5587,10 +4633,11 @@
               npc.timer = 10;
               break;
             }
-            // Walk to farm if not there
+            // Walk to farm if not there (ignore path speed boost)
             const dxF = farm.x - npc.x, dzF = farm.z - npc.z;
             const distToFarm = Math.sqrt(dxF * dxF + dzF * dzF);
             if (distToFarm > 3.0) {
+              // Walk toward farm at slow fixed speed (no path boost)
               const walkSpd = 3.5;
               const step = Math.min(walkSpd * dt, distToFarm);
               npc.x += (dxF / distToFarm) * step;
@@ -5605,7 +4652,7 @@
             } else {
               // Slowly amble around the farm
               npc.timer -= dt;
-              npc.walkPhase += dt * 0.5;
+              npc.walkPhase += dt * 0.3; // very slow rotation
               const tendAng = npc.walkPhase;
               npc.x = farm.x + Math.cos(tendAng) * 3;
               npc.z = farm.z + Math.sin(tendAng) * 3;
@@ -5613,177 +4660,30 @@
               npc.mesh.position.z = npc.z;
               npc.mesh.position.y = getTerrainY(npc.x, npc.z);
               npc.mesh.rotation.y = tendAng + Math.PI * 0.5;
+              // Gentle leg movement
               npc.mesh.userData.legL.rotation.x = Math.sin(tendAng * 3) * 0.15;
               npc.mesh.userData.legR.rotation.x = Math.sin(tendAng * 3 + Math.PI) * 0.15;
-              if (npc.timer <= 0) {
-                if (farm.growthStage < 3) {
-                  // Green crop growth stages 1-3
-                  farm.growthStage++;
-                  npc.timer = FARM_TEND_INTERVAL;
-                  const crops = farm.mesh.userData.cropGroup;
-                  crops.visible = true;
-                  const s = farm.growthStage / 3;
-                  crops.children.forEach(c => {
-                    c.scale.setScalar(s);
-                    c.material.color.setHex(
-                      farm.growthStage === 1 ? 0x55993a :
-                      farm.growthStage === 2 ? 0x66aa40 : 0x88cc44
-                    );
-                  });
-                } else if (farm.growthStage === 3) {
-                  // Transition to corn (stage 4) — hide green crops, show corn
-                  farm.growthStage = 4;
-                  farm.cornCyclesLeft = CORN_TEND_CYCLES_MIN +
-                    Math.floor(Math.random() * (CORN_TEND_CYCLES_MAX - CORN_TEND_CYCLES_MIN + 1));
-                  npc.timer = FARM_TEND_INTERVAL;
-                  farm.mesh.userData.cropGroup.visible = false;
-                  farm.mesh.userData.cornGroup.visible = true;
-                } else if (farm.growthStage === 4) {
-                  // Corn is ripe — count down tend cycles
-                  farm.cornCyclesLeft--;
-                  if (farm.cornCyclesLeft <= 0) {
-                    // Time to harvest!
-                    npc.state = NPC_FARM_HARVEST;
-                    npc.timer = FARM_HARVEST_TIME;
-                  } else {
-                    npc.timer = FARM_TEND_INTERVAL;
-                  }
-                }
-              }
-            }
-            break;
-          }
-
-          case NPC_FARM_HARVEST: {
-            const farm = npc.farmIdx >= 0 ? farms[npc.farmIdx] : null;
-            if (!farm || farm.destroyed) {
-              npc.farmIdx = -1;
-              npc.state = NPC_IDLE;
-              npc.timer = 10;
-              break;
-            }
-            npc.timer -= dt;
-            // Harvesting animation — bend repeatedly
-            npc.mesh.children[0].rotation.x = Math.sin(performance.now() * 0.008) * 0.4;
-            if (npc.timer <= 0) {
-              npc.mesh.children[0].rotation.x = 0;
-              npc.carrying = true;
-              // Hide corn, reset farm to stage 0
-              farm.mesh.userData.cornGroup.visible = false;
-              farm.mesh.userData.cropGroup.visible = false;
-              farm.growthStage = 0;
-              // Find nearest home without food
-              let bestHome = -1, bestD2 = Infinity;
-              for (let bi = 0; bi < buildingAttractors.length; bi++) {
-                const ba = buildingAttractors[bi];
-                if (ba.destroyed || ba.contaminated) continue;
-                if (ba.food >= 1) continue; // already has food
-                const d2 = (ba.x - farm.x) ** 2 + (ba.z - farm.z) ** 2;
-                if (d2 < bestD2) { bestD2 = d2; bestHome = bi; }
-              }
-              if (bestHome >= 0) {
-                npc.deliverHomeIdx = bestHome;
-                npc.targetX = buildingAttractors[bestHome].x;
-                npc.targetZ = buildingAttractors[bestHome].z;
-                npc.state = NPC_FARM_DELIVER;
-              } else {
-                // No hungry homes — just go back to tending
-                npc.carrying = false;
-                npc.state = NPC_FARM_TEND;
+              // Grow crops over time
+              if (farm.growthStage < 3 && npc.timer <= 0) {
+                farm.growthStage++;
                 npc.timer = FARM_TEND_INTERVAL;
-              }
-            }
-            break;
-          }
-
-          case NPC_FARM_DELIVER: {
-            if (moveNPC(npc, npc.targetX, npc.targetZ, dt) === 0) {
-              npc.carrying = false;
-              // Deliver food to the home
-              const bi = npc.deliverHomeIdx;
-              if (bi >= 0 && bi < buildingAttractors.length) {
-                const ba = buildingAttractors[bi];
-                if (!ba.destroyed && ba.food < 1) {
-                  ba.food = 1;
-                  // Create corn bag mesh next to the home
-                  if (!ba.foodBagMesh) {
-                    ba.foodBagMesh = createCornBagMesh();
-                    scene.add(ba.foodBagMesh);
-                  }
-                  // Position the bag next to the building
-                  const bagAngle = ba.rotation + Math.PI * 0.5;
-                  const bagDist = Math.max(ba.dims.w, ba.dims.d) * 0.5 + 0.8;
-                  ba.foodBagMesh.position.set(
-                    ba.x + Math.cos(bagAngle) * bagDist,
-                    ba.groundY,
-                    ba.z + Math.sin(bagAngle) * bagDist
+                const crops = farm.mesh.userData.cropGroup;
+                crops.visible = true;
+                // Scale crops with growth
+                const s = farm.growthStage / 3;
+                crops.children.forEach(c => {
+                  c.scale.setScalar(s);
+                  c.material.color.setHex(
+                    farm.growthStage === 1 ? 0x55993a :
+                    farm.growthStage === 2 ? 0x66aa40 : 0x88cc44
                   );
-                  ba.foodBagMesh.visible = true;
-                }
+                });
               }
-              npc.deliverHomeIdx = -1;
-              // Go back to farm
-              npc.state = NPC_FARM_TEND;
-              npc.timer = FARM_TEND_INTERVAL;
             }
             break;
           }
         }
       }
-    }
-
-    let _lastFoodCheckPhase = -1; // tracks last phase when food was checked
-    function updateNPCsHomes(dt) {
-      // Fire once when moon transitions from Waning Crescent (7) → New Moon (0)
-      if (moonPhaseIndex === 0 && _lastFoodCheckPhase === 7) {
-        for (let bi = 0; bi < buildingAttractors.length; bi++) {
-          const ba = buildingAttractors[bi];
-          if (ba.destroyed) continue;
-          if (ba.food > 0) {
-            ba.food = 0;
-            if (ba.foodBagMesh) ba.foodBagMesh.visible = false;
-          } else {
-            // Starvation — no food → destroy building and its NPC
-            ba.destroyed = true;
-            removeDestroyedBuildingPhysics(ba.x, ba.z, ba.dims);
-            // Hide building mesh
-            if (ba.buildingMesh) {
-              ba.buildingMesh.visible = false;
-            }
-            // Remove corn bag if any
-            if (ba.foodBagMesh) {
-              scene.remove(ba.foodBagMesh);
-              ba.foodBagMesh = null;
-            }
-            // Remove vines if contaminated
-            if (ba.vineGroup) {
-              scene.remove(ba.vineGroup);
-              ba.vineGroup.traverse(c => {
-                if (c.geometry) c.geometry.dispose();
-                if (c.material) c.material.dispose();
-              });
-              ba.vineGroup = null;
-            }
-            // Kill the NPC whose home this is
-            for (let ni = npcs.length - 1; ni >= 0; ni--) {
-              const npc = npcs[ni];
-              const d2 = (npc.homeX - ba.x) ** 2 + (npc.homeZ - ba.z) ** 2;
-              if (d2 < 4) {
-                scene.remove(npc.mesh);
-                npc.mesh.traverse(c => {
-                  if (c.geometry) c.geometry.dispose();
-                  if (c.material) c.material.dispose();
-                });
-                if (npc.farmIdx >= 0 && farms[npc.farmIdx]) {
-                  farms[npc.farmIdx].tenderIdx = -1;
-                }
-                npcs.splice(ni, 1);
-              }
-            }
-          }
-        }
-      }
-      _lastFoodCheckPhase = moonPhaseIndex;
     }
 
     // ─────────────────────────────────────────
@@ -6335,9 +5235,16 @@
                 hp -= dt * (SQ_BUILDING_MAX_HP / SQ_ATTACK_TIME);
                 buildingHP.set(sq.attackTargetIdx, hp);
                 if (hp <= 0) {
+                  scene.traverse(child => {
+                    if (child.isMesh && child.parent && child.parent.isGroup
+                        && child.parent !== scene) {
+                      const p = child.parent.position || child.position;
+                      if (Math.abs(p.x - ba.x) < 1 && Math.abs(p.z - ba.z) < 1) {
+                        child.parent.visible = false;
+                      }
+                    }
+                  });
                   ba.destroyed = true;
-                  if (ba.buildingMesh) ba.buildingMesh.visible = false;
-                  removeDestroyedBuildingPhysics(ba.x, ba.z, ba.dims);
                   sq.state = SQ_FLEE;
                   sq.fleeAngle = Math.random() * Math.PI * 2;
                   sq.fleeChangeTimer = 1 + Math.random() * 2;
@@ -6441,9 +5348,6 @@
     const NM_SMOKE_KILL_RANGE = 5.0; // smoke particle kills mob within this range
     const NM_SMOKE_ATTRACT_RANGE = 120; // how far mobs can sense smoke
     const NM_LINGER_RANGE = 30;      // wander radius when no smoke
-    const NM_HOME_ATTRACT_RANGE = 80; // how far wraiths can sense lit homes
-    const NM_HOME_ATTACK_RANGE = 3.0; // distance to drain home power
-    const NM_PLAYER_NEARBY = 30;      // if player is within this range, wraiths target player not homes
     const NM_FADE_SPEED = 2.0;       // alpha fade in/out speed
     const NM_SPAWN_EDGE = WORLD_SIZE * 0.4; // spawn near world edges
 
@@ -6528,8 +5432,7 @@
         mesh,
         x: sx, z: sz,
         targetX: sx, targetZ: sz,
-        state: 'wander', // 'wander', 'chase_smoke', 'attack_player', 'attack_npc', 'attack_squirrel', 'attack_home', 'dying'
-        homeTargetIdx: -1, // index into buildingAttractors
+        state: 'wander', // 'wander', 'chase_smoke', 'attack_player', 'attack_npc', 'attack_squirrel', 'dying'
         timer: 0,
         attackCooldown: 0,
         alpha: 0, // fade in
@@ -6686,7 +5589,6 @@
         // ── AI: find target ──
         const distToPlayer2 = (px - nm.x) ** 2 + (pz - nm.z) ** 2;
         const distToPlayer = Math.sqrt(distToPlayer2);
-        const playerNearby = distToPlayer < NM_PLAYER_NEARBY;
 
         // Priority 1: Attack player if close
         if (distToPlayer < NM_ATTACK_RANGE * 3) {
@@ -6694,48 +5596,7 @@
           nm.targetX = px;
           nm.targetZ = pz;
         }
-        // Priority 2: If player is NOT nearby, hunt homes (prefer lit, skip contaminated)
-        else if (!playerNearby) {
-          let bestHome = -1, bestHomeD2 = NM_HOME_ATTRACT_RANGE * NM_HOME_ATTRACT_RANGE;
-          let bestScore = -1;
-          for (let bi = 0; bi < buildingAttractors.length; bi++) {
-            const ba = buildingAttractors[bi];
-            if (ba.destroyed || ba.contaminated) continue;
-            const hd2 = (ba.x - nm.x) ** 2 + (ba.z - nm.z) ** 2;
-            if (hd2 > NM_HOME_ATTRACT_RANGE * NM_HOME_ATTRACT_RANGE) continue;
-            // Prefer lit homes (charge > 0) over dark ones
-            const score = ba.charge > 0.05 ? 1000 : 1;
-            const effD2 = hd2 / score; // lower = better target
-            if (effD2 < bestHomeD2) { bestHomeD2 = effD2; bestHome = bi; }
-          }
-          if (bestHome >= 0) {
-            nm.state = 'attack_home';
-            nm.homeTargetIdx = bestHome;
-            nm.targetX = buildingAttractors[bestHome].x;
-            nm.targetZ = buildingAttractors[bestHome].z;
-          } else {
-            // Fallback: follow smoke or wander
-            const smokeCentroid = _smkCentroid;
-            if (smokeCentroid) {
-              nm.state = 'chase_smoke';
-              nm.targetX = smokeCentroid.x;
-              nm.targetZ = smokeCentroid.z;
-            } else {
-              nm.wanderTimer -= dt;
-              if (nm.wanderTimer <= 0 || nm.state !== 'wander') {
-                nm.state = 'wander';
-                nm.wanderTimer = 4 + Math.random() * 6;
-                const ang = Math.random() * Math.PI * 2;
-                nm.targetX = nm.x + Math.cos(ang) * NM_LINGER_RANGE;
-                nm.targetZ = nm.z + Math.sin(ang) * NM_LINGER_RANGE;
-                const bnd = WORLD_SIZE * 0.42;
-                nm.targetX = Math.max(-bnd, Math.min(bnd, nm.targetX));
-                nm.targetZ = Math.max(-bnd, Math.min(bnd, nm.targetZ));
-              }
-            }
-          }
-        }
-        // Priority 3: Follow smoke (use cached centroid)
+        // Priority 2: Follow smoke (use cached centroid)
         else {
           const smokeCentroid = _smkCentroid;
           if (smokeCentroid) {
@@ -6743,7 +5604,7 @@
             nm.targetX = smokeCentroid.x;
             nm.targetZ = smokeCentroid.z;
           }
-          // Priority 4: Attack outdoor NPCs
+          // Priority 3: Attack outdoor NPCs
           else {
             let nearNpc = -1, nearNpcD2 = 40 * 40;
             for (let ni = 0; ni < npcs.length; ni++) {
@@ -6756,7 +5617,7 @@
               nm.targetX = npcs[nearNpc].x;
               nm.targetZ = npcs[nearNpc].z;
             }
-            // Priority 5: Attack outdoor squirrels (not in canopy)
+            // Priority 4: Attack outdoor squirrels (not in canopy)
             else {
               let nearSq = -1, nearSqD2 = 30 * 30;
               for (let si = 0; si < squirrels.length; si++) {
@@ -6769,7 +5630,7 @@
                 nm.targetX = squirrels[nearSq].x;
                 nm.targetZ = squirrels[nearSq].z;
               }
-              // Priority 6: Wander
+              // Priority 5: Wander
               else {
                 nm.wanderTimer -= dt;
                 if (nm.wanderTimer <= 0 || nm.state !== 'wander') {
@@ -6812,6 +5673,9 @@
           if (nm.state === 'attack_player' && distToPlayer < NM_ATTACK_RANGE) {
             ashenDrain = Math.min(0.9, ashenDrain + ASHEN_DRAIN_PER_HIT);
             nm.attackCooldown = NM_ATTACK_COOLDOWN;
+            // Flash player light red briefly
+            playerNightLight.color.setHex(0xff2222);
+            setTimeout(() => playerNightLight.color.setHex(0x6688cc), 200);
           }
           // Kill outdoor NPC on contact
           if (nm.state === 'attack_npc') {
@@ -6823,24 +5687,6 @@
                 npcs[ni].state = NPC_GOING_HOME;
                 nm.attackCooldown = NM_ATTACK_COOLDOWN;
                 break;
-              }
-            }
-          }
-          // Destroy home power on contact + contaminate
-          if (nm.state === 'attack_home' && nm.homeTargetIdx >= 0) {
-            const ba = buildingAttractors[nm.homeTargetIdx];
-            if (ba && !ba.destroyed) {
-              const hd = Math.sqrt((ba.x - nm.x) ** 2 + (ba.z - nm.z) ** 2);
-              if (hd < NM_HOME_ATTACK_RANGE) {
-                ba.charge = 0;
-                ba.glowIntensity = 0;
-                for (let mi = 0; mi < ba.windowMats.length; mi++) {
-                  ba.windowMats[mi].color.setScalar(0);
-                  ba.windowMats[mi].emissive && ba.windowMats[mi].emissive.setScalar(0);
-                }
-                if (!ba.contaminated) contaminateBuilding(ba);
-                nm.attackCooldown = NM_ATTACK_COOLDOWN;
-                nm.homeTargetIdx = -1;
               }
             }
           }
@@ -6915,13 +5761,12 @@
     //  coordinated breathing. One organism, not separate particles.
     // ─────────────────────────────────────────
     const GHOST_MAX = 125;
-    const GHOST_MIN_SIZE_CORE = 0.45;
-    const GHOST_MAX_SIZE_CORE = 1.3;
-    const GHOST_MIN_SIZE_OUTER = 0.35;
-    const GHOST_MAX_SIZE_OUTER = 0.35;
+    const GHOST_MIN_SIZE_CORE = 0.3;
+    const GHOST_MAX_SIZE_CORE = 1;
+    const GHOST_MIN_SIZE_OUTER = 0.25;
+    const GHOST_MAX_SIZE_OUTER = 0.25;
     const GHOST_CORE_R = 2;        // dense inner core radius
     const GHOST_OUTER_R = 5;       // wispy outer reach
-    const GHOST_BUILDING_DISTANCE_MIN = 4;
     const GHOST_SPRING = 20.0;       // strong spring snap to formation
     const GHOST_DAMP = 0.1;         // velocity damping (lower = more viscous)
     const GHOST_CURL_STR = 2.5;      // curl-noise swirl intensity
@@ -6942,8 +5787,8 @@
     const GHOST_LIGHT_COUNT = 1;
 
     // Moon jump
-    const MOON_GRAVITY = 7;
-    const JUMP_VELOCITY = 50.0;
+    const MOON_GRAVITY = 2.5;
+    const JUMP_VELOCITY = 10.0;
     let playerYVel = 0;
     let playerAirborne = false;
     let _jumpLaunchFrame = false;
@@ -6968,9 +5813,9 @@
 
     const _ghostGeo = new THREE.IcosahedronGeometry(0.1, 1);
     const _ghostMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      emissive: 0x222222,
-      emissiveIntensity: 1.0,
+      color: 0x8844ff,
+      emissive: 0x8844ff,
+      emissiveIntensity: 3.0,
       flatShading: true,
       transparent: true,
       opacity: 0.9,
@@ -6986,14 +5831,13 @@
     ghostCloud.castShadow = false;
     scene.add(ghostCloud);
 
-    // Ghost cloud point lights — deep blues and purples
-    const GHOST_LIGHT_HUES = [0.72, 0.62, 0.82];
+    // Ghost cloud point lights
     const ghostLights = [];
     for (let i = 0; i < GHOST_LIGHT_COUNT; i++) {
-      const gl = new THREE.PointLight(0x8844ff, 0, 200, 0.5);
+      const gl = new THREE.PointLight(0x8844ff, 0, 20, 2);
       gl.visible = false;
       scene.add(gl);
-      ghostLights.push({ light: gl, blobIdx: -1, baseHue: GHOST_LIGHT_HUES[i] });
+      ghostLights.push({ light: gl, blobIdx: -1, hue: 0 });
     }
 
     // Dummy matrix for instanced mesh updates
@@ -7034,9 +5878,8 @@
       _gbz[i] = pz + Math.sin(ang) * r;
       _gbvx[i] = 0; _gbvy[i] = 0; _gbvz[i] = 0;
       _gbac[i] = 1;
-      // Match smoke trail hue distribution: 88% blue-violet-magenta, 12% green-teal
-      const _h = Math.random();
-      _gbhue[i] = _h < 0.88 ? 0.58 + _h * 0.34 : 0.28 + (_h - 0.88) * 1.5;
+      const h = Math.random();
+      _gbhue[i] = h < 0.88 ? 0.58 + h * 0.34 : 0.28 + (h - 0.88) * 1.5;
       _gbsz[i] = layer === 0
         ? (GHOST_MIN_SIZE_CORE + Math.random() * GHOST_MAX_SIZE_CORE)
         : (GHOST_MIN_SIZE_OUTER + Math.random() * GHOST_MAX_SIZE_OUTER);
@@ -7164,11 +6007,12 @@
         if ((ba.x - px) ** 2 + (ba.z - pz) ** 2 < (GHOST_OUTER_R + GHOST_OBS_RANGE + ba.r + 5) ** 2)
           _nearBldg.push(ba);
       }
-      const _nearTrunks = [];
-      for (let ti = 0; ti < trunkColliders.length; ti++) {
-        const tc = trunkColliders[ti];
-        if ((tc.x - px) ** 2 + (tc.z - pz) ** 2 < (GHOST_OUTER_R + 6) ** 2)
-          _nearTrunks.push(tc);
+      const _nearTrees = [];
+      for (let ti = 0; ti < treePositions.length; ti++) {
+        if (windTrees[ti] && windTrees[ti].chopped) continue;
+        const tp = treePositions[ti];
+        if ((tp.x - px) ** 2 + (tp.z - pz) ** 2 < (GHOST_OUTER_R + 6) ** 2)
+          _nearTrees.push(tp);
       }
 
       // ── Update each blob ──
@@ -7216,17 +6060,16 @@
             if (_gby[i] < ba.y + 3) fy += push * 0.6;
           }
         }
-        for (let ti = 0; ti < _nearTrunks.length; ti++) {
-          const tc = _nearTrunks[ti];
-          const odx = _gbx[i] - tc.x, odz = _gbz[i] - tc.z;
+        for (let ti = 0; ti < _nearTrees.length; ti++) {
+          const tp = _nearTrees[ti];
+          const odx = _gbx[i] - tp.x, odz = _gbz[i] - tp.z;
           const od2 = odx * odx + odz * odz;
-          const avoidR = tc.r + 3.0; // soft avoidance starts well outside trunk
-          if (od2 < avoidR * avoidR && od2 > 0.01) {
+          if (od2 < 6.25 && od2 > 0.01) {
             const od = Math.sqrt(od2);
-            const pen = 1.0 - od / avoidR;
-            const push = GHOST_OBS_PUSH * pen * pen * 3.0;
-            fx += (odx / od) * push + (-odz / od) * push * 0.6;
-            fz += (odz / od) * push + (odx / od) * push * 0.6;
+            const pen = 1.0 - od / 2.5;
+            const push = GHOST_OBS_PUSH * 0.4 * pen;
+            fx += (odx / od) * push + (-odz / od) * push * 0.5;
+            fz += (odz / od) * push + (odx / od) * push * 0.5;
           }
         }
 
@@ -7238,26 +6081,6 @@
         _gbx[i] += _gbvx[i] * dt;
         _gby[i] += _gbvy[i] * dt;
         _gbz[i] += _gbvz[i] * dt;
-
-        // Hard trunk clamp — ghost orbs cannot penetrate tree trunks
-        for (let ti = 0; ti < _nearTrunks.length; ti++) {
-          const tc = _nearTrunks[ti];
-          const cdx = _gbx[i] - tc.x, cdz = _gbz[i] - tc.z;
-          const cd2 = cdx * cdx + cdz * cdz;
-          const minR = tc.r + 0.3; // hard boundary just outside trunk surface
-          if (cd2 < minR * minR && cd2 > 0.0001) {
-            const cd = Math.sqrt(cd2);
-            const nx = cdx / cd, nz = cdz / cd;
-            _gbx[i] = tc.x + nx * minR;
-            _gbz[i] = tc.z + nz * minR;
-            // Deflect velocity: kill inward component, keep tangential
-            const vDot = _gbvx[i] * nx + _gbvz[i] * nz;
-            if (vDot < 0) {
-              _gbvx[i] -= vDot * nx;
-              _gbvz[i] -= vDot * nz;
-            }
-          }
-        }
 
         // Ground check: use player ground Y (blobs are close to player)
         if (_gby[i] < playerGndY + 0.2) { _gby[i] = playerGndY + 0.2; _gbvy[i] = Math.max(0, _gbvy[i]); }
@@ -7272,8 +6095,8 @@
 
         // Color: reuse inline HSV calc (no object allocation)
         const hue = ((_gbhue[i] + _baseHueShift + Math.sin(t * 0.6 + _gbphase[i]) * 0.02) % 1 + 1) % 1;
-        const sat = 1.0; // fully saturated — vivid colors
-        const c = sat, x = c * (1 - Math.abs((hue * 6) % 2 - 1)), m = 0;
+        const sat = _gblayer[i] === 0 ? 0.95 : 0.75;
+        const c = sat, x = c * (1 - Math.abs((hue * 6) % 2 - 1)), m = 1 - c;
         const h6 = hue * 6;
         let cr, cg, cb;
         if (h6 < 1) { cr = c; cg = x; cb = 0; }
@@ -7290,52 +6113,8 @@
       ghostCloud.count = GHOST_MAX;
       ghostCloud.instanceMatrix.needsUpdate = true;
       ghostCloud.instanceColor.needsUpdate = true;
-      _ghostMat.emissiveIntensity = 0.3 + gp * 0.4;
+      _ghostMat.emissiveIntensity = 2.5 + gp * 2.0;
       _ghostMat.opacity = 0.85 + ghostFade * 0.1;
-
-      // ── Moon jump ──
-      if (ghostActive && keys[' '] && !playerAirborne) {
-        playerAirborne = true;
-        _jumpLaunchFrame = true;
-        playerYVel = JUMP_VELOCITY;
-        // Launch carries current horizontal velocity — no reset
-      }
-      if (playerAirborne) {
-        playerYVel -= MOON_GRAVITY * dt;
-
-        // Space while already airborne = dive downward (skip launch frame)
-        if (keys[' '] && !_jumpLaunchFrame) {
-          playerYVel -= 120.0 * dt;
-        }
-        _jumpLaunchFrame = false;
-
-        // Wind drives airborne velocity — ghost power determines wind resistance
-        const airGndY = getTerrainY(playerGroup.position.x, playerGroup.position.z);
-        const airHag = Math.max(0, playerGroup.position.y - airGndY);
-        const gp = getGhostPower();
-        // Wind ramps gently with altitude, capped modestly
-        const airWindScale = Math.min(airHag / 10.0, 1.5);
-        const airWind = getWindDebug(playerGroup.position.x, playerGroup.position.y,
-                                       playerGroup.position.z, windTime);
-        // Target velocity = wind vector scaled down (was way too strong)
-        const windTargetX = airWind.dx * SMOKE_WIND_SPEED * airWindScale * 0.4;
-        const windTargetZ = airWind.dz * SMOKE_WIND_SPEED * airWindScale * 0.4;
-        // Wind drag: strong ghost (gp=1) resists wind, weak ghost (gp=0.25) carried by it
-        // gp=1.0 → drag 0.3, gp=0.25 → drag 1.2
-        const windDrag = Math.min((1.5 - gp * 1.2) * dt, 0.85);
-        playerVelocity.x += (windTargetX - playerVelocity.x) * windDrag;
-        playerVelocity.z += (windTargetZ - playerVelocity.z) * windDrag;
-        // Vertical wind — gentle
-        playerYVel += airWind.dy * SMOKE_WIND_SPEED * airWindScale * dt * 0.25;
-
-        playerGroup.position.y += playerYVel * dt;
-        const groundY = getExactTerrainY(playerGroup.position.x, playerGroup.position.z);
-        if (playerGroup.position.y <= groundY) {
-          playerGroup.position.y = groundY;
-          playerAirborne = false; playerYVel = 0; smoothedY = groundY;
-        }
-      }
-
 
       // ── Ghost lights: track core blobs ──
       for (let li = 0; li < GHOST_LIGHT_COUNT; li++) {
@@ -7361,591 +6140,60 @@
           gl.light.position.x += (_gbx[bi] - gl.light.position.x) * lr;
           gl.light.position.y += (_gby[bi] - gl.light.position.y) * lr;
           gl.light.position.z += (_gbz[bi] - gl.light.position.z) * lr;
-          // Each light uses its own deep blue/purple hue with gentle drift
-          const h = gl.baseHue + Math.sin(t * 0.7 + li * 1.7) * 0.04;
-          const c = hsvToColor(((h % 1) + 1) % 1, 0.85, 0.6);
+          const h = _gbhue[bi] + Math.sin(t * 1.0 + li * 2.1) * 0.05;
+          const c = hsvToColor(((h % 1) + 1) % 1, 0.8, 1.0);
           gl.light.color.copy(c);
           const blobRatio = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
-
-          if (playerAirborne) {
-            gl.light.intensity = (100 + Math.sin(t * 1.8 + li * 1.5) * 50) * ghostFade * gp * blobRatio;
-            gl.light.distance = 200 + gp * 80;  
-          } else {
-            gl.light.intensity = (100 + Math.sin(t * 1.8 + li * 1.5) * 50) * ghostFade * gp * blobRatio;
-            gl.light.distance = 400 + gp * 80;
-          }
+          gl.light.intensity = (100 + Math.sin(t * 1.8 + li * 1.5) * 40) * ghostFade * gp * blobRatio;
+          gl.light.distance = 18 + gp * 8;
         }
       }
 
-    }
+      // ── Moon jump ──
+      if (ghostActive && keys[' '] && !playerAirborne) {
+        playerAirborne = true;
+        _jumpLaunchFrame = true;
+        playerYVel = JUMP_VELOCITY;
+        // Launch carries current horizontal velocity — no reset
+      }
+      if (playerAirborne) {
+        playerYVel -= MOON_GRAVITY * dt;
 
-    // ─────────────────────────────────────────
-    //  CONTAMINATION VINE SYSTEM
-    // ─────────────────────────────────────────
-    const VINE_COLOR = 0x8a1a1a;
-    const VINE_EMISSIVE = 0x660000;
-    const VINE_COUNT_PER_FACE = 3; // vines per wall face
-    const CLEANSE_RANGE = 6.0; // must be within this distance
-    const SWING_DURATION = 0.3; // seconds per full swing arc
+        // Space while already airborne = dive downward (skip launch frame)
+        if (keys[' '] && !_jumpLaunchFrame) {
+          playerYVel -= 12.0 * dt;
+        }
+        _jumpLaunchFrame = false;
 
-    function contaminateBuilding(ba) {
-      if (ba.contaminated) return;
-      ba.contaminated = true;
-      ba.cleanseProgress = 0;
+        // Wind drives airborne velocity — ghost power determines wind resistance
+        const airGndY = getTerrainY(playerGroup.position.x, playerGroup.position.z);
+        const airHag = Math.max(0, playerGroup.position.y - airGndY);
+        const gp = getGhostPower();
+        // Wind ramps gently with altitude, capped modestly
+        const airWindScale = Math.min(airHag / 10.0, 1.5);
+        const airWind = windForSmoke(playerGroup.position.x, playerGroup.position.z,
+                                     playerGroup.position.y, airGndY, windTime);
+        // Target velocity = wind vector scaled down (was way too strong)
+        const windTargetX = airWind.dx * SMOKE_WIND_SPEED * airWindScale * 0.4;
+        const windTargetZ = airWind.dz * SMOKE_WIND_SPEED * airWindScale * 0.4;
+        // Wind drag: strong ghost (gp=1) resists wind, weak ghost (gp=0.25) carried by it
+        // gp=1.0 → drag 0.3, gp=0.25 → drag 1.2
+        const windDrag = Math.min((1.5 - gp * 1.2) * dt, 0.85);
+        playerVelocity.x += (windTargetX - playerVelocity.x) * windDrag;
+        playerVelocity.z += (windTargetZ - playerVelocity.z) * windDrag;
+        // Vertical wind — gentle
+        playerYVel += airWind.dy * SMOKE_WIND_SPEED * airWindScale * dt * 0.25;
 
-      const vg = new THREE.Group();
-      vg.position.set(ba.x, ba.groundY, ba.z);
-      vg.rotation.y = ba.rotation;
-
-      const { w, h, d } = ba.dims;
-      // Generate vines on each wall face
-      const faces = [
-        { nx: 0, nz: 1, offX: 0, offZ: d / 2 + 0.05, spanW: w, spanH: h },   // +Z
-        { nx: 0, nz: -1, offX: 0, offZ: -d / 2 - 0.05, spanW: w, spanH: h },  // -Z
-        { nx: 1, nz: 0, offX: w / 2 + 0.05, offZ: 0, spanW: d, spanH: h, rotY: Math.PI / 2 }, // +X
-        { nx: -1, nz: 0, offX: -w / 2 - 0.05, offZ: 0, spanW: d, spanH: h, rotY: Math.PI / 2 }, // -X
-      ];
-
-      const vineMeshes = [];
-      for (const face of faces) {
-        for (let vi = 0; vi < VINE_COUNT_PER_FACE; vi++) {
-          // Each vine: a curving tendril from bottom to partway up the wall
-          const vineH = h * (0.3 + Math.random() * 0.6);
-          const segments = 5 + Math.floor(Math.random() * 3);
-          const points = [];
-          const baseX = (Math.random() - 0.5) * face.spanW * 0.8;
-          for (let si = 0; si <= segments; si++) {
-            const t = si / segments;
-            const sx = baseX + Math.sin(t * Math.PI * (1.5 + Math.random())) * 0.4;
-            const sy = t * vineH;
-            const sz = Math.sin(t * Math.PI * 2 * Math.random()) * 0.1;
-            points.push(new THREE.Vector3(sx, sy, sz));
-          }
-          const curve = new THREE.CatmullRomCurve3(points);
-          const tubeGeo = new THREE.TubeGeometry(curve, segments * 2, 0.06 + Math.random() * 0.05, 4, false);
-          const vineMat = new THREE.MeshStandardMaterial({
-            color: VINE_COLOR, emissive: VINE_EMISSIVE,
-            emissiveIntensity: 0.6,
-            flatShading: true, transparent: true, opacity: 0.9,
-            roughness: 0.6,
-          });
-          const vineMesh = new THREE.Mesh(tubeGeo, vineMat);
-          vineMesh.position.set(face.offX, 0, face.offZ);
-          if (face.rotY) vineMesh.rotation.y = face.rotY;
-          vineMesh.userData.phase = Math.random() * Math.PI * 2;
-          vineMesh.userData.vineMat = vineMat;
-          vineMesh.userData.basePoints = points.map(p => p.clone());
-          vineMesh.userData.curve = curve;
-          vineMesh.userData.segments = segments;
-          vg.add(vineMesh);
-          vineMeshes.push(vineMesh);
-
-          // Add small leaf/bulb nodes along vine
-          const bulbCount = 1 + Math.floor(Math.random() * 3);
-          for (let bi = 0; bi < bulbCount; bi++) {
-            const bt = 0.3 + Math.random() * 0.6;
-            const bPos = curve.getPoint(bt);
-            const bulbGeo = new THREE.IcosahedronGeometry(0.1 + Math.random() * 0.08, 0);
-            const bulbMat = new THREE.MeshStandardMaterial({
-              color: 0xbe2f2f, emissive: 0xcc0000,
-              emissiveIntensity: 0.8, flatShading: true,
-              transparent: true, opacity: 0.85,
-            });
-            const bulb = new THREE.Mesh(bulbGeo, bulbMat);
-            bulb.position.copy(bPos).add(new THREE.Vector3(face.offX, 0, face.offZ));
-            if (face.rotY) {
-              const rx = bulb.position.x;
-              const rz = bulb.position.z;
-              bulb.position.x = rz;
-              bulb.position.z = -rx + face.offX;
-              bulb.position.x += face.offX;
-            }
-            bulb.userData.phase = Math.random() * Math.PI * 2;
-            bulb.userData.bulbMat = bulbMat;
-            vg.add(bulb);
-            vineMeshes.push(bulb);
-          }
+        playerGroup.position.y += playerYVel * dt;
+        const groundY = getExactTerrainY(playerGroup.position.x, playerGroup.position.z);
+        if (playerGroup.position.y <= groundY) {
+          playerGroup.position.y = groundY;
+          playerAirborne = false; playerYVel = 0; smoothedY = groundY;
         }
       }
 
-      ba.vineGroup = vg;
-      ba.vineMeshes = vineMeshes;
-      scene.add(vg);
-    }
-
-    function decontaminateBuilding(ba) {
-      if (!ba.contaminated) return;
-      ba.contaminated = false;
-      ba.cleanseProgress = 0;
-      if (ba.vineGroup) {
-        scene.remove(ba.vineGroup);
-        ba.vineGroup.traverse(c => {
-          if (c.geometry) c.geometry.dispose();
-          if (c.material) c.material.dispose();
-        });
-        ba.vineGroup = null;
-        ba.vineMeshes = null;
-      }
-
-      // Reset window tint to yellow
-      for (let mi = 0; mi < ba.windowMats.length; mi++) {
-        const wm = ba.windowMats[mi];
-        const wp = 0.15 + Math.sin(t * 1.2 + mi) * 0.1;
-        wm.color.setRGB(wp, wp * 0.9, 0);
-      }
-    }
-
-    function updateContamination(dt) {
-      const t = performance.now() * 0.001;
-      for (let bi = 0; bi < buildingAttractors.length; bi++) {
-        const ba = buildingAttractors[bi];
-        if (!ba.contaminated || !ba.vineMeshes) continue;
-
-        // Contaminated buildings can't hold charge
-        ba.charge = 0;
-        ba.glowIntensity = 0;
-
-        // Animate vines — pulsating glow + subtle movement
-        for (let vi = 0; vi < ba.vineMeshes.length; vi++) {
-          const vm = ba.vineMeshes[vi];
-          const phase = vm.userData.phase;
-          const pulse = 0.4 + Math.sin(t * 1.5 + phase) * 0.3 + Math.sin(t * 3.7 + phase * 2.1) * 0.15;
-
-          if (vm.userData.vineMat) {
-            vm.userData.vineMat.emissiveIntensity = pulse;
-          }
-          if (vm.userData.bulbMat) {
-            vm.userData.bulbMat.emissiveIntensity = 0.5 + Math.sin(t * 2.0 + phase) * 0.4;
-            const sc = 1.0 + Math.sin(t * 1.8 + phase) * 0.15;
-            vm.scale.setScalar(sc);
-          }
-
-          // Gentle sway for vine tubes
-          if (vm.userData.curve) {
-            vm.rotation.z = Math.sin(t * 0.8 + phase) * 0.04;
-            vm.rotation.x = Math.sin(t * 0.6 + phase * 1.3) * 0.03;
-          }
-        }
-
-        // Red tint on windows
-        for (let mi = 0; mi < ba.windowMats.length; mi++) {
-          const wm = ba.windowMats[mi];
-          const wp = 0.15 + Math.sin(t * 1.2 + mi) * 0.1;
-          wm.color.setRGB(wp, wp * 0.05, 0);
-        }
-      }
-    }
-
-    // ─────────────────────────────────────────
-    //  PLAYER ATTACK — daytime sword cleanse
-    // ─────────────────────────────────────────
-    let attackTargetIdx = -1;
-    let swingTimer = 0;       // time within current swing
-    let swingLanded = false;  // did this swing already remove a vine?
-
-    function removeOneVine(ba) {
-      if (!ba.vineMeshes || ba.vineMeshes.length === 0) return false;
-      // Remove last vine mesh (tube or bulb)
-      let vm = ba.vineMeshes.pop();
-      if (vm.parent) vm.parent.remove(vm);
-      if (vm.geometry) vm.geometry.dispose();
-      if (vm.material) vm.material.dispose();
-      vm = ba.vineMeshes.pop();
-      if (vm.parent) vm.parent.remove(vm);
-      if (vm.geometry) vm.geometry.dispose();
-      if (vm.material) vm.material.dispose();
-      // If no vines left, fully decontaminate
-      if (ba.vineMeshes.length === 0) {
-        decontaminateBuilding(ba);
-        return true; // building cleansed
-      }
-      return false;
-    }
-
-    function updatePlayerAttack(dt) {
-      const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
-      swordGroup.visible = isDay && !ghostActive;
-
-      if (!isDay || ghostActive) {
-        isAttacking = false;
-        swingTimer = 0;
-        attackTargetIdx = -1;
-        swingLanded = false;
-        swordSwingPhase = Math.max(0, swordSwingPhase - dt * 4);
-        swordGroup.rotation.z = 0.2;
-        swordGroup.rotation.x = 0;
-        return;
-      }
-
-      const px = playerGroup.position.x;
-      const pz = playerGroup.position.z;
-
-      if (mouseDown) {
-        // Find nearest contaminated building
-        let bestIdx = -1, bestD2 = CLEANSE_RANGE * CLEANSE_RANGE;
-        for (let bi = 0; bi < buildingAttractors.length; bi++) {
-          const ba = buildingAttractors[bi];
-          if (!ba.contaminated || ba.destroyed) continue;
-          const dd2 = (ba.x - px) ** 2 + (ba.z - pz) ** 2;
-          if (dd2 < bestD2) { bestD2 = dd2; bestIdx = bi; }
-        }
-
-        if (bestIdx >= 0) {
-          if (attackTargetIdx !== bestIdx) {
-            attackTargetIdx = bestIdx;
-            swingTimer = 0;
-            swingLanded = false;
-          }
-          isAttacking = true;
-
-          // Advance swing timer
-          swingTimer += dt;
-
-          // Swing arc: wind up → strike → follow through, repeating
-          const swingT = (swingTimer % SWING_DURATION) / SWING_DURATION; // 0→1 per swing
-          const windUp = Math.min(swingT * 3, 1.0);
-          const strike = Math.max(0, Math.min((swingT - 0.33) * 3, 1.0));
-          swordGroup.rotation.z = -0.3 - windUp * 1.2 + strike * 2.0;
-          swordGroup.rotation.x = -0.3 - windUp * 0.6 + strike * 0.9;
-
-          // Face the building
-          const ba = buildingAttractors[bestIdx];
-          const toX = ba.x - px, toZ = ba.z - pz;
-          const targetAngle = Math.atan2(toX, toZ);
-          let angleDiff = targetAngle - playerFacingAngle;
-          while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
-          while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
-          playerFacingAngle += angleDiff * Math.min(1, 6 * dt);
-          playerGroup.rotation.y = playerFacingAngle;
-
-          // Strike lands at midpoint of each swing — remove one vine
-          if (swingT > 0.5 && !swingLanded) {
-            swingLanded = true;
-            const cleansed = removeOneVine(ba);
-            if (cleansed) {
-              attackTargetIdx = -1;
-              isAttacking = false;
-              swingTimer = 0;
-            }
-          }
-          // Reset for next swing cycle
-          if (swingT < 0.1) {
-            swingLanded = false;
-          }
-        } else {
-          // Swinging at nothing
-          isAttacking = false;
-          attackTargetIdx = -1;
-          swingTimer = 0;
-          swordSwingPhase += dt * 6;
-          swordGroup.rotation.z = -0.3 + Math.sin(swordSwingPhase) * 0.5;
-          swordGroup.rotation.x = Math.sin(swordSwingPhase * 0.7) * 0.3;
-        }
-      } else {
-        // Release — reset
-        isAttacking = false;
-        attackTargetIdx = -1;
-        swingTimer = 0;
-        swingLanded = false;
-        // Return sword to rest
-        swordSwingPhase *= 0.9;
-        swordGroup.rotation.z = 0.2 + Math.sin(swordSwingPhase) * 0.05;
-        swordGroup.rotation.x = 0;
-      }
-    }
-
-    // ─────────────────────────────────────────
-    //  TURRET SYSTEM — player-placed defenses built by NPCs
-    // ─────────────────────────────────────────
-
-    function createTurretMesh() {
-      const g = new THREE.Group();
-      // Stone pedestal — octagonal pillar
-      const baseGeo = new THREE.CylinderGeometry(1.2, 1.5, 3.0, 8);
-      const baseMat = new THREE.MeshStandardMaterial({
-        color: 0x8a8a7a, flatShading: true, roughness: 0.85
-      });
-      const base = new THREE.Mesh(baseGeo, baseMat);
-      base.position.y = 1.5;
-      base.castShadow = true;
-      g.add(base);
-      // Crenellation ring
-      for (let i = 0; i < 8; i++) {
-        const ang = (i / 8) * Math.PI * 2;
-        const cGeo = new THREE.BoxGeometry(0.4, 0.6, 0.4);
-        const cMat = new THREE.MeshStandardMaterial({ color: 0x7a7a6a, flatShading: true });
-        const cren = new THREE.Mesh(cGeo, cMat);
-        cren.position.set(Math.cos(ang) * 1.1, 3.3, Math.sin(ang) * 1.1);
-        cren.castShadow = true;
-        g.add(cren);
-      }
-      // Crystal — the glowing weapon core
-      const crystalGeo = new THREE.OctahedronGeometry(0.5, 0);
-      const crystalMat = new THREE.MeshStandardMaterial({
-        color: 0x44ddff, emissive: 0x22aacc, emissiveIntensity: 1.0,
-        flatShading: true, transparent: true, opacity: 0.9
-      });
-      const crystal = new THREE.Mesh(crystalGeo, crystalMat);
-      crystal.position.y = 3.8;
-      crystal.castShadow = false;
-      g.add(crystal);
-      // Inner glow sphere
-      const glowGeo = new THREE.SphereGeometry(0.3, 6, 6);
-      const glowMat = new THREE.MeshStandardMaterial({
-        color: 0xffffff, emissive: 0x88eeff, emissiveIntensity: 2.0,
-        transparent: true, opacity: 0.4
-      });
-      const glow = new THREE.Mesh(glowGeo, glowMat);
-      glow.position.y = 3.8;
-      g.add(glow);
-      g.userData = { crystalMat, glowMat, crystal, glow };
-      return g;
-    }
-
-    function createTurretSiteMarker(x, y, z) {
-      const g = new THREE.Group();
-      // Semi-transparent ghost of the turret base
-      const baseGeo = new THREE.CylinderGeometry(1.2, 1.5, 3.0, 8);
-      const baseMat = new THREE.MeshStandardMaterial({
-        color: 0xaaaaff, flatShading: true, transparent: true, opacity: 0.3,
-        emissive: 0x4444aa, emissiveIntensity: 0.5
-      });
-      const base = new THREE.Mesh(baseGeo, baseMat);
-      base.position.y = 1.5;
-      g.add(base);
-      // Floating ring indicator
-      const ringGeo = new THREE.TorusGeometry(1.8, 0.08, 6, 16);
-      const ringMat = new THREE.MeshStandardMaterial({
-        color: 0x66aaff, emissive: 0x4488ff, emissiveIntensity: 1.5,
-        transparent: true, opacity: 0.6
-      });
-      const ring = new THREE.Mesh(ringGeo, ringMat);
-      ring.rotation.x = Math.PI / 2;
-      ring.position.y = 0.2;
-      g.add(ring);
-      g.position.set(x, y, z);
-      g.userData = { baseMat, ringMat };
-      scene.add(g);
-      return g;
-    }
-
-    // Turret placement — player presses F during day
-    function placeTurretSite() {
-      const isDay = timeOfDay > 0.28 && timeOfDay < 0.65;
-      if (!isDay || ghostActive) return;
-      // Place in front of player
-      const fwd = new THREE.Vector3();
-      camera.getWorldDirection(fwd);
-      fwd.y = 0; fwd.normalize();
-      const px = playerGroup.position.x + fwd.x * 5;
-      const pz = playerGroup.position.z + fwd.z * 5;
-      const py = getTerrainY(px, pz);
-      if (py < 2.0 || py > 14) return;
-
-      // Check not too close to existing turrets/sites/buildings
-      const MIN_GAP = 8;
-      for (const t of turrets) {
-        if ((t.x - px) ** 2 + (t.z - pz) ** 2 < MIN_GAP * MIN_GAP) return;
-      }
-      for (const s of turretSites) {
-        if ((s.x - px) ** 2 + (s.z - pz) ** 2 < MIN_GAP * MIN_GAP) return;
-      }
-      for (const ba of buildingAttractors) {
-        if ((ba.x - px) ** 2 + (ba.z - pz) ** 2 < 6 * 6) return;
-      }
-      for (const f of farms) {
-        if ((f.x - px) ** 2 + (f.z - pz) ** 2 < 10 * 10) return;
-      }
-      // Check NPC building sites in progress
-      for (const npc of npcs) {
-        if (!npc.buildMesh) continue;
-        if ((npc.buildMesh.position.x - px) ** 2 + (npc.buildMesh.position.z - pz) ** 2 < 8 * 8) return;
-      }
-
-      const marker = createTurretSiteMarker(px, py, pz);
-      turretSites.push({
-        x: px, z: pz, y: py,
-        mesh: marker,
-        rocksDelivered: 0,
-        buildProgress: 0,
-        builderIdx: -1,
-        buildMesh: null,
-      });
-    }
-
-    // Zap beam pool
-    const _zapBeams = [];
-    const _zapPool = [];
-    const ZAP_COLORS = [
-      0xff4488, 0x44ffaa, 0xffaa22, 0x44aaff, 0xaa44ff, 0xff6644, 0x22ffcc
-    ];
-
-    function getZapBeam() {
-      if (_zapPool.length > 0) return _zapPool.pop();
-      const pts = [new THREE.Vector3(), new THREE.Vector3()];
-      const geo = new THREE.BufferGeometry().setFromPoints(pts);
-      const mat = new THREE.LineBasicMaterial({
-        color: 0xffffff, linewidth: 2, transparent: true, opacity: 1.0
-      });
-      const line = new THREE.Line(geo, mat);
-      line.frustumCulled = false;
-      scene.add(line);
-      return { line, geo, mat };
-    }
-
-    function releaseZapBeam(zap) {
-      zap.line.visible = false;
-      _zapPool.push(zap);
-    }
-
-    function fireZapBeam(fromX, fromY, fromZ, toX, toY, toZ, color) {
-      const zap = getZapBeam();
-      const segments = 6;
-      const points = [];
-      for (let i = 0; i <= segments; i++) {
-        const t = i / segments;
-        const bx = fromX + (toX - fromX) * t;
-        const by = fromY + (toY - fromY) * t;
-        const bz = fromZ + (toZ - fromZ) * t;
-        if (i > 0 && i < segments) {
-          const jitter = 0.8;
-          points.push(new THREE.Vector3(
-            bx + (Math.random() - 0.5) * jitter,
-            by + (Math.random() - 0.5) * jitter,
-            bz + (Math.random() - 0.5) * jitter
-          ));
-        } else {
-          points.push(new THREE.Vector3(bx, by, bz));
-        }
-      }
-      zap.geo.dispose();
-      zap.geo = new THREE.BufferGeometry().setFromPoints(points);
-      zap.line.geometry = zap.geo;
-      zap.mat.color.setHex(color);
-      zap.mat.opacity = 1.0;
-      zap.line.visible = true;
-      _zapBeams.push({ beam: zap, timer: TURRET_ZAP_DURATION });
-    }
-
-    function completeTurretBuild(siteIdx) {
-      const site = turretSites[siteIdx];
-      if (site.mesh) {
-        scene.remove(site.mesh);
-        site.mesh.traverse(c => { if (c.geometry) c.geometry.dispose(); if (c.material) c.material.dispose(); });
-      }
-      if (site.buildMesh) {
-        scene.remove(site.buildMesh);
-        if (site.buildMesh.geometry) site.buildMesh.geometry.dispose();
-        if (site.buildMesh.material) site.buildMesh.material.dispose();
-      }
-      const mesh = createTurretMesh();
-      mesh.position.set(site.x, site.y, site.z);
-      scene.add(mesh);
-      turrets.push({
-        mesh,
-        x: site.x, y: site.y, z: site.z,
-        charge: TURRET_CHARGE_MAX,
-        zapCooldown: 0,
-        targetIdx: -1,
-        crystalPhase: Math.random() * Math.PI * 2,
-      });
-      turretSites.splice(siteIdx, 1);
-    }
-
-    function updateTurrets(dt) {
-      const t = performance.now() * 0.001;
-      const isNight = timeOfDay > 0.80 || timeOfDay < 0.25;
-      const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
-
-      // ── Animate turret site markers ──
-      for (let i = turretSites.length - 1; i >= 0; i--) {
-        const site = turretSites[i];
-        if (!site.mesh) continue;
-        const pulse = 0.4 + Math.sin(t * 2.0 + i) * 0.2;
-        site.mesh.userData.ringMat.opacity = pulse;
-        site.mesh.userData.baseMat.opacity = 0.2 + Math.sin(t * 1.5 + i) * 0.1;
-        site.mesh.children[1].rotation.z = t * 0.5;
-      }
-
-      // ── Update zap beams ──
-      for (let i = _zapBeams.length - 1; i >= 0; i--) {
-        const zb = _zapBeams[i];
-        zb.timer -= dt;
-        zb.beam.mat.opacity = Math.max(0, zb.timer / TURRET_ZAP_DURATION);
-        if (zb.timer <= 0) {
-          releaseZapBeam(zb.beam);
-          _zapBeams.splice(i, 1);
-        }
-      }
-
-      // ── Update active turrets ──
-      for (let ti = 0; ti < turrets.length; ti++) {
-        const tur = turrets[ti];
-        tur.zapCooldown = Math.max(0, tur.zapCooldown - dt);
-
-        // Crystal animation
-        tur.crystalPhase += dt * (1.5 + tur.charge * 2.0);
-        const crys = tur.mesh.userData.crystal;
-        const glow = tur.mesh.userData.glow;
-        crys.rotation.y = tur.crystalPhase;
-        crys.rotation.x = Math.sin(tur.crystalPhase * 0.7) * 0.3;
-
-        const chargeFrac = tur.charge / TURRET_CHARGE_MAX;
-        const hue = (t * 0.1 + ti * 0.3) % 1.0;
-        const crystalColor = new THREE.Color().setHSL(hue, 0.8, 0.5 + chargeFrac * 0.3);
-        const emissiveColor = new THREE.Color().setHSL(hue, 0.9, 0.3 + chargeFrac * 0.4);
-        tur.mesh.userData.crystalMat.color.copy(crystalColor);
-        tur.mesh.userData.crystalMat.emissive.copy(emissiveColor);
-        tur.mesh.userData.crystalMat.emissiveIntensity = 0.3 + chargeFrac * 1.5;
-        tur.mesh.userData.glowMat.emissiveIntensity = chargeFrac * 2.5;
-        tur.mesh.userData.glowMat.opacity = 0.1 + chargeFrac * 0.5;
-        const sc = 1.0 + Math.sin(tur.crystalPhase * 2) * 0.1 * chargeFrac;
-        glow.scale.setScalar(sc);
-
-        if (chargeFrac < 0.1) {
-          tur.mesh.userData.crystalMat.emissiveIntensity = 0.1;
-          tur.mesh.userData.glowMat.opacity = 0.05;
-        }
-
-        // ── Ghost recharge ──
-        if (ghostActive && tur.charge < TURRET_CHARGE_MAX) {
-          const gpx = playerGroup.position.x, gpz = playerGroup.position.z;
-          const d2 = (tur.x - gpx) ** 2 + (tur.z - gpz) ** 2;
-          if (d2 < TURRET_GHOST_RECHARGE_RANGE * TURRET_GHOST_RECHARGE_RANGE) {
-            const proximity = 1.0 - Math.sqrt(d2) / TURRET_GHOST_RECHARGE_RANGE;
-            tur.charge = Math.min(TURRET_CHARGE_MAX,
-              tur.charge + TURRET_GHOST_RECHARGE_RATE * proximity * dt);
-          }
-        }
-
-        // ── Slow passive day recharge ──
-        if (isDay && tur.charge < TURRET_CHARGE_MAX) {
-          tur.charge = Math.min(TURRET_CHARGE_MAX, tur.charge + 0.02 * dt);
-        }
-
-        // ── Night combat — zap wraiths ──
-        if (isNight && tur.charge > TURRET_CHARGE_PER_ZAP && tur.zapCooldown <= 0) {
-          let bestIdx = -1, bestD2 = TURRET_RANGE * TURRET_RANGE;
-          for (let ni = 0; ni < nightMobs.length; ni++) {
-            const nm = nightMobs[ni];
-            if (nm.state === 'dying') continue;
-            const d2 = (nm.x - tur.x) ** 2 + (nm.z - tur.z) ** 2;
-            if (d2 < bestD2) { bestD2 = d2; bestIdx = ni; }
-          }
-          if (bestIdx >= 0) {
-            const nm = nightMobs[bestIdx];
-            const zapColor = ZAP_COLORS[Math.floor(Math.random() * ZAP_COLORS.length)];
-            const fromY = tur.y + 3.8;
-            const toY = getTerrainY(nm.x, nm.z) + 2.0;
-            fireZapBeam(tur.x, fromY, tur.z, nm.x, toY, nm.z, zapColor);
-            nm.hp -= TURRET_ZAP_DAMAGE;
-            nm.mesh.userData.headMat.emissiveIntensity = 3.0;
-            if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; }
-            tur.charge -= TURRET_CHARGE_PER_ZAP;
-            tur.zapCooldown = TURRET_ZAP_COOLDOWN;
-          }
-        }
-      }
+      const blobFrac = ghostMaxBlobs > 0 ? ghostBlobCount / ghostMaxBlobs : 0;
+      playerNightLight.intensity = ghostFade * gp * blobFrac * 300;
     }
 
     // ─────────────────────────────────────────
@@ -7990,18 +6238,13 @@
 
       // NPCs + Mobs
       updateNPCs(dt);
-      updateNPCsHomes(dt);
       updateSquirrels(dt);
       updateGrowingTrees(dt);
       updateNightMobs(dt);
 
-      // Building lights (deferred) + Smoke + Contamination
-      updateBuildingLights(dt);
+      // Smoke
       updateSmoke(dt);
       updateChimneySmoke(dt);
-      updateContamination(dt);
-      updatePlayerAttack(dt);
-      updateTurrets(dt);
 
       // Ghost cloud + player mesh visibility
       updateGhostCloud(dt);
@@ -8011,7 +6254,7 @@
       updateCamera();
       drawAxisHud();
 
-      deferredLightsRender();
+      renderer.render(scene, camera);
     }
 
     // ─────────────────────────────────────────
@@ -8021,16 +6264,6 @@
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
-      _deferredColorTarget.setSize(window.innerWidth, window.innerHeight);
-      _lightAccumMat.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
-    });
-
-    // Start
-    animate();
-  </script>
-</body>
-</html>
-tion.value.set(window.innerWidth, window.innerHeight);
     });
 
     // Start
