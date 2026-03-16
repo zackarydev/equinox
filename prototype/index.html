@@ -1360,14 +1360,15 @@
           // -Z face
           windFaces.push({ cx: wcx + (bd/2)*sinR, cz: wcz - (bd/2)*cosR, nx: sinR,  nz: -cosR, halfExtent: bw/2, height: bh, groundY: wy });
         }
-        // Register collision box for player collision (daytime)
-        collisionBoxes.push({ 
-          cx: center.x + bx, 
-          cz: center.y + bz, 
-          hw: dims.w / 2 + 0.3, 
-          hd: dims.d / 2 + 0.3, 
-          cosR: Math.cos(rot), 
-          sinR: Math.sin(rot) 
+        // Register collision box for player collision
+        collisionBoxes.push({
+          cx: center.x + bx,
+          cz: center.y + bz,
+          hw: dims.w / 2 + 0.3,
+          hd: dims.d / 2 + 0.3,
+          cosR: Math.cos(rot),
+          sinR: Math.sin(rot),
+          roofY: wy + dims.h + dims.h * 0.5 * 0.4
         });
       }
       // Perimeter wall fragments
@@ -1395,7 +1396,7 @@
         }
         // Register wall collision box (wallRot = angle + PI/2; wall geometry is length x 0.8)
         { const wallRot = angle + Math.PI / 2;
-          collisionBoxes.push({ cx: center.x + wx, cz: center.y + wz, hw: wallLen / 2 + 0.3, hd: 0.4 + 0.3, cosR: Math.cos(wallRot), sinR: Math.sin(wallRot) });
+          collisionBoxes.push({ cx: center.x + wx, cz: center.y + wz, hw: wallLen / 2 + 0.3, hd: 0.4 + 0.3, cosR: Math.cos(wallRot), sinR: Math.sin(wallRot), roofY: wallGY + 3.0 });
         }
       }
       settlementGroup.position.set(center.x, 0, center.y);
@@ -2695,6 +2696,8 @@
       const _nightPad = ghostActive ? GHOST_BUILDING_DISTANCE_MIN : 0;
       for (let i = 0, len = collisionBoxes.length; i < len; i++) {
         const b = collisionBoxes[i];
+        // Ghost can jump over buildings — skip collision if above roof
+        if (ghostActive && b.roofY && playerGroup.position.y > b.roofY) continue;
         // Transform player into box local space (inverse rotation = transpose)
         const dx = playerGroup.position.x - b.cx;
         const dz = playerGroup.position.z - b.cz;
@@ -3651,7 +3654,7 @@
     // ─────────────────────────────────────────
     //  SMOKE TRAILS — static glowing dots left behind moving smoke
     // ─────────────────────────────────────────
-    const TRAIL_MAX = 4000;
+    const TRAIL_MAX = 3000;
     const _tPos  = new Float32Array(TRAIL_MAX * 3);
     const _tSz   = new Float32Array(TRAIL_MAX);
     const _tAlph = new Float32Array(TRAIL_MAX);
@@ -3766,6 +3769,11 @@
 
     let _smokeHead = 0; // ring-buffer write index
 
+    const TRAIL_AIRBORN_SIZE = 6;
+    const TRAIL_AIRBORN_VARIETY = 2;
+    const TRAIL_GROUNDED_SIZE = 1.3;
+    const TRAIL_GROUNDED_VARIETY = 0.55;
+
     function spawnSmoke() {
       const i = _smokeHead;
       _smokeHead = (_smokeHead + 1) % SMOKE_MAX;
@@ -3789,8 +3797,10 @@
       const ashenPower = getEffectiveAshenPower();
 
       _sli[i] = 0;
-      _sml[i] = 3.0 * ashenPower + Math.random() * 9.0; // 3–12 second lifetime
-      _ssi[i] = 0.8 + Math.random() * 0.55; // size variety
+      _sml[i] = 6.0 * ashenPower + Math.random() * 12.0; // ~6–18 second lifetime, dependent on power
+      _ssi[i] = playerAirborne // particle sizes
+        ? (TRAIL_AIRBORN_SIZE * ashenPower + Math.random() * TRAIL_AIRBORN_VARIETY)
+        : (TRAIL_GROUNDED_SIZE * ashenPower + Math.random() * TRAIL_GROUNDED_VARIETY);
       _sac[i] = 1;
     }
 
@@ -5346,7 +5356,8 @@
               collisionBoxes.push({
                 cx: npc.siteX, cz: npc.siteZ,
                 hw: bw / 2 + 0.3, hd: bd / 2 + 0.3,
-                cosR: cR, sinR: sR
+                cosR: cR, sinR: sR,
+                roofY: bgy + bh + bh * 0.5 * 0.4
               });
               // Spawn new NPC at the new home
               spawnNPC(npc.siteX, npc.siteZ, npc.palette, npc.kingdomIdx);
@@ -6914,7 +6925,11 @@
     //  Dense core + wispy outer shell, curl-noise swirling, wind-guided,
     //  coordinated breathing. One organism, not separate particles.
     // ─────────────────────────────────────────
-    const GHOST_MAX = 125;
+    const GHOST_MAX = 250;        // absolute max capacity (2x base)
+    const GHOST_BASE = 125;       // base blob count at full ashen power
+    const GHOST_WRAITH_BONUS = 15; // bonus blob capacity per wraith consumed
+    const GHOST_CLEANSE_COST = 0.05;  // 5% of current max to cleanse a building
+    const GHOST_MIN_LIFE_FRAC = 0.05; // can't drop below 5% of max
     const GHOST_MIN_SIZE_CORE = 0.45;
     const GHOST_MAX_SIZE_CORE = 1.3;
     const GHOST_MIN_SIZE_OUTER = 0.35;
@@ -6965,6 +6980,8 @@
     let ghostBlobCount = 0;
     let ghostMaxBlobs = GHOST_MAX;
     let ghostFade = 0;
+    let ghostBonusMax = 0;          // accumulated bonus capacity from consuming wraiths
+    let ghostCleanseCooldown = 0;   // cooldown timer for ghost cleanse
 
     const _ghostGeo = new THREE.IcosahedronGeometry(0.1, 1);
     const _ghostMat = new THREE.MeshStandardMaterial({
@@ -7069,8 +7086,11 @@
       const t = performance.now() * 0.001;
       const gp = getGhostPower();
       const ashen = getEffectiveAshenPower();
-      // Max blobs based on ghost power (moon phase) and fade-in only
-      ghostMaxBlobs = Math.floor(GHOST_MAX * gp * ghostFade);
+      // Base size from moon phase ashen power, plus bonus from consuming wraiths
+      const baseAshen = getCurrentMoonPhase().ashenPower;
+      const baseMax = Math.floor(GHOST_BASE * baseAshen);
+      ghostBonusMax = Math.min(baseMax, ghostBonusMax); // cap bonus at base (2x total)
+      ghostMaxBlobs = Math.min(GHOST_MAX, Math.floor((baseMax + ghostBonusMax) * ghostFade));
 
       // ── Regeneration — ashen drain slows regen rate, doesn't reduce cap ──
       if (ghostBlobCount < ghostMaxBlobs) {
@@ -7116,16 +7136,16 @@
         const nm = nightMobs[ni];
         if (nm.state === 'dying') continue;
         const wd = Math.sqrt((nm.x - px) ** 2 + (nm.z - pz) ** 2);
-        if (wd < GHOST_DRAIN_WRAITH + 3) {
-          let drained = 0;
-          const drainBudget = GHOST_DRAIN_RATE_WRAITH * dt;
-          for (let i = 0; i < GHOST_MAX && drained < drainBudget; i++) {
-            if (!_gbac[i]) continue;
-            if ((_gbx[i] - nm.x) ** 2 + (_gbz[i] - nm.z) ** 2 < GHOST_DRAIN_WRAITH * GHOST_DRAIN_WRAITH) {
-              _gbac[i] = 0; ghostBlobCount--; drained++;
-            }
-          }
-        }
+        // if (wd < GHOST_DRAIN_WRAITH + 3) {
+        //   let drained = 0;
+        //   const drainBudget = GHOST_DRAIN_RATE_WRAITH * dt;
+        //   for (let i = 0; i < GHOST_MAX && drained < drainBudget; i++) {
+        //     if (!_gbac[i]) continue;
+        //     if ((_gbx[i] - nm.x) ** 2 + (_gbz[i] - nm.z) ** 2 < GHOST_DRAIN_WRAITH * GHOST_DRAIN_WRAITH) {
+        //       _gbac[i] = 0; ghostBlobCount--; drained++;
+        //     }
+        //   }
+        // }
         if (wd < GHOST_ATTACK_RANGE) {
           let nearBlobs = 0;
           for (let i = 0; i < GHOST_MAX; i++) {
@@ -7136,11 +7156,39 @@
           if (nearBlobs > 3) {
             nm.hp -= GHOST_ATTACK_DPS * Math.min(nearBlobs / 10, 1.0) * dt;
             nm.mesh.userData.headMat.emissiveIntensity = 3.0;
-            if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; }
+            if (nm.hp <= 0) {
+              nm.state = 'dying'; nm.alpha = 1;
+              // Ghost consumes wraith — grow in size
+              ghostBonusMax += GHOST_WRAITH_BONUS;
+            }
           }
         }
       }
 
+
+      // ── Ghost cleanse — consume blobs to clear contaminated buildings ──
+      ghostCleanseCooldown = Math.max(0, ghostCleanseCooldown - dt);
+      if (mouseDown && ghostCleanseCooldown <= 0) {
+        for (let bi = 0; bi < buildingAttractors.length; bi++) {
+          const ba = buildingAttractors[bi];
+          if (!ba.contaminated || ba.destroyed) continue;
+          const dd2 = (ba.x - px) ** 2 + (ba.z - pz) ** 2;
+          if (dd2 < CLEANSE_RANGE * CLEANSE_RANGE) {
+            const cost = Math.max(1, Math.floor(ghostMaxBlobs * GHOST_CLEANSE_COST));
+            const minBlobs = Math.max(1, Math.floor(ghostMaxBlobs * GHOST_MIN_LIFE_FRAC));
+            if (ghostBlobCount - cost >= minBlobs) {
+              let removed = 0;
+              for (let i = GHOST_MAX - 1; i >= 0 && removed < cost; i--) {
+                if (_gbac[i]) { _gbac[i] = 0; removed++; }
+              }
+              ghostBlobCount -= removed;
+              decontaminateBuilding(ba);
+              ghostCleanseCooldown = 0.5;
+            }
+            break;
+          }
+        }
+      }
       // ── Shared cloud state (computed ONCE, not per blob) ──
       const breath = 1.0 + Math.sin(t * GHOST_BREATH_RATE * Math.PI * 2) * GHOST_BREATH_AMP;
       const playerGndY = getTerrainY(px, pz); // one terrain lookup for all blobs
