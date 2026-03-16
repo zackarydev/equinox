@@ -39,15 +39,60 @@
       pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,0.8);
       display: none; white-space: pre;
     }
+    #title-screen {
+      position: fixed; inset: 0; z-index: 100;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: radial-gradient(ellipse at 50% 40%, #0a0a1e 0%, #000 70%);
+      font-family: monospace; color: #bbc;
+      transition: opacity 0.8s ease-out;
+    }
+    #title-screen.hidden { opacity: 0; pointer-events: none; }
+    #title-screen h1 {
+      font-size: 64px; letter-spacing: 18px; margin: 0;
+      color: #c8b8ff;
+      text-shadow: 0 0 30px rgba(120,80,255,0.5), 0 0 80px rgba(120,80,255,0.2);
+    }
+    #title-screen .subtitle {
+      font-size: 14px; letter-spacing: 4px; margin-top: 12px;
+      color: #667; text-transform: uppercase;
+    }
+    #title-screen .lore {
+      max-width: 480px; text-align: center; margin-top: 40px;
+      font-size: 13px; line-height: 1.8; color: #889;
+    }
+    #title-screen #play-btn {
+      margin-top: 48px; padding: 14px 48px;
+      background: none; border: 1px solid #5544aa;
+      color: #c8b8ff; font-family: monospace; font-size: 16px;
+      letter-spacing: 6px; cursor: pointer;
+      transition: border-color 0.3s, color 0.3s, box-shadow 0.3s;
+    }
+    #title-screen #play-btn:hover {
+      border-color: #8866ff; color: #e0d0ff;
+      box-shadow: 0 0 20px rgba(120,80,255,0.3);
+    }
+    .game-hud { display: none; }
+    .game-hud.visible { display: block; }
   </style>
 </head>
 <body>
-  <div id="info">
+  <div id="title-screen">
+    <h1>ECLIPSED</h1>
+    <div class="subtitle">Phase Pre-0 Prototype</div>
+    <div class="lore">
+      By day you walk among them, tending hearth and home.<br>
+      By night you become something else — a luminous ghost,<br>
+      drifting between worlds, consuming wraiths,<br>
+      and cleansing the corruption that creeps through the village.
+    </div>
+    <button id="play-btn">PLAY</button>
+  </div>
+  <div id="info" class="game-hud">
     WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Hold LMB — attack (cleanse) &nbsp;|&nbsp; F — place turret<br>
     1 / 2 / 3 — Day / Dusk / Night &nbsp;|&nbsp; T — auto cycle &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; G — smoke &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis &nbsp;|&nbsp; B — collision boxes
   </div>
-  <div id="time-indicator"></div>
-  <div id="moon-indicator"><canvas id="moon-hud" width="24" height="24"></canvas><span id="moon-text"></span></div>
+  <div id="time-indicator" class="game-hud"></div>
+  <div id="moon-indicator" class="game-hud"><canvas id="moon-hud" width="24" height="24"></canvas><span id="moon-text"></span></div>
   <canvas id="axis-hud" width="80" height="80"></canvas>
   <div id="axis-info"></div>
 
@@ -66,13 +111,31 @@
     // ─────────────────────────────────────────
     //  NOISE — Simplex 2D (compact implementation)
     // ─────────────────────────────────────────
+    // ─────────────────────────────────────────
+    //  SEEDED RNG — world seed drives all randomization
+    // ─────────────────────────────────────────
+    const WORLD_SEED = Math.floor(Math.random() * 2147483647) || 1;
+    console.log('World seed:', WORLD_SEED);
+
+    // Mulberry32 — fast seeded PRNG returning [0,1)
+    function mulberry32(seed) {
+      let s = seed | 0;
+      return function() {
+        s = (s + 0x6D2B79F5) | 0;
+        let t = Math.imul(s ^ (s >>> 15), 1 | s);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    const seededRng = mulberry32(WORLD_SEED);
+
     const GRAD3 = [[1,1],[- 1,1],[1,-1],[-1,-1],[1,0],[-1,0],[0,1],[0,-1]];
     const PERM = new Uint8Array(512);
     (function buildPerm() {
       const p = [];
       for (let i = 0; i < 256; i++) p[i] = i;
-      // Fisher-Yates with seed
-      let seed = 42;
+      // Fisher-Yates with world seed
+      let seed = WORLD_SEED;
       for (let i = 255; i > 0; i--) {
         seed = (seed * 16807 + 0) % 2147483647;
         const j = seed % (i + 1);
@@ -210,10 +273,26 @@
     const TERRAIN_SEG   = 128;
     const HEIGHT_SCALE  = 20;
 
-    // Kingdom centers
-    const KINGDOM_A_CENTER = new THREE.Vector2(-100, -80);
-    const KINGDOM_B_CENTER = new THREE.Vector2(100, 90);
+    // Kingdom centers — randomized each run, kept apart and away from edges
     const ECLIPSE_POINT    = new THREE.Vector2(0, 0);
+    function randomizeKingdoms() {
+      const minSep = 120; // minimum distance between kingdoms
+      const margin = 60;  // distance from world edge
+      const range = WORLD_SIZE * 0.5 - margin;
+      for (let tries = 0; tries < 100; tries++) {
+        const ax = (seededRng() - 0.5) * 2 * range;
+        const az = (seededRng() - 0.5) * 2 * range;
+        const bx = (seededRng() - 0.5) * 2 * range;
+        const bz = (seededRng() - 0.5) * 2 * range;
+        const dist = Math.hypot(bx - ax, bz - az);
+        if (dist >= minSep) return { a: new THREE.Vector2(ax, az), b: new THREE.Vector2(bx, bz) };
+      }
+      // fallback — opposite quadrants
+      return { a: new THREE.Vector2(-100, -80), b: new THREE.Vector2(100, 90) };
+    }
+    const _kingdoms = randomizeKingdoms();
+    const KINGDOM_A_CENTER = _kingdoms.a;
+    const KINGDOM_B_CENTER = _kingdoms.b;
 
     // ─────────────────────────────────────────
     //  SCENE SETUP
@@ -2097,20 +2176,27 @@
       moonShadowTex.needsUpdate = true;
     }
 
-    // Settlements — Kingdom A
-    const settlementsA = [
-      createSettlement(new THREE.Vector2(KINGDOM_A_CENTER.x, KINGDOM_A_CENTER.y), PALETTE.A, 8),
-      createSettlement(new THREE.Vector2(KINGDOM_A_CENTER.x - 30, KINGDOM_A_CENTER.y + 25), PALETTE.A, 5),
-      createSettlement(new THREE.Vector2(KINGDOM_A_CENTER.x + 20, KINGDOM_A_CENTER.y - 35), PALETTE.A, 4),
-    ];
+    // Settlements — randomized clusters around each kingdom center
+    function generateSettlements(center, palette) {
+      const settlements = [];
+      // Main settlement at center
+      const mainCount = 6 + Math.floor(seededRng() * 5); // 6-10 buildings
+      settlements.push(createSettlement(new THREE.Vector2(center.x, center.y), palette, mainCount));
+      // 2-3 satellite settlements
+      const satCount = 2 + Math.floor(seededRng() * 2);
+      for (let i = 0; i < satCount; i++) {
+        const angle = seededRng() * Math.PI * 2;
+        const dist = 25 + seededRng() * 20;
+        const sx = center.x + Math.cos(angle) * dist;
+        const sz = center.y + Math.sin(angle) * dist;
+        const bCount = 3 + Math.floor(seededRng() * 4); // 3-6 buildings
+        settlements.push(createSettlement(new THREE.Vector2(sx, sz), palette, bCount));
+      }
+      return settlements;
+    }
+    const settlementsA = generateSettlements(KINGDOM_A_CENTER, PALETTE.A);
     settlementsA.forEach(s => scene.add(s));
-
-    // Settlements — Kingdom B
-    const settlementsB = [
-      createSettlement(new THREE.Vector2(KINGDOM_B_CENTER.x, KINGDOM_B_CENTER.y), PALETTE.B, 8),
-      createSettlement(new THREE.Vector2(KINGDOM_B_CENTER.x + 25, KINGDOM_B_CENTER.y - 30), PALETTE.B, 5),
-      createSettlement(new THREE.Vector2(KINGDOM_B_CENTER.x - 20, KINGDOM_B_CENTER.y + 25), PALETTE.B, 4),
-    ];
+    const settlementsB = generateSettlements(KINGDOM_B_CENTER, PALETTE.B);
     settlementsB.forEach(s => scene.add(s));
 
     // Spawn one NPC per existing building
@@ -2230,8 +2316,8 @@
       return terrainHeight(x, z) * HEIGHT_SCALE; // fallback
     }
 
-    // Start position
-    const startX = 0, startZ = 0;
+    // Start position — near Kingdom A's main settlement
+    const startX = Math.random() * WORLD_SIZE, startZ = Math.random() * WORLD_SIZE;
     playerGroup.position.set(startX, getExactTerrainY(startX, startZ), startZ);
     scene.add(playerGroup);
 
@@ -2340,9 +2426,22 @@
     });
     window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
+    // Title screen
+    let gameStarted = false;
+    const titleScreen = document.getElementById('title-screen');
+    document.getElementById('play-btn').addEventListener('click', () => {
+      gameStarted = true;
+      titleScreen.classList.add('hidden');
+      setTimeout(() => { titleScreen.style.display = 'none'; }, 800);
+      document.querySelectorAll('.game-hud').forEach(el => el.classList.add('visible'));
+      renderer.domElement.requestPointerLock();
+      if (!SFX.initialized) SFX.init();
+    });
+
     // Mouse look
     let pointerLocked = false;
     renderer.domElement.addEventListener('click', () => {
+      if (!gameStarted) return;
       renderer.domElement.requestPointerLock();
       if (!SFX.initialized) SFX.init();
     });
