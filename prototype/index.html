@@ -7258,7 +7258,7 @@
 
     // Spawn initial squirrels — one per ~40 trees, near random trees
     {
-      const sqCount = Math.max(4, Math.floor(treePositions.length / 40));
+      const sqCount = Math.max(4, Math.floor(treePositions.length / 10));
       for (let i = 0; i < sqCount; i++) {
         const tIdx = (Math.random() * treePositions.length) | 0;
         if (windTrees[tIdx] && !windTrees[tIdx].chopped) {
