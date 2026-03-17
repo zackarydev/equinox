@@ -2904,6 +2904,33 @@
         n.onended = () => this._untrackSound(id);
       },
 
+      // Building charging — warm resonant hum when smoke feeds a building
+      buildingCharge(chargeFrac) {
+        if (!this.ctx || !this.canPlay() || !this._cooldown('bChg', 350)) return;
+        const id = this._trackSound('bChg');
+        const t = this.ctx.currentTime;
+        // Base tone rises with charge level (200→500 Hz)
+        const freq = 200 + chargeFrac * 300;
+        const o = this.ctx.createOscillator();
+        o.type = 'sine'; o.frequency.value = freq;
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.06, t + 0.05);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.45);
+        o.connect(g); g.connect(this.sfxGain);
+        o.start(t); o.stop(t + 0.5);
+        // Warm harmonic overtone (octave + fifth above)
+        const o2 = this.ctx.createOscillator();
+        o2.type = 'triangle'; o2.frequency.value = freq * 3;
+        const g2 = this.ctx.createGain();
+        g2.gain.setValueAtTime(0, t);
+        g2.gain.linearRampToValueAtTime(0.015, t + 0.06);
+        g2.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+        o2.connect(g2); g2.connect(this.sfxGain);
+        o2.start(t); o2.stop(t + 0.4);
+        o.onended = () => this._untrackSound(id);
+      },
+
       // Building cleansed — ascending arpeggio chime
       buildingCleansed() {
         if (!this.ctx || !this.canPlay()) return;
@@ -4759,7 +4786,7 @@
               for (let wi = 0; wi < wl.length; wi++) {
                 deferredLightPush(
                   wl[wi].x, wl[wi].y, wl[wi].z,
-                  1.0, 0.85, 0.4,    // warm yellow
+                  winColor.r, winColor.g, winColor.b,
                   visGlow * 12.0,
                   1500 + visGlow * 10,
                   wl[wi].nx, wl[wi].ny, wl[wi].nz,
@@ -4863,6 +4890,7 @@
               if (ba.charge >= ba.chargeMax * 0.95) ba.fullyCharged = true;
               ba.glowIntensity = Math.min(ba.charge * 1.2, 1.0);
               ba.glowColor.lerp(neonCol, 0.3);
+              SFX.buildingCharge(ba.charge / ba.chargeMax);
             }
           }
         }
