@@ -89,7 +89,7 @@
   </div>
   <div id="info" class="game-hud">
     WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Hold LMB — attack (cleanse) &nbsp;|&nbsp; F — place turret<br>
-    1 / 2 / 3 — Day / Dusk / Night &nbsp;|&nbsp; T — auto cycle &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; G — smoke &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis &nbsp;|&nbsp; B — collision boxes
+    1 Day / 2 Dusk / 3 Night / 4 Dawn &nbsp;|&nbsp; T — time &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; G — smoke &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis &nbsp;|&nbsp; B — collision boxes &nbsp;|&nbsp; P — paths
   </div>
   <div id="time-indicator" class="game-hud"></div>
   <div id="moon-indicator" class="game-hud"><canvas id="moon-hud" width="24" height="24"></canvas><span id="moon-text"></span></div>
@@ -3607,18 +3607,18 @@
 
       // Building collision — always active so ghost core can't enter buildings
       resolvePlayerBuildingCollisions();
-      // Tree trunk collision — daytime only (ghost blobs avoid trunks via obstacle avoidance)
       if (timeOfDay > 0.25 && timeOfDay < 0.75) {
+        // Tree trunk collision — daytime only (ghost blobs avoid trunks via obstacle avoidance)
         resolvePlayerTrunkCollisions();
-      }
-
-      // Player trampling
-      const _pSpeed = playerVelocity.length();
-      if (_pSpeed > 1.5) {
-        _playerTrampAccum += _pSpeed * dt;
-        if (_playerTrampAccum > 2.0) {
-          _playerTrampAccum = 0;
-          trampleAt(playerGroup.position.x, playerGroup.position.z);
+        
+        // Player trampling, only during daytime, ghost doesn't touch ground
+        const _pSpeed = playerVelocity.length();
+        if (_pSpeed > 1.5) {
+          _playerTrampAccum += _pSpeed * dt;
+          if (_playerTrampAccum > 2.0) {
+            _playerTrampAccum = 0;
+            trampleAt(playerGroup.position.x, playerGroup.position.z);
+          }
         }
       }
 
@@ -8659,7 +8659,7 @@
       const px = playerGroup.position.x + fwd.x * 5;
       const pz = playerGroup.position.z + fwd.z * 5;
       const py = getTerrainY(px, pz);
-      if (py < 2.0 || py > 14) return;
+      if (py < 2.0) return;
 
       // Check not too close to existing turrets/sites/buildings
       const MIN_GAP = 8;
