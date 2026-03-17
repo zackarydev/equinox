@@ -2742,8 +2742,10 @@
       },
 
       // Turret zap — electric crack
-      turretZap() {
+      turretZap(dist) {
         if (!this.ctx || !this.canPlay() || !this._cooldown('zap', 50)) return;
+        const vol = 0.1 * Math.max(0, 1 - (dist || 0) / 60);
+        if (vol <= 0) return;
         const id = this._trackSound('zap');
         const t = this.ctx.currentTime;
         const startF = 700 + Math.random() * 200;
@@ -2752,7 +2754,7 @@
         o.frequency.setValueAtTime(startF, t);
         o.frequency.exponentialRampToValueAtTime(200, t + 0.08);
         const g = this.ctx.createGain();
-        g.gain.setValueAtTime(0.1, t);
+        g.gain.setValueAtTime(vol, t);
         g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
         o.connect(g); g.connect(this.sfxGain);
         o.start(t); o.stop(t + 0.2);
@@ -2761,7 +2763,7 @@
         const nf = this.ctx.createBiquadFilter();
         nf.type = 'bandpass'; nf.frequency.value = 2000; nf.Q.value = 4;
         const ng = this.ctx.createGain();
-        ng.gain.setValueAtTime(0.08, t);
+        ng.gain.setValueAtTime(vol * 0.8, t);
         ng.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
         n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
         n.start(t); n.stop(t + 0.15);
@@ -2769,8 +2771,10 @@
       },
 
       // Wraith spawn — eerie rising moan
-      wraithSpawn() {
+      wraithSpawn(dist) {
         if (!this.ctx || !this.canPlay() || !this._cooldown('wSpawn', 3000)) return;
+        const vol = 0.07 * Math.max(0, 1 - (dist || 0) / 80);
+        if (vol <= 0) return;
         const id = this._trackSound('wSpawn');
         const t = this.ctx.currentTime;
         const o1 = this.ctx.createOscillator();
@@ -2785,8 +2789,8 @@
         flt.type = 'bandpass'; flt.frequency.value = 200; flt.Q.value = 0.5;
         const g = this.ctx.createGain();
         g.gain.setValueAtTime(0, t);
-        g.gain.linearRampToValueAtTime(0.07, t + 0.5);
-        g.gain.setValueAtTime(0.07, t + 1.0);
+        g.gain.linearRampToValueAtTime(vol, t + 0.5);
+        g.gain.setValueAtTime(vol, t + 1.0);
         g.gain.exponentialRampToValueAtTime(0.001, t + 1.8);
         o1.connect(flt); o2.connect(flt); flt.connect(g); g.connect(this.sfxGain);
         o1.start(t); o2.start(t);
@@ -2795,8 +2799,10 @@
       },
 
       // Wraith death — descending wail
-      wraithDie() {
+      wraithDie(dist) {
         if (!this.ctx || !this.canPlay() || !this._cooldown('wDie', 200)) return;
+        const vol = 0.12 * Math.max(0, 1 - (dist || 0) / 60);
+        if (vol <= 0) return;
         const id = this._trackSound('wDie');
         const t = this.ctx.currentTime;
         const o = this.ctx.createOscillator();
@@ -2811,7 +2817,7 @@
         lfo.connect(lfoG); lfoG.connect(o.frequency);
         const g = this.ctx.createGain();
         g.gain.setValueAtTime(0, t);
-        g.gain.linearRampToValueAtTime(0.12, t + 0.05);
+        g.gain.linearRampToValueAtTime(vol, t + 0.05);
         g.gain.exponentialRampToValueAtTime(0.001, t + 0.8);
         o.connect(g); g.connect(this.sfxGain);
         o.start(t); lfo.start(t);
@@ -2821,7 +2827,7 @@
         const nf = this.ctx.createBiquadFilter();
         nf.type = 'lowpass'; nf.frequency.value = 400;
         const ng = this.ctx.createGain();
-        ng.gain.setValueAtTime(0.04, t);
+        ng.gain.setValueAtTime(vol * 0.33, t);
         ng.gain.exponentialRampToValueAtTime(0.001, t + 0.7);
         n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
         n.start(t); n.stop(t + 0.75);
@@ -2905,8 +2911,10 @@
       },
 
       // Building charging — warm resonant hum when smoke feeds a building
-      buildingCharge(chargeFrac) {
+      buildingCharge(chargeFrac, dist) {
         if (!this.ctx || !this.canPlay() || !this._cooldown('bChg', 350)) return;
+        const vol = 0.06 * Math.max(0, 1 - (dist || 0) / 50);
+        if (vol <= 0) return;
         const id = this._trackSound('bChg');
         const t = this.ctx.currentTime;
         // Base tone rises with charge level (200→500 Hz)
@@ -2915,7 +2923,7 @@
         o.type = 'sine'; o.frequency.value = freq;
         const g = this.ctx.createGain();
         g.gain.setValueAtTime(0, t);
-        g.gain.linearRampToValueAtTime(0.06, t + 0.05);
+        g.gain.linearRampToValueAtTime(vol, t + 0.05);
         g.gain.exponentialRampToValueAtTime(0.001, t + 0.45);
         o.connect(g); g.connect(this.sfxGain);
         o.start(t); o.stop(t + 0.5);
@@ -2924,7 +2932,7 @@
         o2.type = 'triangle'; o2.frequency.value = freq * 3;
         const g2 = this.ctx.createGain();
         g2.gain.setValueAtTime(0, t);
-        g2.gain.linearRampToValueAtTime(0.015, t + 0.06);
+        g2.gain.linearRampToValueAtTime(vol * 0.25, t + 0.06);
         g2.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
         o2.connect(g2); g2.connect(this.sfxGain);
         o2.start(t); o2.stop(t + 0.4);
@@ -2962,7 +2970,7 @@
 
       // Ghost splits around tree trunk — swooshing split sound
       ghostSplit() {
-        if (!this.ctx || !this.canPlay() || !this._cooldown('gSplit', 600)) return;
+        if (!this.ctx || !this.canPlay() || !this._cooldown('gSplit', 300)) return;
         const id = this._trackSound('gSplit');
         const t = this.ctx.currentTime;
         // Stereo swoosh: noise swept through bandpass, panning left and right
@@ -3064,8 +3072,10 @@
       },
 
       // Contaminate building — ominous creeping swell
-      contaminate() {
+      contaminate(dist) {
         if (!this.ctx || !this.canPlay() || !this._cooldown('contam', 2000)) return;
+        const vol = 0.08 * Math.max(0, 1 - (dist || 0) / 70);
+        if (vol <= 0) return;
         const id = this._trackSound('contam');
         const t = this.ctx.currentTime;
         const n = this._noise();
@@ -3073,12 +3083,12 @@
         nf.type = 'lowpass'; nf.frequency.value = 300;
         const ng = this.ctx.createGain();
         ng.gain.setValueAtTime(0, t);
-        ng.gain.linearRampToValueAtTime(0.08, t + 0.5);
+        ng.gain.linearRampToValueAtTime(vol, t + 0.5);
         ng.gain.exponentialRampToValueAtTime(0.001, t + 1.0);
         n.connect(nf); nf.connect(ng); ng.connect(this.sfxGain);
         n.start(t); n.stop(t + 1.1);
         // Low sine bed
-        this._osc('sine', 80, 0.06, 0.3, 0.7, this.sfxGain);
+        this._osc('sine', 80, vol * 0.75, 0.3, 0.7, this.sfxGain);
         n.onended = () => this._untrackSound(id);
       },
 
@@ -4890,7 +4900,8 @@
               if (ba.charge >= ba.chargeMax * 0.95) ba.fullyCharged = true;
               ba.glowIntensity = Math.min(ba.charge * 1.2, 1.0);
               ba.glowColor.lerp(neonCol, 0.3);
-              SFX.buildingCharge(ba.charge / ba.chargeMax);
+              { const _dx = ba.x - playerGroup.position.x, _dy = ba.y - playerGroup.position.y, _dz = ba.z - playerGroup.position.z;
+                SFX.buildingCharge(ba.charge / ba.chargeMax, Math.sqrt(_dx*_dx + _dy*_dy + _dz*_dz)); }
             }
           }
         }
@@ -6012,7 +6023,7 @@
             npc.mesh.children[0].rotation.z = Math.sin(npc.timer * 8) * 0.2 * (1 - chopProg);
             // Chop sound at animation peaks
             if (Math.sin(npc.timer * 8) > 0.95) {
-              const cd = Math.sqrt((npc.x - playerGroup.position.x) ** 2 + (npc.z - playerGroup.position.z) ** 2);
+              const cd = Math.sqrt((npc.x - playerGroup.position.x) ** 2 + (npc.mesh.position.y - playerGroup.position.y) ** 2 + (npc.z - playerGroup.position.z) ** 2);
               if (cd < 40) SFX.chop(cd);
             }
             // Progressive tree shrink: each visit removes 1/treeMaxTrips of the tree
@@ -6170,7 +6181,7 @@
               nb.position.set(npc.siteX, bgy, npc.siteZ);
               nb.rotation.y = Math.random() * Math.PI * 2;
               scene.add(nb);
-              { const bd = Math.sqrt((npc.siteX - playerGroup.position.x) ** 2 + (npc.siteZ - playerGroup.position.z) ** 2); SFX.buildComplete(bd); }
+              { const bd = Math.sqrt((npc.siteX - playerGroup.position.x) ** 2 + (bgy - playerGroup.position.y) ** 2 + (npc.siteZ - playerGroup.position.z) ** 2); SFX.buildComplete(bd); }
               // Register wind faces for new building
               const { w: bw, h: bh, d: bd } = nb.userData.dims;
               const rot = nb.rotation.y, cR = Math.cos(rot), sR = Math.sin(rot);
@@ -6199,7 +6210,7 @@
                 windowMats: nb.userData.windowMats || [],
                 windowLights: nwl,
                 glowIntensity: 0, glowColor: new THREE.Color(0, 0, 0),
-                charge: 0, chargeMax: 1.0, fullyCharged: false,
+                charge: 0, chargeMax: 10.0, fullyCharged: false,
                 roofY: bgy + bh + bh * 0.5 * 0.4,
                 settlementX: npc.siteX, settlementZ: npc.siteZ,
                 contaminated: false, vineGroup: null,
@@ -7124,7 +7135,7 @@
             if (sq.timer <= 0) {
               sq.hasNut = false;
               plantTreeAt(sq.targetX, sq.targetZ);
-              { const sd = Math.sqrt((sq.x - playerGroup.position.x) ** 2 + (sq.z - playerGroup.position.z) ** 2); SFX.squirrelPlant(sd); }
+              { const sd = Math.sqrt((sq.x - playerGroup.position.x) ** 2 + (sq.mesh.position.y - playerGroup.position.y) ** 2 + (sq.z - playerGroup.position.z) ** 2); SFX.squirrelPlant(sd); }
               sq.state = SQ_IDLE;
               sq.timer = 15 + Math.random() * 20;
             }
@@ -7488,11 +7499,15 @@
         if (_nmSpawnTimer >= NM_SPAWN_INTERVAL) {
           _nmSpawnTimer = 0;
           spawnWraith();
-          SFX.wraithSpawn();
+          { const _nm = nightMobs[nightMobs.length - 1];
+            if (_nm) { const _dx = _nm.x - playerGroup.position.x, _dy = _nm.mesh.position.y - playerGroup.position.y, _dz = _nm.z - playerGroup.position.z;
+              SFX.wraithSpawn(Math.sqrt(_dx*_dx + _dy*_dy + _dz*_dz)); }
+          }
         }
       }
 
       const px = playerGroup.position.x;
+      const py_nm = playerGroup.position.y;
       const pz = playerGroup.position.z;
 
       for (let i = nightMobs.length - 1; i >= 0; i--) {
@@ -7555,7 +7570,7 @@
         }
 
         // ── AI: find target ──
-        const distToPlayer2 = (px - nm.x) ** 2 + (pz - nm.z) ** 2;
+        const distToPlayer2 = (px - nm.x) ** 2 + (py_nm - nm.mesh.position.y) ** 2 + (pz - nm.z) ** 2;
         const distToPlayer = Math.sqrt(distToPlayer2);
         const playerNearby = distToPlayer < NM_PLAYER_NEARBY;
 
@@ -7710,12 +7725,15 @@
                   ba.windowMats[mi].color.setScalar(0);
                   ba.windowMats[mi].emissive && ba.windowMats[mi].emissive.setScalar(0);
                 }
-                if (!ba.contaminated) { 
-                  SFX.contaminate(); 
-                  contaminateBuilding(ba); 
-                  // kill night mob on contamination
-                  nm.hp -= NM_MAX_HP;
-                  if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; SFX.wraithDie(); }
+                if (!ba.contaminated) {
+                  { const _dx = ba.x - playerGroup.position.x, _dy = ba.y - playerGroup.position.y, _dz = ba.z - playerGroup.position.z;
+                    const _d = Math.sqrt(_dx*_dx + _dy*_dy + _dz*_dz);
+                    SFX.contaminate(_d);
+                    // kill night mob on contamination
+                    nm.hp -= NM_MAX_HP;
+                    if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; SFX.wraithDie(_d); }
+                  }
+                  contaminateBuilding(ba);
                 } else {
                   nm.attackCooldown = NM_ATTACK_COOLDOWN;
                   nm.homeTargetIdx = -1;
@@ -8003,7 +8021,7 @@
       for (let ni = nightMobs.length - 1; ni >= 0; ni--) {
         const nm = nightMobs[ni];
         if (nm.state === 'dying') continue;
-        const wd = Math.sqrt((nm.x - px) ** 2 + (nm.z - pz) ** 2);
+        const wd = Math.sqrt((nm.x - px) ** 2 + (nm.mesh.position.y - py) ** 2 + (nm.z - pz) ** 2);
         // if (wd < GHOST_DRAIN_WRAITH + 3) {
         //   let drained = 0;
         //   const drainBudget = GHOST_DRAIN_RATE_WRAITH * dt;
@@ -8018,7 +8036,7 @@
           let nearBlobs = 0;
           for (let i = 0; i < GHOST_MAX; i++) {
             if (!_gbac[i]) continue;
-            if ((_gbx[i] - nm.x) ** 2 + (_gbz[i] - nm.z) ** 2 < GHOST_ATTACK_RANGE * GHOST_ATTACK_RANGE) nearBlobs++;
+            if ((_gbx[i] - nm.x) ** 2 + (_gby[i] - nm.mesh.position.y) ** 2 + (_gbz[i] - nm.z) ** 2 < GHOST_ATTACK_RANGE * GHOST_ATTACK_RANGE) nearBlobs++;
             if (nearBlobs >= 10) break;
           }
           if (nearBlobs > 3) {
@@ -8028,7 +8046,7 @@
               nm.state = 'dying'; nm.alpha = 1;
               // Ghost consumes wraith — grow in size
               ghostBonusMax += GHOST_WRAITH_BONUS;
-              SFX.wraithDie();
+              SFX.wraithDie(wd);
               SFX.ghostConsume();
             }
           }
@@ -8435,7 +8453,7 @@
       }
 
       // NPC yay sound
-      const d = Math.sqrt((ba.x - playerGroup.position.x) ** 2 + (ba.z - playerGroup.position.z) ** 2);
+      const d = Math.sqrt((ba.x - playerGroup.position.x) ** 2 + (ba.y - playerGroup.position.y) ** 2 + (ba.z - playerGroup.position.z) ** 2);
       SFX.npcYay(d);
     }
 
@@ -8886,10 +8904,13 @@
             const fromY = tur.y + 3.8;
             const toY = getTerrainY(nm.x, nm.z) + 2.0;
             fireZapBeam(tur.x, fromY, tur.z, nm.x, toY, nm.z, zapColor);
-            SFX.turretZap();
-            nm.hp -= TURRET_ZAP_DAMAGE;
-            nm.mesh.userData.headMat.emissiveIntensity = 3.0;
-            if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; SFX.wraithDie(); }
+            { const _dx = tur.x - playerGroup.position.x, _dy = tur.y - playerGroup.position.y, _dz = tur.z - playerGroup.position.z;
+              const _td = Math.sqrt(_dx*_dx + _dy*_dy + _dz*_dz);
+              SFX.turretZap(_td);
+              nm.hp -= TURRET_ZAP_DAMAGE;
+              nm.mesh.userData.headMat.emissiveIntensity = 3.0;
+              if (nm.hp <= 0) { nm.state = 'dying'; nm.alpha = 1; SFX.wraithDie(_td); }
+            }
             tur.charge -= TURRET_CHARGE_PER_ZAP;
             tur.zapCooldown = TURRET_ZAP_COOLDOWN;
           }
