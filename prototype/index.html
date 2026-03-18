@@ -1400,6 +1400,7 @@
           { x: wcx - (dims.w/2 + 0.8)*cosR, z: wcz + (dims.w/2 + 0.8)*sinR, y: winY,
             nx: -cosR, ny: -0.3, nz: sinR },
         ];
+        const charge = 5.0 + Math.random() * 5;
         buildingAttractors.push({
           x: center.x + bx,
           y: wy + dims.h * 0.5,
@@ -1409,9 +1410,9 @@
           windowLights: windowLights,
           glowIntensity: 0,
           glowColor: new THREE.Color(0, 0, 0),
-          charge: 1.0 + Math.random() * 3,        // accumulated smoke charge (1-4)
+          charge,        // accumulated smoke charge (1-4)
           chargeMax: 10.0,    // 1.0 = fully charged = 3 in-game hours of glow
-          fullyCharged: false, // set true when ghost charges to max; fast drain if not
+          fullyCharged: charge > 7, // set true when ghost charges to max; fast drain if not
           hearth: Math.random() < 0.35
             ? (0.3 + Math.random() * 0.7) * Math.min(1, (dims.w * dims.d) / 20)
             : 0,
@@ -4753,7 +4754,7 @@
     const _defaultWarmWin = new THREE.Color(1.0, 0.85, 0.4);
     function updateBuildingLights(dt) {
       deferredLightsClear();
-      const MAX_DRAIN_TIME = 0.250 / CYCLE_SPEED;
+      const MAX_DRAIN_TIME = 0.01 / CYCLE_SPEED;
 
       // Lights on from mid-dusk (0.73) through night to dawn start (0.23)
       // Smooth fade: ramp up 0.70→0.75, ramp down 0.22→0.27
@@ -4773,10 +4774,12 @@
         if (ba.destroyed) continue;
         if (ba.charge > 0.001) {
           if (autoCycle) {
-            // Buildings that haven't been fully charged drain much faster
-            const baseDrain = 1.0 / (MAX_DRAIN_TIME * Math.max(ba.charge, 0.05));
-            const drainMult = ba.fullyCharged ? 1.0 : 8.0;
-            ba.charge = Math.max(0, ba.charge - baseDrain * drainMult * dt);
+            // Drain proportional to charge — high charge drains faster,
+            // low charge drains slowly so smoke can build up.
+            // Non-fully-charged buildings drain 3x faster.
+            const drainMult = ba.fullyCharged ? 1.0 : 3.0;
+            const baseDrain = ba.charge * drainMult / (MAX_DRAIN_TIME * ba.chargeMax);
+            ba.charge = Math.max(0, ba.charge - baseDrain * dt);
             if (ba.charge <= 0.001) ba.fullyCharged = false;
           }
           ba.glowIntensity = Math.min(ba.charge * 1.2, 1.0);
@@ -8445,11 +8448,13 @@
         ba.vineMeshes = null;
       }
 
-      // Reset window tint to warm yellow
+      // Reset window tint to dark — updateBuildingLights will handle glow
+      // based on charge and time of day once smoke recharges the building
+      ba.glowColor.setRGB(0, 0, 0);
       for (let mi = 0; mi < ba.windowMats.length; mi++) {
         const wm = ba.windowMats[mi];
-        wm.color.setRGB(0.9, 0.75, 0.1);
-        if (wm.emissive) wm.emissive.setRGB(0.4, 0.3, 0.0);
+        wm.color.setHex(0x1a1a22);
+        if (wm.emissive) wm.emissive.setRGB(0, 0, 0);
       }
 
       // NPC yay sound
@@ -8507,15 +8512,18 @@
 
     function removeOneVine(ba) {
       if (!ba.vineMeshes || ba.vineMeshes.length === 0) return false;
-      // Remove last vine mesh (tube or bulb)
-      let vm = ba.vineMeshes.pop();
-      if (vm.parent) vm.parent.remove(vm);
-      if (vm.geometry) vm.geometry.dispose();
-      if (vm.material) vm.material.dispose();
-      vm = ba.vineMeshes.pop();
-      if (vm.parent) vm.parent.remove(vm);
-      if (vm.geometry) vm.geometry.dispose();
-      if (vm.material) vm.material.dispose();
+      // Remove meshes from the end until we've removed one vine tube.
+      // Vine tubes have .userData.vineMat; bulbs have .userData.bulbMat.
+      // Bulbs are pushed after their tube, so popping from the end removes
+      // bulbs first, then the tube they belong to.
+      let removedTube = false;
+      while (ba.vineMeshes.length > 0 && !removedTube) {
+        const vm = ba.vineMeshes.pop();
+        if (vm.userData.vineMat) removedTube = true;
+        if (vm.parent) vm.parent.remove(vm);
+        if (vm.geometry) vm.geometry.dispose();
+        if (vm.material) vm.material.dispose();
+      }
       // If no vines left, fully decontaminate
       if (ba.vineMeshes.length === 0) {
         decontaminateBuilding(ba);
