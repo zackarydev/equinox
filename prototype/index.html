@@ -248,9 +248,10 @@
 
       // Mountains at world edges — taller and more dramatic
       const distFromCenter = Math.sqrt(wx * wx + wz * wz) / (WORLD_SIZE * 0.5);
-      const mountainMask = Math.pow(Math.max(0, distFromCenter - 0.45) / 0.55, 2.0);
+      const mountainMask = Math.pow(Math.max(0, distFromCenter - 0.35) / 0.65, 2.5);
       const ridge = ridgedNoise(nx * 0.8, nz * 0.8, 3);
-      h = h + ridge * 0.6 * mountainMask;
+      const ridgeFine = ridgedNoise(nx * 2.0, nz * 2.0, 2);
+      h = h + (ridge * 0.9 + ridgeFine * 0.3) * mountainMask;
 
       return h;
     }
@@ -285,7 +286,11 @@
         const bx = (seededRng() - 0.5) * 2 * range;
         const bz = (seededRng() - 0.5) * 2 * range;
         const dist = Math.hypot(bx - ax, bz - az);
-        if (dist >= minSep) return { a: new THREE.Vector2(ax, az), b: new THREE.Vector2(bx, bz) };
+        // Reject if too close, or if either center is in water or on tall terrain
+        const hA = terrainHeight(ax, az) * HEIGHT_SCALE;
+        const hB = terrainHeight(bx, bz) * HEIGHT_SCALE;
+        if (dist >= minSep && hA > 2.5 && hA < 12 && hB > 2.5 && hB < 12)
+          return { a: new THREE.Vector2(ax, az), b: new THREE.Vector2(bx, bz) };
       }
       // fallback — opposite quadrants
       return { a: new THREE.Vector2(-100, -80), b: new THREE.Vector2(100, 90) };
@@ -1373,12 +1378,14 @@
         const dist = 6 + Math.random() * 14;
         const bx = Math.cos(angle) * dist;
         const bz = Math.sin(angle) * dist;
+        // Skip buildings that would land in water or on tall terrain
+        const wy = getTerrainY(center.x + bx, center.y + bz);
+        if (wy < 2.5 || wy > 12) continue;
         const sizeScale = 1.0 + Math.random() * 0.5;
         const building = createBuilding(palette, sizeScale);
         building.position.set(bx, 0, bz);
         building.rotation.y = Math.random() * Math.PI * 2;
         // Place on terrain
-        const wy = getTerrainY(center.x + bx, center.y + bz);
         building.position.y = wy;
         settlementGroup.add(building);
         // Register as smoke attractor (world space)
@@ -1459,9 +1466,10 @@
         const dist = 20 + Math.random() * 6;
         const wx = Math.cos(angle) * dist;
         const wz = Math.sin(angle) * dist;
+        const wallGY = getTerrainY(center.x + wx, center.y + wz);
+        if (wallGY < 2.5 || wallGY > 12) continue; // skip walls in water or on mountains
         const wallLen = 6 + Math.random() * 6;
         const wall = createWallSegment(palette, wallLen);
-        const wallGY = getTerrainY(center.x + wx, center.y + wz);
         wall.position.set(wx, wallGY, wz);
         wall.rotation.y = angle + Math.PI / 2;
         settlementGroup.add(wall);
@@ -1960,7 +1968,7 @@
     const depletedRocks = new Set();
     const rockGroup = new THREE.Group();
     const halfW = WORLD_SIZE / 2;
-    for (let i = 0; i < 800; i++) {
+    for (let i = 0; i < 1200; i++) {
       const x = (Math.random() - 0.5) * WORLD_SIZE * 0.95;
       const z = (Math.random() - 0.5) * WORLD_SIZE * 0.95;
       const y = getTerrainY(x, z);
@@ -1968,7 +1976,7 @@
 
       // Mountain factor — distance from center
       const dist = Math.sqrt(x * x + z * z) / halfW;
-      const mountain = Math.pow(Math.max(0, dist - 0.4) / 0.6, 1.5);
+      const mountain = Math.pow(Math.max(0, dist - 0.35) / 0.65, 1.5);
 
       // Erosion gully factor — cheap noise check
       const nx = x * 0.002, nz = z * 0.002;
@@ -1978,15 +1986,15 @@
       // Height factor — rockier at higher elevations
       const heightFactor = Math.max(0, (y - 5) / (HEIGHT_SCALE * 0.8));
 
-      // Green/flat penalty — low elevation = grassy, fewer rocks
-      const greenPenalty = y < HEIGHT_SCALE * 0.35 ? 0.6 : 0;
+      // Green/flat penalty — low elevation = grassy, much fewer rocks
+      const greenPenalty = y < HEIGHT_SCALE * 0.35 ? 0.85 : 0;
 
-      const density = Math.max(0, 0.04 + mountain * 0.65 + gully * 0.3 + heightFactor * 0.3 - greenPenalty);
+      const density = Math.max(0, 0.02 + mountain * 0.8 + gully * 0.3 + heightFactor * 0.4 - greenPenalty);
       if (Math.random() > density) continue;
 
-      const rockScale = mountain > 0.3 ? 0.8 + Math.random() * 2.5 :
+      const rockScale = mountain > 0.3 ? 1.0 + Math.random() * 3.0 :
                         gully > 0.2 ? 0.4 + Math.random() * 1.5 :
-                        0.3 + Math.random() * 0.8;
+                        0.2 + Math.random() * 0.6;
 
       const rock = createRock(rockScale);
       rock.position.set(x, y - rockScale * 0.15, z);
@@ -2187,10 +2195,18 @@
       // 2-3 satellite settlements
       const satCount = 2 + Math.floor(seededRng() * 2);
       for (let i = 0; i < satCount; i++) {
-        const angle = seededRng() * Math.PI * 2;
-        const dist = 25 + seededRng() * 20;
-        const sx = center.x + Math.cos(angle) * dist;
-        const sz = center.y + Math.sin(angle) * dist;
+        let sx, sz, attempts = 0;
+        do {
+          const angle = seededRng() * Math.PI * 2;
+          const dist = 25 + seededRng() * 20;
+          sx = center.x + Math.cos(angle) * dist;
+          sz = center.y + Math.sin(angle) * dist;
+          attempts++;
+        } while (attempts < 20 && (() => {
+          const h = getTerrainY(sx, sz);
+          return h < 2.5 || h > 12;
+        })());
+        if (attempts >= 20) continue; // skip this satellite if no valid spot found
         const bCount = 3 + Math.floor(seededRng() * 4); // 3-6 buildings
         settlements.push(createSettlement(new THREE.Vector2(sx, sz), palette, bCount));
       }
