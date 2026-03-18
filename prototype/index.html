@@ -88,7 +88,7 @@
     <button id="play-btn">PLAY</button>
   </div>
   <div id="info" class="game-hud">
-    WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Hold LMB — attack (cleanse) &nbsp;|&nbsp; F — place turret<br>
+    WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Hold LMB — cleanse / mine &nbsp;|&nbsp; F — place turret<br>
     1 Day / 2 Dusk / 3 Night / 4 Dawn &nbsp;|&nbsp; T — time &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; G — smoke &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis &nbsp;|&nbsp; B — collision boxes &nbsp;|&nbsp; P — paths
   </div>
   <div id="time-indicator" class="game-hud"></div>
@@ -2305,6 +2305,28 @@
     let swordSwingPhase = 0;
     let isAttacking = false;
 
+    // ── Player stone carrying state ──
+    let playerCarryingStone = false;
+    let playerMiningRockIdx = -1;   // rock index being mined
+    let playerMineSwingTimer = 0;
+    let playerMineSwingLanded = false;
+    const PLAYER_MINE_RANGE = 5.0;     // must be within this distance to mine
+    const PLAYER_DELIVER_RANGE = 4.0;  // auto-deliver when this close to turret site
+    const PLAYER_BUILD_TIME = 3.0;     // seconds to finalize turret after all rocks delivered
+    let playerBuildingTurretIdx = -1;
+    let playerBuildTimer = 0;
+
+    // Carried stone visual — replaces sword in hand when carrying
+    const carriedStoneGroup = new THREE.Group();
+    const _csGeo = new THREE.DodecahedronGeometry(0.45, 0);
+    const _csMat = new THREE.MeshStandardMaterial({ color: 0x8a8a7a, flatShading: true, roughness: 0.9 });
+    const _csMesh = new THREE.Mesh(_csGeo, _csMat);
+    _csMesh.castShadow = true;
+    carriedStoneGroup.add(_csMesh);
+    carriedStoneGroup.position.set(0.8, 1.8, 0.3); // same side as sword
+    carriedStoneGroup.visible = false;
+    playerGroup.add(carriedStoneGroup);
+
     // Raycaster for exact terrain surface Y
     const terrainRay = new THREE.Raycaster();
     const rayOrigin = new THREE.Vector3();
@@ -3212,7 +3234,7 @@
     // ─────────────────────────────────────────
     //  DAY/NIGHT CYCLE + LIGHTING PRESETS
     // ─────────────────────────────────────────
-    let timeOfDay = 0.25; // 0 = midnight, 0.25 = sunrise, 0.5 = noon, 0.75 = sunset
+    let timeOfDay = 0.15; // 0 = midnight, 0.25 = sunrise, 0.5 = noon, 0.75 = sunset
     let autoCycle = true;
     const CYCLE_SPEED = 0.007; // full cycle per ~70 seconds
 
@@ -4754,7 +4776,7 @@
     const _defaultWarmWin = new THREE.Color(1.0, 0.85, 0.4);
     function updateBuildingLights(dt) {
       deferredLightsClear();
-      const MAX_DRAIN_TIME = 0.01 / CYCLE_SPEED;
+      const MAX_DRAIN_TIME = 0.05 / CYCLE_SPEED;
 
       // Lights on from mid-dusk (0.73) through night to dawn start (0.23)
       // Smooth fade: ramp up 0.70→0.75, ramp down 0.22→0.27
@@ -8534,7 +8556,9 @@
 
     function updatePlayerAttack(dt) {
       const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
-      swordGroup.visible = isDay && !ghostActive;
+      // Swap sword ↔ stone based on carry state
+      swordGroup.visible = isDay && !ghostActive && !playerCarryingStone;
+      carriedStoneGroup.visible = isDay && !ghostActive && playerCarryingStone;
 
       if (!isDay || ghostActive) {
         isAttacking = false;
@@ -8550,8 +8574,8 @@
       const px = playerGroup.position.x;
       const pz = playerGroup.position.z;
 
-      if (mouseDown) {
-        // Find nearest contaminated building
+      if (mouseDown && !playerCarryingStone) {
+        // Find nearest contaminated building (only when not carrying stone)
         let bestIdx = -1, bestD2 = CLEANSE_RANGE * CLEANSE_RANGE;
         for (let bi = 0; bi < buildingAttractors.length; bi++) {
           const ba = buildingAttractors[bi];
@@ -8605,14 +8629,73 @@
           if (swingT < 0.1) {
             swingLanded = false;
           }
-        } else {
-          // Swinging at nothing
-          isAttacking = false;
-          attackTargetIdx = -1;
-          swingTimer = 0;
-          swordSwingPhase += dt * 6;
-          swordGroup.rotation.z = -0.3 + Math.sin(swordSwingPhase) * 0.5;
-          swordGroup.rotation.x = Math.sin(swordSwingPhase * 0.7) * 0.3;
+        } else if (!playerCarryingStone) {
+          // No contaminated building — try mining a rock
+          let bestRock = -1, bestRD2 = PLAYER_MINE_RANGE * PLAYER_MINE_RANGE;
+          for (let ri = 0; ri < rockPositions.length; ri++) {
+            if (depletedRocks.has(ri)) continue;
+            const r = rockPositions[ri];
+            const rd2 = (r.x - px) ** 2 + (r.z - pz) ** 2;
+            if (rd2 < bestRD2) { bestRD2 = rd2; bestRock = ri; }
+          }
+
+          if (bestRock >= 0) {
+            if (playerMiningRockIdx !== bestRock) {
+              playerMiningRockIdx = bestRock;
+              playerMineSwingTimer = 0;
+              playerMineSwingLanded = false;
+            }
+            isAttacking = true;
+            playerMineSwingTimer += dt;
+
+            const swingT = (playerMineSwingTimer % SWING_DURATION) / SWING_DURATION;
+            const windUp = Math.min(swingT * 3, 1.0);
+            const strike = Math.max(0, Math.min((swingT - 0.33) * 3, 1.0));
+            if (strike > 0 && strike < 0.2) SFX.swordSwing();
+            swordGroup.rotation.z = -0.3 - windUp * 1.2 + strike * 2.0;
+            swordGroup.rotation.x = -0.3 - windUp * 0.6 + strike * 0.9;
+
+            // Face the rock
+            const rp = rockPositions[bestRock];
+            const toX = rp.x - px, toZ = rp.z - pz;
+            const targetAngle = Math.atan2(toX, toZ);
+            let angleDiff = targetAngle - playerFacingAngle;
+            while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+            while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+            playerFacingAngle += angleDiff * Math.min(1, 6 * dt);
+            playerGroup.rotation.y = playerFacingAngle;
+
+            // Strike lands at midpoint — pick up stone
+            if (swingT > 0.5 && !playerMineSwingLanded) {
+              playerMineSwingLanded = true;
+              // Deplete rock
+              rockDurability[bestRock]--;
+              if (rockDurability[bestRock] <= 0) {
+                depletedRocks.add(bestRock);
+                if (rockMeshes[bestRock]) rockMeshes[bestRock].visible = false;
+              } else {
+                const origScale = rockScales[bestRock];
+                const frac = rockDurability[bestRock] / Math.max(2, Math.round(2 + (origScale - 0.3) / 3.0 * 8));
+                const s = Math.max(0.15, frac);
+                rockMeshes[bestRock].scale.set(s, s, s);
+              }
+              playerCarryingStone = true;
+              carriedStoneGroup.visible = true;
+              playerMiningRockIdx = -1;
+              isAttacking = false;
+              playerMineSwingTimer = 0;
+            }
+            if (swingT < 0.1) playerMineSwingLanded = false;
+          } else {
+            // Swinging at nothing
+            isAttacking = false;
+            attackTargetIdx = -1;
+            playerMiningRockIdx = -1;
+            swingTimer = 0;
+            swordSwingPhase += dt * 6;
+            swordGroup.rotation.z = -0.3 + Math.sin(swordSwingPhase) * 0.5;
+            swordGroup.rotation.x = Math.sin(swordSwingPhase * 0.7) * 0.3;
+          }
         }
       } else {
         // Release — reset
@@ -8625,6 +8708,98 @@
         swordGroup.rotation.z = 0.2 + Math.sin(swordSwingPhase) * 0.05;
         swordGroup.rotation.x = 0;
       }
+    }
+
+    // ─────────────────────────────────────────
+    //  PLAYER STONE DELIVERY — carry stone to turret sites
+    // ─────────────────────────────────────────
+    function updatePlayerStoneDelivery(dt) {
+      const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
+      if (!isDay || ghostActive) {
+        // Drop stone at night/dusk
+        if (playerCarryingStone) {
+          playerCarryingStone = false;
+          carriedStoneGroup.visible = false;
+        }
+        playerBuildingTurretIdx = -1;
+        playerBuildTimer = 0;
+        return;
+      }
+
+      const px = playerGroup.position.x;
+      const pz = playerGroup.position.z;
+
+      // ── Player is finalizing a turret build ──
+      if (playerBuildingTurretIdx >= 0) {
+        if (playerBuildingTurretIdx >= turretSites.length) {
+          // Site was removed (NPC finished it?)
+          playerBuildingTurretIdx = -1;
+          playerBuildTimer = 0;
+          return;
+        }
+        const ts = turretSites[playerBuildingTurretIdx];
+        // Cancel if player walks too far away
+        const bd2 = (ts.x - px) ** 2 + (ts.z - pz) ** 2;
+        if (bd2 > 8 * 8) {
+          playerBuildingTurretIdx = -1;
+          playerBuildTimer = 0;
+          return;
+        }
+        playerBuildTimer -= dt;
+        // Grow placeholder during build
+        if (ts.buildMesh) {
+          const bp = 1 - playerBuildTimer / PLAYER_BUILD_TIME;
+          ts.buildMesh.scale.y = 0.4 + bp * 0.6;
+          ts.buildMesh.position.y = ts.y + 1.5 * ts.buildMesh.scale.y;
+        }
+        if (playerBuildTimer <= 0) {
+          const sIdx = playerBuildingTurretIdx;
+          completeTurretBuild(sIdx);
+          playerBuildingTurretIdx = -1;
+          playerBuildTimer = 0;
+          SFX.buildComplete(0); // distance 0 = player is right there
+        }
+        return;
+      }
+
+      // ── Auto-deliver stone to nearest turret site ──
+      if (playerCarryingStone) {
+        for (let si = 0; si < turretSites.length; si++) {
+          const ts = turretSites[si];
+          const d2 = (ts.x - px) ** 2 + (ts.z - pz) ** 2;
+          if (d2 < PLAYER_DELIVER_RANGE * PLAYER_DELIVER_RANGE) {
+            // Deliver the stone
+            playerCarryingStone = false;
+            carriedStoneGroup.visible = false;
+            ts.rocksDelivered++;
+
+            // Create build mesh if not yet created (player is first to deliver)
+            if (!ts.buildMesh) {
+              const bm = new THREE.Mesh(
+                new THREE.CylinderGeometry(1.2, 1.5, 3.0, 8),
+                new THREE.MeshStandardMaterial({ color: 0x9a9a8a, flatShading: true, roughness: 0.9 })
+              );
+              bm.scale.y = 0.05;
+              bm.position.set(ts.x, ts.y + 0.08, ts.z);
+              bm.castShadow = true;
+              scene.add(bm);
+              ts.buildMesh = bm;
+            }
+
+            // Grow the placeholder
+            ts.buildMesh.scale.y = Math.min(1, 0.05 + ts.rocksDelivered / TURRET_ROCK_TRIPS * 0.4);
+            ts.buildMesh.position.y = ts.y + 1.5 * ts.buildMesh.scale.y;
+
+            if (ts.rocksDelivered >= TURRET_ROCK_TRIPS) {
+              // Enough rocks — player starts building
+              playerBuildingTurretIdx = si;
+              playerBuildTimer = PLAYER_BUILD_TIME;
+            }
+            break;
+          }
+        }
+      }
+
     }
 
     // ─────────────────────────────────────────
@@ -8982,6 +9157,7 @@
       updateChimneySmoke(dt);
       updateContamination(dt);
       updatePlayerAttack(dt);
+      updatePlayerStoneDelivery(dt);
       updateTurrets(dt);
 
       // Ghost cloud + player mesh visibility
