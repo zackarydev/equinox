@@ -2656,18 +2656,18 @@
     // Called when user taps a 3D object on mobile
     function handleTouchPick(screenX, screenY) {
       const hit = touchPick(screenX, screenY);
-      if (!hit) { touchTarget = null; return; }
+      if (!hit) { clearTouchTarget(); return; }
 
       const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
 
       if (hit.type === 'rock' && isDay && !ghostActive) {
-        if (depletedRocks.has(hit.index)) { touchTarget = null; return; }
-        if (playerCarryingStone) { touchTarget = null; return; }
+        if (depletedRocks.has(hit.index)) { clearTouchTarget(); return; }
+        if (playerCarryingStone) { clearTouchTarget(); return; }
         const rp = rockPositions[hit.index];
         touchTarget = { type: 'rock', index: hit.index, position: rp.clone() };
       } else if (hit.type === 'building' && isDay && !ghostActive) {
         const ba = buildingAttractors[hit.index];
-        if (!ba.contaminated || ba.destroyed) { touchTarget = null; return; }
+        if (!ba.contaminated || ba.destroyed) { clearTouchTarget(); return; }
         touchTarget = { type: 'building', index: hit.index, position: new THREE.Vector3(ba.x, ba.y, ba.z) };
       }
       // Future: add more types here (NPCs, farms, etc.)
@@ -2740,6 +2740,12 @@
     }
 
     // Update auto-walk toward touch target — called each frame
+    function clearTouchTarget() {
+      touchTarget = null;
+      touchMoveX = 0;
+      touchMoveY = 0;
+    }
+
     function updateTouchTarget(dt) {
       if (!touchTarget) return;
 
@@ -2750,11 +2756,11 @@
 
       // Validate target still exists
       if (touchTarget.type === 'rock' && depletedRocks.has(touchTarget.index)) {
-        touchTarget = null; return;
+        clearTouchTarget(); return;
       }
       if (touchTarget.type === 'building') {
         const ba = buildingAttractors[touchTarget.index];
-        if (!ba.contaminated || ba.destroyed) { touchTarget = null; return; }
+        if (!ba.contaminated || ba.destroyed) { clearTouchTarget(); return; }
       }
 
       const interactRange = touchTarget.type === 'rock' ? PLAYER_MINE_RANGE : CLEANSE_RANGE;
@@ -2762,7 +2768,7 @@
       if (dist < interactRange * 0.9) {
         // Close enough — trigger interaction
         mouseDown = true; // activates existing attack/mine logic
-        touchTarget = null;
+        clearTouchTarget();
         // Auto-release after a brief window to let the swing land
         setTimeout(() => { if (isTouchDevice) mouseDown = false; }, 600);
         return;
