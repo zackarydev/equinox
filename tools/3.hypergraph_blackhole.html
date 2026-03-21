@@ -492,36 +492,22 @@ function buildGraph(analysis, clusters, clusterNames, opts) {
       for (let j = i + 1; j < names.length; j++) {
         const a = functions.get(names[i]);
         const b = functions.get(names[j]);
-        let sharedWeight = 0;
-        let callWeight = 0;
-
-        // Count shared globals
-        const aState = new Set([...a.reads, ...a.writes, ...a.rw]);
-        const bState = new Set([...b.reads, ...b.writes, ...b.rw]);
-        for (const v of aState) { if (bState.has(v)) sharedWeight++; }
-
-        // Count calls
-        if (a.calls.has(names[j])) callWeight += 3;
-        if (b.calls.has(names[i])) callWeight += 3;
-
-        // Determine which edges to include based on mode
         let weight = 0;
         let type = 'shared';
-        if (edgeMode === 'shared-state') {
-          weight = sharedWeight;
-          type = 'shared';
-        } else if (edgeMode === 'calls') {
-          if (callWeight === 0) continue; // skip non-call edges entirely
-          weight = callWeight;
-          type = 'call';
-        } else { // both
-          weight = sharedWeight + callWeight;
-          type = callWeight > 0 ? 'call' : 'shared';
+
+        if (edgeMode === 'shared-state' || edgeMode === 'both') {
+          // Count shared globals
+          const aState = new Set([...a.reads, ...a.writes, ...a.rw]);
+          const bState = new Set([...b.reads, ...b.writes, ...b.rw]);
+          for (const v of aState) { if (bState.has(v)) weight++; }
         }
 
-        // For calls mode, always show if there's a call (don't filter by minShared)
-        const threshold = edgeMode === 'calls' ? 1 : minShared;
-        if (weight >= threshold) {
+        if (edgeMode === 'calls' || edgeMode === 'both') {
+          if (a.calls.has(names[j])) { weight += 3; type = 'call'; }
+          if (b.calls.has(names[i])) { weight += 3; type = 'call'; }
+        }
+
+        if (weight >= minShared) {
           links.push({ source: names[i], target: names[j], type, weight });
         }
       }
@@ -657,7 +643,7 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
     .force('link', d3.forceLink(links).id(d => d.id).distance(d => 100 / (d.weight || 1)).strength(d => Math.min(1.1, (d.weight || 1) * 0.15)))
     .force('charge', d3.forceManyBody().strength(-8).distanceMax(8))
     .force('center', d3.forceCenter(0, 0).strength(0.0))
-    .force('collision', d3.forceCollide(d => d.radius + 8).strength(0.7).iterations(10))
+    .force('collision', d3.forceCollide(d => d.radius + 2).strength(0.3).iterations(10))
     .force('cluster', clusterForce(nodes, clusters, clusterNames, 3))
     .force('clusterSep', clusterSeparationForce(nodes, clusters, baseRadius * 2))
     .force('viewport', viewportContainForce(nodes))
@@ -731,8 +717,8 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
     .attr('class', 'node')
     .call(d3.drag()
       .on('start', (e, d) => { if (!e.active) simulation.alphaTarget(0.1).restart(); d.fx = d.x; d.fy = d.y; startAttractor(d, graph); })
-      .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; d.x = e.x; d.y = e.y; if (attractorNode) renderPositions(); })
-      .on('end', (e, d) => { if (!attractorNode) { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; } lockAttractor(); })
+      .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
+      .on('end', (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; lockAttractor(); })
     );
 
   node.append('circle')
@@ -1091,102 +1077,110 @@ function selectNode(d, analysis) {
 }
 
 // ── Attractor (press-and-hold pull) ────────────────
-// Pure JS — stops d3 entirely, runs own animation loop.
-let attractorRAF = null;
+function makeAttractorForce(graph) {
+  return (alpha) => {
+    if (!attractorNode || attractorHoldStrength <= 0) return;
+    const tx = attractorNode.x;
+    const ty = attractorNode.y;
+    const adj = graph.adjacency;
+    const ew = graph.edgeWeights;
+    if (!adj) return;
 
-function renderPositions() {
-  // Same as d3 tick handler — sync SVG to data positions
-  gLinks.selectAll('.link')
-    .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
-    .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
-  gNodes.selectAll('.node')
-    .attr('transform', d => `translate(${d.x},${d.y})`);
-  const allNodes = gNodes.selectAll('.node').data();
-  gLabels.selectAll('text')
-    .attr('x', (d, i) => allNodes[i].x)
-    .attr('y', (d, i) => allNodes[i].y);
-}
+    const distances = bfsDistances(attractorNode.id, adj, 6);
+    const str = attractorHoldStrength;
 
-function attractorLoop() {
-  if (!attractorNode) return;
-  const holdMs = Date.now() - attractorStartTime;
-  attractorHoldStrength = Math.min(1, holdMs / 2000);
-  const str = attractorHoldStrength;
+    // Target orbit radii by hop distance
+    const hopTarget = [0, 4, 20, 36, 55, 78, 105];
 
-  const tx = attractorNode.x;
-  const ty = attractorNode.y;
-  const adj = currentGraph?.adjacency;
-  if (!adj) { attractorRAF = requestAnimationFrame(attractorLoop); return; }
+    for (const n of simulation.nodes()) {
+      if (n.id === attractorNode.id) continue;
+      const gDist = distances.get(n.id);
 
-  const neighbors = adj.get(attractorNode.id) || new Set();
+      const dx = tx - n.x;
+      const dy = ty - n.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
 
-  for (const n of simulation.nodes()) {
-    if (n.id === attractorNode.id) continue;
-    if (!neighbors.has(n.id)) continue;
+      if (gDist != null && gDist <= 6) {
+        // Connected node: spring to tight orbit shell
+        const w = gDist === 1 ? (ew.get(attractorNode.id + '\0' + n.id) || 1) : 1;
+        const baseR = n.radius + attractorNode.radius + 3;
+        const hopR = hopTarget[gDist] || (hopTarget[6] + (gDist - 6) * 30);
+        const targetDist = baseR + hopR + (gDist === 1 ? (6 / Math.max(1, w)) : 0);
 
-    const dx = tx - n.x;
-    const dy = ty - n.y;
-    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-
-    // Target distance: just outside touching + small gap
-    const targetDist = n.radius + attractorNode.radius + 12;
-    if (dist <= targetDist) continue;
-
-    // Lerp 15% of the way toward target distance each frame
-    const move = (dist - targetDist) * str * 0.15;
-    n.x += (dx / dist) * move;
-    n.y += (dy / dist) * move;
-  }
-
-  renderPositions();
-  attractorRAF = requestAnimationFrame(attractorLoop);
+        const displacement = dist - targetDist;
+        if (displacement > 0) {
+          const pull = str * Math.min(0.6, displacement * 0.01 + 0.15);
+          n.vx += (dx / dist) * pull * dist;
+          n.vy += (dy / dist) * pull * dist;
+        } else if (displacement < -2) {
+          const push = str * Math.min(0.3, -displacement * 0.005);
+          n.vx -= (dx / dist) * push * Math.abs(displacement);
+          n.vy -= (dy / dist) * push * Math.abs(displacement);
+        }
+      } else {
+        // Background node: strong repulsion
+        const repelRadius = 250 + str * 500;
+        if (dist < repelRadius) {
+          const t = 1 - dist / repelRadius;
+          const repel = str * 0.2 * t * t;
+          n.vx -= (dx / dist) * repel * dist;
+          n.vy -= (dy / dist) * repel * dist;
+        }
+      }
+    }
+  };
 }
 
 function startAttractor(d, graph) {
   attractorNode = d;
   attractorStartTime = Date.now();
-  attractorHoldStrength = 0;
   currentGraph = graph;
 
-  // Stop d3 completely
-  simulation.stop();
+  simulation.force('attractor', makeAttractorForce(graph));
+  simulation.alphaTarget(0.3).restart();
 
-  // Pin the held node at its current position
-  attractorNode.fx = attractorNode.x;
-  attractorNode.fy = attractorNode.y;
+  attractorInterval = setInterval(() => {
+    if (!attractorNode) return;
+    const holdMs = Date.now() - attractorStartTime;
+    attractorHoldStrength = Math.min(1, holdMs / 2500);
+    simulation.alpha(Math.max(simulation.alpha(), 0.3));
+  }, 30);
 
   gNodes.selectAll('.node').filter(n => n.id === d.id)
     .select('circle').classed('attractor-glow', true);
-
-  // Start our own animation loop
-  attractorRAF = requestAnimationFrame(attractorLoop);
 }
 
 function lockAttractor() {
   lastAttractorDuration = Date.now() - attractorStartTime;
 
-  // Stop our animation loop
-  if (attractorRAF) {
-    cancelAnimationFrame(attractorRAF);
-    attractorRAF = null;
+  if (attractorInterval) {
+    clearInterval(attractorInterval);
+    attractorInterval = null;
   }
 
-  // Short tap → release immediately
+  // Short tap (<300ms) → don't lock, just release
   if (lastAttractorDuration < 300) {
     releaseAttractor();
     return;
   }
 
-  // Lock: positions frozen, sim stays stopped
+  // Lock: keep forces active, stop ramping
   attractorLocked = true;
+  // Pin the attractor node so asymmetric forces don't drift the graph
+  attractorNode.fx = attractorNode.x;
+  attractorNode.fy = attractorNode.y;
+  // Stop simulation — positions are now frozen
+  simulation.alphaTarget(0);
+  simulation.alpha(0);
 }
 
 function releaseAttractor() {
-  if (attractorRAF) {
-    cancelAnimationFrame(attractorRAF);
-    attractorRAF = null;
+  if (attractorInterval) {
+    clearInterval(attractorInterval);
+    attractorInterval = null;
   }
 
+  // Unpin the node
   if (attractorNode) {
     attractorNode.fx = null;
     attractorNode.fy = null;
@@ -1198,7 +1192,8 @@ function releaseAttractor() {
   attractorHoldStrength = 0;
   attractorLocked = false;
 
-  // Restart d3
+  simulation.force('attractor', null);
+  simulation.alphaTarget(0);
   simulation.alpha(0.3).restart();
 }
 
