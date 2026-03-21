@@ -8,12 +8,6 @@
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { overflow: hidden; background: #000; }
     canvas { display: block; }
-    #info {
-      position: absolute; top: 16px; left: 16px;
-      color: #ccc; font-family: monospace; font-size: 13px;
-      pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,0.8);
-      line-height: 1.6;
-    }
     #time-indicator {
       position: absolute; top: 16px; right: 16px;
       color: #ccc; font-family: monospace; font-size: 13px;
@@ -45,6 +39,7 @@
       background: radial-gradient(ellipse at 50% 40%, #0a0a1e 0%, #000 70%);
       font-family: monospace; color: #bbc;
       transition: opacity 0.8s ease-out;
+      cursor: pointer;
     }
     #title-screen.hidden { opacity: 0; pointer-events: none; }
     #title-screen h1 {
@@ -60,17 +55,6 @@
       max-width: 480px; text-align: center; margin-top: 40px;
       font-size: 13px; line-height: 1.8; color: #889;
     }
-    #title-screen #play-btn {
-      margin-top: 48px; padding: 14px 48px;
-      background: none; border: 1px solid #5544aa;
-      color: #c8b8ff; font-family: monospace; font-size: 16px;
-      letter-spacing: 6px; cursor: pointer;
-      transition: border-color 0.3s, color 0.3s, box-shadow 0.3s;
-    }
-    #title-screen #play-btn:hover {
-      border-color: #8866ff; color: #e0d0ff;
-      box-shadow: 0 0 20px rgba(120,80,255,0.3);
-    }
     .game-hud { display: none; }
     .game-hud.visible { display: block; }
 
@@ -78,21 +62,10 @@
     .touch-controls { display: none; }
     .touch-only { display: none !important; }
 
-    /* Orientation warning overlay */
-    #orient-warn {
-      display: none; position: fixed; inset: 0; z-index: 9999;
-      background: rgba(0,0,0,0.92); color: #c8b8ff;
-      font-family: monospace; font-size: 18px;
-      flex-direction: column; align-items: center; justify-content: center;
-      text-align: center; gap: 16px;
-    }
-    #orient-warn .icon { font-size: 48px; }
-    #orient-warn .msg { max-width: 280px; line-height: 1.6; }
 
     @media (pointer: coarse) {
       .touch-controls { display: block; }
       .touch-only { display: block !important; }
-      #info { display: none !important; } /* hide keyboard controls HUD on touch */
 
       /* Virtual joystick zone (left side) */
       #touch-joystick-zone {
@@ -160,7 +133,6 @@
       .touch-hidden #touch-btn-turret { opacity: 0; pointer-events: none; transition: opacity 0.2s; }
       #touch-joystick-zone, #touch-btn-action,
       #touch-btn-jump, #touch-btn-turret { transition: opacity 0.2s; }
-      .touch-hidden #touch-btn-toggle { transform: scaleX(-1); }
 
       /* Ghost / night mode — hide everything, fullscreen becomes the control */
       .ghost-touch #touch-joystick-zone,
@@ -179,17 +151,12 @@
       #title-screen h1 { font-size: 36px; letter-spacing: 10px; }
       #title-screen .subtitle { font-size: 11px; letter-spacing: 3px; }
       #title-screen .lore { font-size: 12px; margin-top: 24px; max-width: 320px; padding: 0 16px; }
-      #title-screen #play-btn { padding: 16px 40px; font-size: 18px; }
 
       /* HUD adjustments */
       #time-indicator { font-size: 11px; top: 10px; right: 54px; }
       #moon-indicator { font-size: 11px; top: 28px; right: 54px; }
     }
 
-    /* Portrait orientation warning — only on touch + portrait */
-    @media (pointer: coarse) and (orientation: portrait) {
-      #orient-warn { display: flex; }
-    }
   </style>
 </head>
 <body>
@@ -202,19 +169,11 @@
       drifting between worlds, consuming wraiths,<br>
       and cleansing the corruption that creeps through the village.
     </div>
-    <button id="play-btn">PLAY</button>
-  </div>
-  <div id="info" class="game-hud">
-    WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Hold LMB — cleanse / mine &nbsp;|&nbsp; F — place turret<br>
-    1 Day / 2 Dusk / 3 Night / 4 Dawn &nbsp;|&nbsp; T — time &nbsp;|&nbsp; M — moon phase &nbsp;|&nbsp; G — smoke &nbsp;|&nbsp; V — wind debug &nbsp;|&nbsp; ↑↓ — wind layers &nbsp;|&nbsp; X — axis &nbsp;|&nbsp; B — collision boxes &nbsp;|&nbsp; P — paths
+    <div id="play-hint" style="margin-top: 48px; color: #556; font-family: monospace; font-size: 13px; letter-spacing: 4px;">click anywhere</div>
   </div>
   <div id="time-indicator" class="game-hud"></div>
   <div id="moon-indicator" class="game-hud"><canvas id="moon-hud" width="24" height="24"></canvas><span id="moon-text"></span></div>
   <!-- Touch controls (hidden on desktop via CSS) -->
-  <div id="orient-warn">
-    <div class="icon">📱↔️</div>
-    <div class="msg">Please rotate your device to landscape for the best experience</div>
-  </div>
   <div id="touch-joystick-zone" class="touch-controls">
     <div id="touch-joystick-base">
       <div id="touch-joystick-thumb"></div>
@@ -222,11 +181,11 @@
   </div>
   <div id="touch-look-zone" class="touch-controls"></div>
   <div id="touch-ghost-zone" class="touch-controls"></div>
-  <div id="touch-btn-action" class="touch-controls touch-btn">&#9678;</div>
-  <div id="touch-btn-jump" class="touch-controls touch-btn">&#8593;</div>
-  <div id="touch-btn-turret" class="touch-controls touch-btn">&#9650;</div>
-  <div id="touch-btn-toggle" class="touch-controls">&#x2039;</div>
-  <div id="touch-btn-fs" class="touch-controls touch-btn">&#x26F6;</div>
+  <div id="touch-btn-action" class="touch-controls touch-btn"></div>
+  <div id="touch-btn-jump" class="touch-controls touch-btn"></div>
+  <div id="touch-btn-turret" class="touch-controls touch-btn"></div>
+  <div id="touch-btn-toggle" class="touch-controls"></div>
+  <div id="touch-btn-fs" class="touch-controls touch-btn"></div>
 
   <canvas id="axis-hud" width="80" height="80"></canvas>
   <div id="axis-info"></div>
@@ -2611,7 +2570,8 @@
     // Title screen
     let gameStarted = false;
     const titleScreen = document.getElementById('title-screen');
-    document.getElementById('play-btn').addEventListener('click', () => {
+    titleScreen.addEventListener('click', () => {
+      if (gameStarted) return;
       gameStarted = true;
       titleScreen.classList.add('hidden');
       setTimeout(() => { titleScreen.style.display = 'none'; }, 800);
@@ -2811,8 +2771,8 @@
         }, { passive: false });
       }
 
-      // ── Override play button for touch (no pointer lock needed) ──
-      document.getElementById('play-btn').addEventListener('touchend', e => {
+      // ── Override title screen for touch (no pointer lock needed) ──
+      titleScreen.addEventListener('touchend', e => {
         // On touch, we skip pointer lock — touch look handles camera
         pointerLocked = false;
       });
