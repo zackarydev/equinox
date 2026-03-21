@@ -2673,6 +2673,72 @@
       // Future: add more types here (NPCs, farms, etc.)
     }
 
+    // ── Blue touch debug light — shows where touches land in the 3D scene ──
+    const touchDebugLights = []; // { light, sphere, age }
+    const TOUCH_DEBUG_DURATION = 1.2; // seconds before fade-out completes
+    const touchDebugRaycaster = new THREE.Raycaster();
+    const touchDebugNDC = new THREE.Vector2();
+
+    function spawnTouchDebugLight(screenX, screenY) {
+      // Raycast from screen coords into scene to find 3D position
+      touchDebugNDC.x = (screenX / window.innerWidth) * 2 - 1;
+      touchDebugNDC.y = -(screenY / window.innerHeight) * 2 + 1;
+      touchDebugRaycaster.setFromCamera(touchDebugNDC, camera);
+
+      // Try to intersect scene objects first
+      const ray = touchDebugRaycaster.ray;
+      let hitPos = null;
+
+      // Project ray onto terrain: find where ray hits y = terrainHeight(x,z)
+      // Use iterative approach along the ray
+      for (let t = 1; t < 200; t += 1.5) {
+        const p = ray.at(t, new THREE.Vector3());
+        const terrainY = getTerrainY(p.x, p.z);
+        if (p.y <= terrainY + 0.5) {
+          hitPos = new THREE.Vector3(p.x, terrainY + 0.3, p.z);
+          break;
+        }
+      }
+
+      if (!hitPos) return; // ray didn't hit terrain
+
+      // Create blue point light
+      const light = new THREE.PointLight(0x4488ff, 3, 15);
+      light.position.copy(hitPos);
+      light.position.y += 1.0;
+      scene.add(light);
+
+      // Create small glowing blue sphere as visual marker
+      const sphereGeo = new THREE.SphereGeometry(0.25, 8, 8);
+      const sphereMat = new THREE.MeshBasicMaterial({ color: 0x4488ff, transparent: true, opacity: 0.9 });
+      const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+      sphere.position.copy(hitPos);
+      sphere.position.y += 1.0;
+      scene.add(sphere);
+
+      touchDebugLights.push({ light, sphere, mat: sphereMat, age: 0 });
+    }
+
+    function updateTouchDebugLights(dt) {
+      for (let i = touchDebugLights.length - 1; i >= 0; i--) {
+        const d = touchDebugLights[i];
+        d.age += dt;
+        const t = d.age / TOUCH_DEBUG_DURATION;
+        if (t >= 1) {
+          scene.remove(d.light);
+          scene.remove(d.sphere);
+          d.sphere.geometry.dispose();
+          d.mat.dispose();
+          touchDebugLights.splice(i, 1);
+        } else {
+          // Fade out
+          const alpha = 1 - t;
+          d.light.intensity = 3 * alpha;
+          d.mat.opacity = 0.9 * alpha;
+        }
+      }
+    }
+
     // Update auto-walk toward touch target — called each frame
     function updateTouchTarget(dt) {
       if (!touchTarget) return;
@@ -2784,6 +2850,7 @@
           lookLastX = t.clientX; lookLastY = t.clientY;
           lookStartX = t.clientX; lookStartY = t.clientY;
           lookMoved = false;
+          spawnTouchDebugLight(t.clientX, t.clientY);
         }
       }, { passive: false });
       lookZone.addEventListener('touchmove', e => {
@@ -2850,6 +2917,7 @@
             startX: t.clientX, startY: t.clientY,
             lastX: t.clientX, lastY: t.clientY, moved: false
           };
+          spawnTouchDebugLight(t.clientX, t.clientY);
         }
       }, { passive: false });
 
@@ -9559,6 +9627,10 @@
       lastDayState = isDay;
       applyLighting(timeOfDay);
       updateTimeDisplay();
+
+      // Touch: auto-walk toward tapped target + debug lights
+      updateTouchTarget(dt);
+      updateTouchDebugLights(dt);
 
       // Player
       updatePlayer(dt);

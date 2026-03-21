@@ -49,14 +49,31 @@ body { background: #0a0a0f; color: #ccc; font-family: 'SF Mono', 'Fira Code', mo
   padding: 12px; font-size: 11px; text-align: right;
 }
 
+#focus-panel {
+  position: fixed; top: 50px; left: 50%; transform: translateX(-50%); z-index: 15;
+  background: #111118ee; border: 1px solid #3a3a50; border-radius: 8px;
+  padding: 10px 18px; font-size: 12px; max-width: 600px;
+  opacity: 0; transition: opacity 0.4s; pointer-events: none;
+}
+#focus-panel.active { opacity: 1; pointer-events: auto; }
+#focus-panel .focus-desc { color: #aab; margin-bottom: 6px; }
+#focus-panel .focus-step { color: #7af; font-weight: 600; }
+#focus-panel .focus-targets { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+#focus-panel .focus-tag {
+  display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px;
+  background: #1a1a2a; border: 1px solid #333;
+}
+#focus-panel .focus-tag.high { border-color: #7af; color: #7af; }
+#focus-panel .focus-tag.med { border-color: #5a8; color: #5a8; }
+#focus-panel .focus-tag.low { border-color: #555; color: #888; }
+.node circle.focus-glow { filter: drop-shadow(0 0 6px currentColor); }
+
 svg { position: fixed; top: 44px; left: 0; right: 0; bottom: 0; }
-.link { stroke-opacity: 0.3; }
-.link:hover { stroke-opacity: 0.8; }
-.node circle { cursor: pointer; stroke-width: 1.5; }
+.link { transition: stroke-opacity 0.2s, stroke-width 0.2s; }
+.link:hover { stroke-opacity: 0.8 !important; }
+.node circle { cursor: pointer; stroke-width: 1.5; transition: opacity 0.2s; }
 .node text { fill: #999; font-size: 10px; pointer-events: none; }
 .node.highlighted circle { stroke-width: 3; }
-.node.dimmed { opacity: 0.15; }
-.link.dimmed { opacity: 0.03; }
 .hull { fill-opacity: 0.04; stroke-opacity: 0.15; stroke-width: 1.5; }
 </style>
 </head>
@@ -94,6 +111,11 @@ svg { position: fixed; top: 44px; left: 0; right: 0; bottom: 0; }
   <div id="info-body"></div>
 </div>
 
+<div id="focus-panel">
+  <div class="focus-step"></div>
+  <div class="focus-desc"></div>
+  <div class="focus-targets"></div>
+</div>
 <div id="legend"></div>
 <div id="stats"></div>
 
@@ -514,13 +536,13 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
   const clusterMembers = new Map();
   for (const cid of clusterIds) clusterMembers.set(cid, nodes.filter(n => n.cluster === cid));
   // Place clusters in a circle, spacing based on member count
-  const baseRadius = Math.min(width, height) * 0.3 * Math.max(1, numClusters / 6);
+  const baseRadius = Math.min(width, height) * 0.15 * Math.max(1, numClusters / 8);
   clusterIds.forEach((cid, i) => {
     const angle = (2 * Math.PI * i) / numClusters - Math.PI / 2;
     const cx = Math.cos(angle) * baseRadius;
     const cy = Math.sin(angle) * baseRadius;
     const members = clusterMembers.get(cid);
-    const memberRadius = Math.sqrt(members.length) * 40;
+    const memberRadius = Math.sqrt(members.length) * 20;
     members.forEach((n, j) => {
       const a2 = (2 * Math.PI * j) / members.length;
       const r2 = memberRadius * (0.3 + 0.7 * Math.random());
@@ -538,14 +560,53 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
   // Simulation — light touch, just refine the pre-positioned layout
   if (simulation) simulation.stop();
   simulation = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(links).id(d => d.id).distance(d => 30 / (d.weight || 1)).strength(d => Math.min(0.4, (d.weight || 1) * 0.06)))
-    .force('charge', d3.forceManyBody().strength(-50).distanceMax(200))
-    .force('center', d3.forceCenter(0, 0).strength(0.02))
-    .force('collision', d3.forceCollide(d => d.radius + 30).strength(1).iterations(4))
+    .force('link', d3.forceLink(links).id(d => d.id).distance(d => 15 / (d.weight || 1)).strength(d => Math.min(0.6, (d.weight || 1) * 0.1)))
+    .force('charge', d3.forceManyBody().strength(-20).distanceMax(80))
+    .force('center', d3.forceCenter(0, 0).strength(0.08))
+    .force('collision', d3.forceCollide(d => d.radius + 6).strength(0.8).iterations(3))
     .force('cluster', clusterForce(nodes, clusters, clusterNames, 0.6))
-    .force('clusterSep', clusterSeparationForce(nodes, clusters, baseRadius * 0.6))
+    .force('clusterSep', clusterSeparationForce(nodes, clusters, baseRadius * 0.4))
     .alpha(0.5)
     .alphaDecay(0.03);
+
+  // Compute node degree for density-adaptive rendering
+  const nodeDegree = new Map();
+  for (const n of nodes) nodeDegree.set(n.id, 0);
+  for (const l of links) {
+    const sid = typeof l.source === 'object' ? l.source.id : l.source;
+    const tid = typeof l.target === 'object' ? l.target.id : l.target;
+    nodeDegree.set(sid, (nodeDegree.get(sid) || 0) + 1);
+    nodeDegree.set(tid, (nodeDegree.get(tid) || 0) + 1);
+  }
+  // Build adjacency list for BFS
+  const adjacency = new Map();
+  for (const n of nodes) adjacency.set(n.id, new Set());
+  for (const l of links) {
+    const sid = typeof l.source === 'object' ? l.source.id : l.source;
+    const tid = typeof l.target === 'object' ? l.target.id : l.target;
+    adjacency.get(sid).add(tid);
+    adjacency.get(tid).add(sid);
+  }
+  // Store on graph for highlight use
+  graph.nodeDegree = nodeDegree;
+  graph.adjacency = adjacency;
+
+  // Density-adaptive base opacity: edges between high-degree nodes fade
+  function baseEdgeOpacity(l) {
+    const sid = typeof l.source === 'object' ? l.source.id : l.source;
+    const tid = typeof l.target === 'object' ? l.target.id : l.target;
+    const maxDeg = Math.max(nodeDegree.get(sid) || 1, nodeDegree.get(tid) || 1);
+    // High connectivity → lower opacity (range: 0.08 for very dense, 0.4 for sparse)
+    return Math.max(0.08, 0.4 / Math.sqrt(maxDeg));
+  }
+  function baseEdgeWidth(l) {
+    const sid = typeof l.source === 'object' ? l.source.id : l.source;
+    const tid = typeof l.target === 'object' ? l.target.id : l.target;
+    const maxDeg = Math.max(nodeDegree.get(sid) || 1, nodeDegree.get(tid) || 1);
+    const w = 0.5 + (l.weight || 1) * 0.3;
+    // Thin out edges in dense hubs
+    return Math.min(3, w / Math.max(1, Math.sqrt(maxDeg) * 0.4));
+  }
 
   // Links
   const link = gLinks.selectAll('line')
@@ -553,7 +614,8 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
     .join('line')
     .attr('class', 'link')
     .attr('stroke', d => d.type === 'call' ? '#af6' : '#4a9eff')
-    .attr('stroke-width', d => Math.min(3, 0.5 + (d.weight || 1) * 0.3))
+    .attr('stroke-width', d => baseEdgeWidth(d))
+    .attr('stroke-opacity', d => baseEdgeOpacity(d))
     .attr('stroke-dasharray', d => d.type === 'uses' ? '3,3' : null);
 
   // Nodes
@@ -717,31 +779,109 @@ function clusterSeparationForce(nodes, clusters, minDist) {
   };
 }
 
-function highlightNeighbors(d, graph) {
-  const neighbors = new Set();
-  neighbors.add(d.id);
-  graph.links.forEach(l => {
-    const sid = typeof l.source === 'object' ? l.source.id : l.source;
-    const tid = typeof l.target === 'object' ? l.target.id : l.target;
-    if (sid === d.id) neighbors.add(tid);
-    if (tid === d.id) neighbors.add(sid);
-  });
+// BFS from a node, returns Map<nodeId, distance>
+function bfsDistances(startId, adjacency, maxDepth) {
+  const dist = new Map();
+  dist.set(startId, 0);
+  const queue = [startId];
+  while (queue.length) {
+    const cur = queue.shift();
+    const d = dist.get(cur);
+    if (d >= maxDepth) continue;
+    for (const nb of (adjacency.get(cur) || [])) {
+      if (!dist.has(nb)) {
+        dist.set(nb, d + 1);
+        queue.push(nb);
+      }
+    }
+  }
+  return dist;
+}
 
-  gNodes.selectAll('.node').classed('dimmed', n => !neighbors.has(n.id));
-  gLinks.selectAll('.link').classed('dimmed', l => {
-    const sid = typeof l.source === 'object' ? l.source.id : l.source;
-    const tid = typeof l.target === 'object' ? l.target.id : l.target;
-    return !neighbors.has(sid) || !neighbors.has(tid);
-  });
-  gLabels.selectAll('text').attr('opacity', (n, i) => {
-    const nodes = gNodes.selectAll('.node').data();
-    return neighbors.has(nodes[i]?.id) ? 1 : 0.1;
+function highlightNeighbors(d, graph) {
+  const adj = graph.adjacency;
+  if (!adj) return;
+  const distances = bfsDistances(d.id, adj, 3);
+
+  // Nodes: opacity by distance (0=full, 1=strong, 2=medium, 3+=faint, unreachable=very faint)
+  const nodeOpacity = dist => {
+    if (dist === 0) return 1;
+    if (dist === 1) return 1;
+    if (dist === 2) return 0.35;
+    if (dist === 3) return 0.12;
+    return 0.06;
+  };
+
+  gNodes.selectAll('.node')
+    .style('opacity', n => nodeOpacity(distances.has(n.id) ? distances.get(n.id) : 99));
+
+  // Edges: visible if both endpoints are within range, opacity by max distance of endpoints
+  gLinks.selectAll('.link')
+    .attr('stroke-opacity', l => {
+      const sid = typeof l.source === 'object' ? l.source.id : l.source;
+      const tid = typeof l.target === 'object' ? l.target.id : l.target;
+      const sd = distances.has(sid) ? distances.get(sid) : 99;
+      const td = distances.has(tid) ? distances.get(tid) : 99;
+      const maxD = Math.max(sd, td);
+      if (maxD === 0) return 0.8;
+      if (maxD === 1) return 0.6;
+      if (maxD === 2) return 0.15;
+      return 0.02;
+    })
+    .attr('stroke-width', l => {
+      const sid = typeof l.source === 'object' ? l.source.id : l.source;
+      const tid = typeof l.target === 'object' ? l.target.id : l.target;
+      const sd = distances.has(sid) ? distances.get(sid) : 99;
+      const td = distances.has(tid) ? distances.get(tid) : 99;
+      const maxD = Math.max(sd, td);
+      if (maxD <= 1) return Math.min(3, 1 + (l.weight || 1) * 0.4);
+      return Math.min(2, 0.3 + (l.weight || 1) * 0.15);
+    });
+
+  gLabels.selectAll('text').attr('opacity', (_, i) => {
+    const allNodes = gNodes.selectAll('.node').data();
+    const nid = allNodes[i]?.id;
+    const dist = distances.has(nid) ? distances.get(nid) : 99;
+    return dist <= 1 ? 1 : dist <= 2 ? 0.3 : 0.05;
   });
 }
 
 function clearHighlight() {
-  gNodes.selectAll('.node').classed('dimmed', false);
-  gLinks.selectAll('.link').classed('dimmed', false);
+  gNodes.selectAll('.node').style('opacity', 1);
+  // Restore density-adaptive base opacity
+  gLinks.selectAll('.link').each(function(d) {
+    const el = d3.select(this);
+    const sid = typeof d.source === 'object' ? d.source.id : d.source;
+    const tid = typeof d.target === 'object' ? d.target.id : d.target;
+    const graph = el.datum();
+    // Recalc from degree — stored on the line's parent graph context
+    el.attr('stroke-opacity', null).attr('stroke-width', null);
+  });
+  // Simpler: just rebuild opacity from stored data
+  const allLinks = gLinks.selectAll('.link');
+  const allNodes = gNodes.selectAll('.node').data();
+  const degMap = new Map();
+  allNodes.forEach(n => degMap.set(n.id, 0));
+  allLinks.each(l => {
+    const sid = typeof l.source === 'object' ? l.source.id : l.source;
+    const tid = typeof l.target === 'object' ? l.target.id : l.target;
+    degMap.set(sid, (degMap.get(sid) || 0) + 1);
+    degMap.set(tid, (degMap.get(tid) || 0) + 1);
+  });
+  allLinks
+    .attr('stroke-opacity', l => {
+      const sid = typeof l.source === 'object' ? l.source.id : l.source;
+      const tid = typeof l.target === 'object' ? l.target.id : l.target;
+      const maxDeg = Math.max(degMap.get(sid) || 1, degMap.get(tid) || 1);
+      return Math.max(0.08, 0.4 / Math.sqrt(maxDeg));
+    })
+    .attr('stroke-width', l => {
+      const sid = typeof l.source === 'object' ? l.source.id : l.source;
+      const tid = typeof l.target === 'object' ? l.target.id : l.target;
+      const maxDeg = Math.max(degMap.get(sid) || 1, degMap.get(tid) || 1);
+      const w = 0.5 + (l.weight || 1) * 0.3;
+      return Math.min(3, w / Math.max(1, Math.sqrt(maxDeg) * 0.4));
+    });
   gLabels.selectAll('text').attr('opacity', 1);
 }
 
@@ -835,6 +975,136 @@ document.getElementById('graph').addEventListener('click', e => {
   }
 });
 
+// ── Claude Focus (SSE) ─────────────────────────────
+let currentFocus = null;
+
+function connectFocusSSE() {
+  const sseUrl = location.origin + '/focus-events';
+  const source = new EventSource(sseUrl);
+
+  source.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.timestamp && Date.now() - data.timestamp > 30000) {
+        applyFocus(null);
+      } else {
+        applyFocus(data);
+      }
+    } catch {
+      applyFocus(null);
+    }
+  };
+
+  source.onerror = () => {
+    // Server not running — silent degrade, retry is automatic with EventSource
+    document.getElementById('focus-panel').classList.remove('active');
+  };
+}
+
+function applyFocus(data) {
+  const panel = document.getElementById('focus-panel');
+  currentFocus = data;
+
+  if (!data || !data.focus || data.focus.length === 0) {
+    panel.classList.remove('active');
+    // Restore default view
+    if (gNodes) {
+      gNodes.selectAll('.node').style('opacity', 1);
+      gNodes.selectAll('circle').classed('focus-glow', false);
+      clearHighlight();
+    }
+    return;
+  }
+
+  // Update panel
+  panel.classList.add('active');
+  panel.querySelector('.focus-step').textContent = data.step || '';
+  panel.querySelector('.focus-desc').textContent = data.description || '';
+
+  const tagsHtml = data.focus.map(f => {
+    const level = f.relevance >= 0.7 ? 'high' : f.relevance >= 0.4 ? 'med' : 'low';
+    return `<span class="focus-tag ${level}">${f.name} ${(f.relevance * 100)|0}%</span>`;
+  }).join('');
+  panel.querySelector('.focus-targets').innerHTML = tagsHtml;
+
+  // Build relevance map: named targets + BFS expansion
+  if (!gNodes || !gLinks) return;
+  const relevanceMap = new Map(); // nodeId → relevance [0-1]
+  for (const f of data.focus) {
+    relevanceMap.set(f.name, f.relevance);
+  }
+
+  // Expand via adjacency: neighbors of focused nodes get diminished relevance
+  const allNodes = gNodes.selectAll('.node').data();
+  const adj = new Map();
+  allNodes.forEach(n => adj.set(n.id, new Set()));
+  if (gLinks) {
+    gLinks.selectAll('.link').each(l => {
+      const sid = typeof l.source === 'object' ? l.source.id : l.source;
+      const tid = typeof l.target === 'object' ? l.target.id : l.target;
+      if (adj.has(sid)) adj.get(sid).add(tid);
+      if (adj.has(tid)) adj.get(tid).add(sid);
+    });
+  }
+
+  // BFS spread: each hop reduces relevance by 0.4x
+  const queue = [...data.focus.map(f => ({ id: f.name, rel: f.relevance, depth: 0 }))];
+  const visited = new Set(data.focus.map(f => f.name));
+  while (queue.length) {
+    const { id, rel, depth } = queue.shift();
+    if (depth >= 3) continue;
+    for (const nb of (adj.get(id) || [])) {
+      if (!visited.has(nb)) {
+        visited.add(nb);
+        const spreadRel = rel * 0.4;
+        if (spreadRel > (relevanceMap.get(nb) || 0)) {
+          relevanceMap.set(nb, spreadRel);
+        }
+        queue.push({ id: nb, rel: spreadRel, depth: depth + 1 });
+      }
+    }
+  }
+
+  // Apply to nodes
+  gNodes.selectAll('.node')
+    .style('opacity', d => {
+      const r = relevanceMap.get(d.id);
+      return r != null ? 0.3 + r * 0.7 : 0.06;
+    });
+  gNodes.selectAll('circle')
+    .classed('focus-glow', d => (relevanceMap.get(d.id) || 0) >= 0.7);
+
+  // Apply to edges
+  gLinks.selectAll('.link')
+    .attr('stroke-opacity', l => {
+      const sid = typeof l.source === 'object' ? l.source.id : l.source;
+      const tid = typeof l.target === 'object' ? l.target.id : l.target;
+      const sr = relevanceMap.get(sid) || 0;
+      const tr = relevanceMap.get(tid) || 0;
+      const minR = Math.min(sr, tr);
+      if (minR >= 0.5) return 0.7;
+      if (minR >= 0.2) return 0.25;
+      if (minR > 0) return 0.08;
+      return 0.015;
+    })
+    .attr('stroke-width', l => {
+      const sid = typeof l.source === 'object' ? l.source.id : l.source;
+      const tid = typeof l.target === 'object' ? l.target.id : l.target;
+      const sr = relevanceMap.get(sid) || 0;
+      const tr = relevanceMap.get(tid) || 0;
+      const minR = Math.min(sr, tr);
+      if (minR >= 0.5) return Math.min(4, 1.5 + (l.weight || 1) * 0.5);
+      return Math.min(2, 0.3 + (l.weight || 1) * 0.15);
+    });
+
+  // Labels
+  gLabels.selectAll('text').attr('opacity', (_, i) => {
+    const n = allNodes[i];
+    const r = n ? (relevanceMap.get(n.id) || 0) : 0;
+    return r >= 0.5 ? 1 : r >= 0.2 ? 0.4 : 0.04;
+  });
+}
+
 // ── Main Loop ──────────────────────────────────────
 async function loadAndAnalyze() {
   const statusEl = document.getElementById('status');
@@ -870,6 +1140,7 @@ window.addEventListener('resize', () => {
 
 loadAndAnalyze();
 setInterval(loadAndAnalyze, REFRESH_MS);
+connectFocusSSE();
 </script>
 </body>
 </html>
