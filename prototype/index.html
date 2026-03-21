@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>ECLIPSED — Phase Pre-0 Prototype</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -73,6 +73,90 @@
     }
     .game-hud { display: none; }
     .game-hud.visible { display: block; }
+
+    /* ── Touch / Mobile ── */
+    .touch-controls { display: none; }
+    .touch-only { display: none !important; }
+
+    /* Orientation warning overlay */
+    #orient-warn {
+      display: none; position: fixed; inset: 0; z-index: 9999;
+      background: rgba(0,0,0,0.92); color: #c8b8ff;
+      font-family: monospace; font-size: 18px;
+      flex-direction: column; align-items: center; justify-content: center;
+      text-align: center; gap: 16px;
+    }
+    #orient-warn .icon { font-size: 48px; }
+    #orient-warn .msg { max-width: 280px; line-height: 1.6; }
+
+    @media (pointer: coarse) {
+      .touch-controls { display: block; }
+      .touch-only { display: block !important; }
+      #info { display: none !important; } /* hide keyboard controls HUD on touch */
+
+      /* Virtual joystick zone (left side) */
+      #touch-joystick-zone {
+        position: fixed; left: 0; bottom: 0;
+        width: 45vw; height: 50vh;
+        z-index: 50; touch-action: none;
+      }
+      #touch-joystick-base {
+        position: absolute; left: 24px; bottom: 32px;
+        width: 120px; height: 120px; border-radius: 50%;
+        background: rgba(200,184,255,0.12); border: 2px solid rgba(200,184,255,0.25);
+        pointer-events: none;
+      }
+      #touch-joystick-thumb {
+        position: absolute; left: 60px; top: 60px;
+        width: 48px; height: 48px; border-radius: 50%;
+        background: rgba(200,184,255,0.35);
+        transform: translate(-50%, -50%);
+        pointer-events: none; transition: none;
+      }
+
+      /* Look area (right side, covers most of screen) */
+      #touch-look-zone {
+        position: fixed; right: 0; top: 0;
+        width: 55vw; height: 100vh;
+        z-index: 49; touch-action: none;
+      }
+
+      /* Action buttons (right side, bottom) */
+      .touch-btn {
+        position: fixed; z-index: 51; touch-action: none;
+        width: 64px; height: 64px; border-radius: 50%;
+        background: rgba(200,184,255,0.15); border: 2px solid rgba(200,184,255,0.3);
+        color: #c8b8ff; font-family: monospace; font-size: 11px;
+        display: flex; align-items: center; justify-content: center;
+        text-align: center; line-height: 1.2;
+        user-select: none; -webkit-user-select: none;
+      }
+      .touch-btn.active { background: rgba(200,184,255,0.35); border-color: rgba(200,184,255,0.6); }
+      #touch-btn-action { right: 24px; bottom: 32px; width: 80px; height: 80px; font-size: 12px; }
+      #touch-btn-jump   { right: 116px; bottom: 56px; }
+      #touch-btn-turret { right: 24px; bottom: 124px; }
+      #touch-btn-fs     { position: fixed; top: 12px; right: 12px; z-index: 51;
+                          width: 36px; height: 36px; border-radius: 6px;
+                          background: rgba(200,184,255,0.1); border: 1px solid rgba(200,184,255,0.2);
+                          color: #c8b8ff; font-family: monospace; font-size: 16px;
+                          display: none; align-items: center; justify-content: center;
+                          touch-action: none; user-select: none; -webkit-user-select: none; }
+
+      /* Title screen adjustments for mobile */
+      #title-screen h1 { font-size: 36px; letter-spacing: 10px; }
+      #title-screen .subtitle { font-size: 11px; letter-spacing: 3px; }
+      #title-screen .lore { font-size: 12px; margin-top: 24px; max-width: 320px; padding: 0 16px; }
+      #title-screen #play-btn { padding: 16px 40px; font-size: 18px; }
+
+      /* HUD adjustments */
+      #time-indicator { font-size: 11px; top: 10px; right: 54px; }
+      #moon-indicator { font-size: 11px; top: 28px; right: 54px; }
+    }
+
+    /* Portrait orientation warning — only on touch + portrait */
+    @media (pointer: coarse) and (orientation: portrait) {
+      #orient-warn { display: flex; }
+    }
   </style>
 </head>
 <body>
@@ -93,6 +177,22 @@
   </div>
   <div id="time-indicator" class="game-hud"></div>
   <div id="moon-indicator" class="game-hud"><canvas id="moon-hud" width="24" height="24"></canvas><span id="moon-text"></span></div>
+  <!-- Touch controls (hidden on desktop via CSS) -->
+  <div id="orient-warn">
+    <div class="icon">📱↔️</div>
+    <div class="msg">Please rotate your device to landscape for the best experience</div>
+  </div>
+  <div id="touch-joystick-zone" class="touch-controls">
+    <div id="touch-joystick-base">
+      <div id="touch-joystick-thumb"></div>
+    </div>
+  </div>
+  <div id="touch-look-zone" class="touch-controls"></div>
+  <div id="touch-btn-action" class="touch-controls touch-btn">HOLD<br>ACT</div>
+  <div id="touch-btn-jump" class="touch-controls touch-btn">JUMP</div>
+  <div id="touch-btn-turret" class="touch-controls touch-btn">TUR-<br>RET</div>
+  <div id="touch-btn-fs" class="touch-controls touch-btn">⛶</div>
+
   <canvas id="axis-hud" width="80" height="80"></canvas>
   <div id="axis-info"></div>
 
@@ -2373,6 +2473,12 @@
     let   cameraPitch     = CAMERA_ANGLE;
 
     function updateCamera() {
+      // Apply touch look deltas (consumed each frame)
+      if (touchLookDX !== 0 || touchLookDY !== 0) {
+        cameraYaw   -= touchLookDX * 0.004;
+        cameraPitch  = Math.max(-0.3, Math.min(Math.PI / 2 - 0.05, cameraPitch + touchLookDY * 0.004));
+        touchLookDX = 0; touchLookDY = 0;
+      }
       const offset = new THREE.Vector3(
         Math.sin(cameraYaw) * Math.cos(cameraPitch) * CAMERA_DIST,
         Math.sin(cameraPitch) * CAMERA_DIST,
@@ -2459,6 +2565,7 @@
     // ─────────────────────────────────────────
     //  INPUT
     // ─────────────────────────────────────────
+    const isTouchDevice = matchMedia('(pointer: coarse)').matches;
     const keys = {};
     window.addEventListener('keydown', e => {
       keys[e.key.toLowerCase()] = true;
@@ -2474,7 +2581,7 @@
       titleScreen.classList.add('hidden');
       setTimeout(() => { titleScreen.style.display = 'none'; }, 800);
       document.querySelectorAll('.game-hud').forEach(el => el.classList.add('visible'));
-      renderer.domElement.requestPointerLock();
+      if (!isTouchDevice) renderer.domElement.requestPointerLock();
       if (!SFX.initialized) SFX.init();
     });
 
@@ -2482,7 +2589,7 @@
     let pointerLocked = false;
     renderer.domElement.addEventListener('click', () => {
       if (!gameStarted) return;
-      renderer.domElement.requestPointerLock();
+      if (!isTouchDevice) renderer.domElement.requestPointerLock();
       if (!SFX.initialized) SFX.init();
     });
     document.addEventListener('pointerlockchange', () => {
@@ -2498,6 +2605,135 @@
     let mouseDown = false;
     document.addEventListener('mousedown', e => { if (e.button === 0 && pointerLocked) mouseDown = true; });
     document.addEventListener('mouseup', e => { if (e.button === 0) mouseDown = false; });
+
+    // ─────────────────────────────────────────
+    //  TOUCH / MOBILE INPUT
+    // ─────────────────────────────────────────
+    // Virtual joystick state (normalized -1..1)
+    let touchMoveX = 0, touchMoveY = 0;
+    // Touch look delta (accumulated per frame, consumed each frame)
+    let touchLookDX = 0, touchLookDY = 0;
+
+    if (isTouchDevice) {
+      // ── Joystick ──
+      const jZone  = document.getElementById('touch-joystick-zone');
+      const jBase  = document.getElementById('touch-joystick-base');
+      const jThumb = document.getElementById('touch-joystick-thumb');
+      let jTouchId = null;
+      let jCenterX = 0, jCenterY = 0;
+      const J_RADIUS = 50; // max displacement in px
+
+      function jStart(t) {
+        jTouchId = t.identifier;
+        const rect = jBase.getBoundingClientRect();
+        jCenterX = rect.left + rect.width / 2;
+        jCenterY = rect.top + rect.height / 2;
+        jMove(t);
+      }
+      function jMove(t) {
+        let dx = t.clientX - jCenterX;
+        let dy = t.clientY - jCenterY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > J_RADIUS) { dx *= J_RADIUS / dist; dy *= J_RADIUS / dist; }
+        jThumb.style.left  = (60 + dx) + 'px';
+        jThumb.style.top   = (60 + dy) + 'px';
+        touchMoveX = dx / J_RADIUS;  // -1 left .. +1 right
+        touchMoveY = -dy / J_RADIUS; // -1 back .. +1 forward (screen Y is inverted)
+      }
+      function jEnd() {
+        jTouchId = null;
+        jThumb.style.left = '60px';
+        jThumb.style.top  = '60px';
+        touchMoveX = 0; touchMoveY = 0;
+      }
+
+      jZone.addEventListener('touchstart', e => {
+        e.preventDefault();
+        if (jTouchId === null) jStart(e.changedTouches[0]);
+      }, { passive: false });
+      jZone.addEventListener('touchmove', e => {
+        e.preventDefault();
+        for (const t of e.changedTouches) { if (t.identifier === jTouchId) jMove(t); }
+      }, { passive: false });
+      jZone.addEventListener('touchend', e => {
+        for (const t of e.changedTouches) { if (t.identifier === jTouchId) jEnd(); }
+      });
+      jZone.addEventListener('touchcancel', e => {
+        for (const t of e.changedTouches) { if (t.identifier === jTouchId) jEnd(); }
+      });
+
+      // ── Look area (right side of screen) ──
+      const lookZone = document.getElementById('touch-look-zone');
+      let lookTouchId = null, lookLastX = 0, lookLastY = 0;
+
+      lookZone.addEventListener('touchstart', e => {
+        e.preventDefault();
+        if (lookTouchId === null) {
+          const t = e.changedTouches[0];
+          lookTouchId = t.identifier;
+          lookLastX = t.clientX; lookLastY = t.clientY;
+        }
+      }, { passive: false });
+      lookZone.addEventListener('touchmove', e => {
+        e.preventDefault();
+        for (const t of e.changedTouches) {
+          if (t.identifier === lookTouchId) {
+            touchLookDX += (t.clientX - lookLastX);
+            touchLookDY += (t.clientY - lookLastY);
+            lookLastX = t.clientX; lookLastY = t.clientY;
+          }
+        }
+      }, { passive: false });
+      lookZone.addEventListener('touchend', e => {
+        for (const t of e.changedTouches) { if (t.identifier === lookTouchId) lookTouchId = null; }
+      });
+      lookZone.addEventListener('touchcancel', e => {
+        for (const t of e.changedTouches) { if (t.identifier === lookTouchId) lookTouchId = null; }
+      });
+
+      // ── Action button (hold = mouseDown) ──
+      const actBtn = document.getElementById('touch-btn-action');
+      actBtn.addEventListener('touchstart', e => { e.preventDefault(); mouseDown = true;  actBtn.classList.add('active'); }, { passive: false });
+      actBtn.addEventListener('touchend',   e => { mouseDown = false; actBtn.classList.remove('active'); });
+      actBtn.addEventListener('touchcancel', e => { mouseDown = false; actBtn.classList.remove('active'); });
+
+      // ── Jump button (space key) ──
+      const jumpBtn = document.getElementById('touch-btn-jump');
+      jumpBtn.addEventListener('touchstart', e => { e.preventDefault(); keys[' '] = true;  jumpBtn.classList.add('active'); }, { passive: false });
+      jumpBtn.addEventListener('touchend',   e => { keys[' '] = false; jumpBtn.classList.remove('active'); });
+      jumpBtn.addEventListener('touchcancel', e => { keys[' '] = false; jumpBtn.classList.remove('active'); });
+
+      // ── Turret button (F key) ──
+      const turBtn = document.getElementById('touch-btn-turret');
+      turBtn.addEventListener('touchstart', e => { e.preventDefault(); placeTurretSite(); turBtn.classList.add('active'); }, { passive: false });
+      turBtn.addEventListener('touchend',   e => { turBtn.classList.remove('active'); });
+      turBtn.addEventListener('touchcancel', e => { turBtn.classList.remove('active'); });
+
+      // ── Fullscreen button ──
+      const fsBtn = document.getElementById('touch-btn-fs');
+      if (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen) {
+        fsBtn.style.display = 'flex';
+        fsBtn.addEventListener('touchstart', e => {
+          e.preventDefault();
+          const el = document.documentElement;
+          if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+            (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+          } else {
+            (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+          }
+        }, { passive: false });
+      }
+
+      // ── Override play button for touch (no pointer lock needed) ──
+      document.getElementById('play-btn').addEventListener('touchend', e => {
+        // On touch, we skip pointer lock — touch look handles camera
+        pointerLocked = false;
+      });
+
+      // ── Prevent default touch behaviors on canvas ──
+      renderer.domElement.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+      renderer.domElement.addEventListener('touchmove',  e => e.preventDefault(), { passive: false });
+    }
 
     // ─────────────────────────────────────────
     //  PROCEDURAL AUDIO ENGINE
@@ -3632,6 +3868,12 @@
       if (keys['s']) input.sub(forward);
       if (keys['a']) input.sub(right);
       if (keys['d']) input.add(right);
+
+      // Touch joystick input (adds to keyboard input)
+      if (touchMoveX !== 0 || touchMoveY !== 0) {
+        input.add(forward.clone().multiplyScalar(touchMoveY));
+        input.add(right.clone().multiplyScalar(touchMoveX));
+      }
 
       // Frame-rate independent smoothing factor
       const accelSmooth = 1 - Math.pow(0.001, dt);
@@ -9190,21 +9432,16 @@
     // ─────────────────────────────────────────
     //  RESIZE
     // ─────────────────────────────────────────
-    window.addEventListener('resize', () => {
+    function handleResize() {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
       _deferredColorTarget.setSize(window.innerWidth, window.innerHeight);
       _lightAccumMat.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
-    });
-
-    // Start
-    animate();
-  </script>
-</body>
-</html>
-tion.value.set(window.innerWidth, window.innerHeight);
-    });
+    }
+    window.addEventListener('resize', handleResize);
+    // Some mobile browsers need orientationchange as well
+    window.addEventListener('orientationchange', () => { setTimeout(handleResize, 150); });
 
     // Start
     animate();
