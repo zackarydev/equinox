@@ -630,17 +630,14 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
   // Simulation — tight layout, strong clustering
   if (simulation) simulation.stop();
   simulation = d3.forceSimulation(nodes)
-    .force('link', d3.forceLink(links).id(d => d.id).distance(d => 12 / (d.weight || 1)).strength(d => Math.min(0.8, (d.weight || 1) * 0.15)))
-    .force('charge', d3.forceManyBody().strength(-8).distanceMax(1))
+    .force('link', d3.forceLink(links).id(d => d.id).distance(d => 8 / (d.weight || 1)).strength(d => Math.min(0.8, (d.weight || 1) * 0.15)))
+    .force('charge', d3.forceManyBody().strength(-8).distanceMax(40))
     .force('center', d3.forceCenter(0, 0).strength(0.0))
-    .force('collision', d3.forceCollide(d => d.radius + 2).strength(0.3).iterations(2))
-    .force('cluster', clusterForce(nodes, clusters, clusterNames, 5))
-    .force('clusterSep', clusterSeparationForce(nodes, clusters, baseRadius * 2))
-    .alpha(0.2)
-    .alphaDecay(0.4);
-    /**
-     * Alpha = 0 creates spherical layout
-     */
+    .force('collision', d3.forceCollide(d => d.radius + 2).strength(0.3).iterations(10))
+    .force('cluster', clusterForce(nodes, clusters, clusterNames, 0.8))
+    .force('clusterSep', clusterSeparationForce(nodes, clusters, baseRadius))
+    .alpha(0.5)
+    .alphaDecay(0.04);
 
   // Compute node degree for density-adaptive rendering
   const nodeDegree = new Map();

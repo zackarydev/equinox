@@ -34,6 +34,7 @@ SECTION_RULES = [
     ("Night / Combat", r"Wraith|wraith|AshenPower|GhostPower|nightMob|updateNightMob|ghostCloud|updateGhostCloud|curlNoise|initGhostBlob|_smkCell|_rebuildSmoke|_smokeNearby"),
     ("Contamination", r"contaminate|decontaminate|updateContamination|removeOneVine"),
     ("Turrets", r"[Tt]urret|[Zz]ap"),
+    ("Controls / Touch", r"touch|Touch|handleResize|jStart|jMove|jEnd|pointer|joystick"),
     ("Main Loop", r"^animate$"),
     ("Debug", r"[Dd]ebug|buildCollision|buildFaceDebug|windDebug"),
 ]
