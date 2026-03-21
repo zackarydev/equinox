@@ -67,10 +67,18 @@
       .touch-controls { display: block; }
       .touch-only { display: block !important; }
 
-      /* Virtual joystick zone (left side) */
+      /* Look zone — fullscreen, BEHIND joystick & buttons so it catches all
+         touches that don't land on a control. This fixes portrait-mode taps
+         on the left side of the screen being swallowed by the joystick zone. */
+      #touch-look-zone {
+        position: fixed; inset: 0;
+        z-index: 48; touch-action: none;
+      }
+
+      /* Virtual joystick zone — compact, just around the stick graphic */
       #touch-joystick-zone {
         position: fixed; left: 0; bottom: 0;
-        width: 45vw; height: 50vh;
+        width: 170px; height: 180px;
         z-index: 50; touch-action: none;
       }
       #touch-joystick-base {
@@ -87,31 +95,25 @@
         pointer-events: none; transition: none;
       }
 
-      /* Look area (right side, covers most of screen) */
-      #touch-look-zone {
-        position: fixed; right: 0; top: 0;
-        width: 55vw; height: 100vh;
-        z-index: 49; touch-action: none;
-      }
-
-      /* Action buttons (right side, bottom) */
+      /* Action buttons */
       .touch-btn {
         position: fixed; z-index: 51; touch-action: none;
-        width: 64px; height: 64px; border-radius: 50%;
-        background: rgba(200,184,255,0.15); border: 2px solid rgba(200,184,255,0.3);
-        color: #c8b8ff; font-family: monospace; font-size: 11px;
+        width: 56px; height: 56px; border-radius: 50%;
+        background: rgba(200,184,255,0.12); border: 2px solid rgba(200,184,255,0.25);
+        color: #c8b8ff;
         display: flex; align-items: center; justify-content: center;
-        text-align: center; line-height: 1.2;
+        text-align: center;
         user-select: none; -webkit-user-select: none;
+        font-size: 24px; line-height: 1;
       }
       .touch-btn.active { background: rgba(200,184,255,0.35); border-color: rgba(200,184,255,0.6); }
-      #touch-btn-action { right: 24px; bottom: 32px; width: 72px; height: 72px; font-size: 20px; }
-      #touch-btn-jump   { right: 108px; bottom: 52px; font-size: 16px; }
-      #touch-btn-turret { right: 24px; bottom: 116px; font-size: 18px; }
+      #touch-btn-action { right: 24px; bottom: 32px; width: 64px; height: 64px; font-size: 28px; }
+      #touch-btn-jump   { right: 100px; bottom: 48px; font-size: 22px; }
+      #touch-btn-turret { right: 24px; bottom: 108px; font-size: 22px; }
       #touch-btn-fs     { position: fixed; top: 12px; right: 12px; z-index: 51;
                           width: 36px; height: 36px; border-radius: 6px;
                           background: rgba(200,184,255,0.1); border: 1px solid rgba(200,184,255,0.2);
-                          color: #c8b8ff; font-family: monospace; font-size: 16px;
+                          color: #c8b8ff; font-size: 18px;
                           display: none; align-items: center; justify-content: center;
                           touch-action: none; user-select: none; -webkit-user-select: none; }
 
@@ -119,9 +121,9 @@
       #touch-btn-toggle {
         position: fixed; z-index: 52; touch-action: none;
         left: 12px; top: 12px;
-        width: 32px; height: 32px; border-radius: 6px;
+        width: 36px; height: 36px; border-radius: 6px;
         background: rgba(200,184,255,0.1); border: 1px solid rgba(200,184,255,0.2);
-        color: #c8b8ff; font-family: monospace; font-size: 14px;
+        color: #c8b8ff; font-size: 18px;
         display: flex; align-items: center; justify-content: center;
         user-select: none; -webkit-user-select: none;
         transition: transform 0.2s;
@@ -181,11 +183,11 @@
   </div>
   <div id="touch-look-zone" class="touch-controls"></div>
   <div id="touch-ghost-zone" class="touch-controls"></div>
-  <div id="touch-btn-action" class="touch-controls touch-btn"></div>
-  <div id="touch-btn-jump" class="touch-controls touch-btn"></div>
-  <div id="touch-btn-turret" class="touch-controls touch-btn"></div>
-  <div id="touch-btn-toggle" class="touch-controls"></div>
-  <div id="touch-btn-fs" class="touch-controls touch-btn"></div>
+  <div id="touch-btn-action" class="touch-controls touch-btn">&#x26CF;&#xFE0E;</div>
+  <div id="touch-btn-jump" class="touch-controls touch-btn">&uarr;</div>
+  <div id="touch-btn-turret" class="touch-controls touch-btn">&#x25C8;</div>
+  <div id="touch-btn-toggle" class="touch-controls">&#x22EE;</div>
+  <div id="touch-btn-fs" class="touch-controls touch-btn">&#x26F6;</div>
 
   <canvas id="axis-hud" width="80" height="80"></canvas>
   <div id="axis-info"></div>
