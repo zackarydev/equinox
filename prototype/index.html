@@ -2602,6 +2602,119 @@
     document.addEventListener('mouseup', e => { if (e.button === 0) mouseDown = false; });
 
     // ─────────────────────────────────────────
+    //  TOUCH INTERACTION — 3D object picking via raycaster
+    // ─────────────────────────────────────────
+    const touchPickRaycaster = new THREE.Raycaster();
+    const touchPickNDC = new THREE.Vector2();
+
+    // Touch target state — tap an object to auto-walk + interact
+    let touchTarget = null;  // { type: 'rock'|'building'|..., index, position: Vector3 }
+    const TOUCH_ARRIVE_DIST = 4.5; // distance at which auto-walk stops and interaction begins
+
+    // Perform a raycast from screen coords and return the best interactable hit
+    function touchPick(screenX, screenY) {
+      touchPickNDC.x = (screenX / window.innerWidth) * 2 - 1;
+      touchPickNDC.y = -(screenY / window.innerHeight) * 2 + 1;
+      touchPickRaycaster.setFromCamera(touchPickNDC, camera);
+
+      // Check rocks — raycast against the rock group's children
+      const visibleRocks = rockMeshes.filter((m, i) => m.visible && !depletedRocks.has(i));
+      const rockHits = touchPickRaycaster.intersectObjects(visibleRocks, false);
+      let bestHit = null;
+
+      if (rockHits.length > 0) {
+        const idx = rockMeshes.indexOf(rockHits[0].object);
+        if (idx >= 0) bestHit = { type: 'rock', index: idx, point: rockHits[0].point.clone(), distance: rockHits[0].distance };
+      }
+
+      // Check buildings
+      const buildingMeshes = [];
+      const buildingIndices = [];
+      for (let bi = 0; bi < buildingAttractors.length; bi++) {
+        const ba = buildingAttractors[bi];
+        if (ba.buildingMesh && ba.buildingMesh.visible && ba.contaminated && !ba.destroyed) {
+          buildingMeshes.push(ba.buildingMesh);
+          buildingIndices.push(bi);
+        }
+      }
+      if (buildingMeshes.length > 0) {
+        const bHits = touchPickRaycaster.intersectObjects(buildingMeshes, true);
+        if (bHits.length > 0) {
+          // Find which building this mesh belongs to
+          let hitMesh = bHits[0].object;
+          while (hitMesh.parent && !buildingMeshes.includes(hitMesh)) hitMesh = hitMesh.parent;
+          const mIdx = buildingMeshes.indexOf(hitMesh);
+          if (mIdx >= 0 && (!bestHit || bHits[0].distance < bestHit.distance)) {
+            bestHit = { type: 'building', index: buildingIndices[mIdx], point: bHits[0].point.clone(), distance: bHits[0].distance };
+          }
+        }
+      }
+
+      return bestHit;
+    }
+
+    // Called when user taps a 3D object on mobile
+    function handleTouchPick(screenX, screenY) {
+      const hit = touchPick(screenX, screenY);
+      if (!hit) { touchTarget = null; return; }
+
+      const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
+
+      if (hit.type === 'rock' && isDay && !ghostActive) {
+        if (depletedRocks.has(hit.index)) { touchTarget = null; return; }
+        if (playerCarryingStone) { touchTarget = null; return; }
+        const rp = rockPositions[hit.index];
+        touchTarget = { type: 'rock', index: hit.index, position: rp.clone() };
+      } else if (hit.type === 'building' && isDay && !ghostActive) {
+        const ba = buildingAttractors[hit.index];
+        if (!ba.contaminated || ba.destroyed) { touchTarget = null; return; }
+        touchTarget = { type: 'building', index: hit.index, position: new THREE.Vector3(ba.x, ba.y, ba.z) };
+      }
+      // Future: add more types here (NPCs, farms, etc.)
+    }
+
+    // Update auto-walk toward touch target — called each frame
+    function updateTouchTarget(dt) {
+      if (!touchTarget) return;
+
+      const px = playerGroup.position.x, pz = playerGroup.position.z;
+      const tx = touchTarget.position.x, tz = touchTarget.position.z;
+      const dx = tx - px, dz = tz - pz;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+
+      // Validate target still exists
+      if (touchTarget.type === 'rock' && depletedRocks.has(touchTarget.index)) {
+        touchTarget = null; return;
+      }
+      if (touchTarget.type === 'building') {
+        const ba = buildingAttractors[touchTarget.index];
+        if (!ba.contaminated || ba.destroyed) { touchTarget = null; return; }
+      }
+
+      const interactRange = touchTarget.type === 'rock' ? PLAYER_MINE_RANGE : CLEANSE_RANGE;
+
+      if (dist < interactRange * 0.9) {
+        // Close enough — trigger interaction
+        mouseDown = true; // activates existing attack/mine logic
+        touchTarget = null;
+        // Auto-release after a brief window to let the swing land
+        setTimeout(() => { if (isTouchDevice) mouseDown = false; }, 600);
+        return;
+      }
+
+      // Auto-walk: inject movement toward target via touchMoveX/Y
+      // Convert world-space direction to camera-relative input
+      const forward = new THREE.Vector3(-Math.sin(cameraYaw), 0, -Math.cos(cameraYaw));
+      const right   = new THREE.Vector3(-forward.z, 0, forward.x);
+      const dir = new THREE.Vector3(dx, 0, dz).normalize();
+      touchMoveY = dir.dot(forward);  // forward component
+      touchMoveX = dir.dot(right);    // right component
+      // Normalize so magnitude ≤ 1
+      const mag = Math.sqrt(touchMoveX * touchMoveX + touchMoveY * touchMoveY);
+      if (mag > 1) { touchMoveX /= mag; touchMoveY /= mag; }
+    }
+
+    // ─────────────────────────────────────────
     //  TOUCH / MOBILE INPUT
     // ─────────────────────────────────────────
     // Virtual joystick state (normalized -1..1)
@@ -2657,9 +2770,11 @@
         for (const t of e.changedTouches) { if (t.identifier === jTouchId) jEnd(); }
       });
 
-      // ── Look area (right side of screen) ──
+      // ── Look area (right side of screen) — tap=pick 3D object, drag=look ──
       const lookZone = document.getElementById('touch-look-zone');
       let lookTouchId = null, lookLastX = 0, lookLastY = 0;
+      let lookStartX = 0, lookStartY = 0, lookMoved = false;
+      const LOOK_TAP_THRESHOLD = 14; // px — under this counts as a tap
 
       lookZone.addEventListener('touchstart', e => {
         e.preventDefault();
@@ -2667,12 +2782,16 @@
           const t = e.changedTouches[0];
           lookTouchId = t.identifier;
           lookLastX = t.clientX; lookLastY = t.clientY;
+          lookStartX = t.clientX; lookStartY = t.clientY;
+          lookMoved = false;
         }
       }, { passive: false });
       lookZone.addEventListener('touchmove', e => {
         e.preventDefault();
         for (const t of e.changedTouches) {
           if (t.identifier === lookTouchId) {
+            const dx = t.clientX - lookStartX, dy = t.clientY - lookStartY;
+            if (Math.abs(dx) + Math.abs(dy) > LOOK_TAP_THRESHOLD) lookMoved = true;
             touchLookDX += (t.clientX - lookLastX);
             touchLookDY += (t.clientY - lookLastY);
             lookLastX = t.clientX; lookLastY = t.clientY;
@@ -2680,7 +2799,15 @@
         }
       }, { passive: false });
       lookZone.addEventListener('touchend', e => {
-        for (const t of e.changedTouches) { if (t.identifier === lookTouchId) lookTouchId = null; }
+        for (const t of e.changedTouches) {
+          if (t.identifier === lookTouchId) {
+            if (!lookMoved) {
+              // Tap — try to pick a 3D object
+              handleTouchPick(lookStartX, lookStartY);
+            }
+            lookTouchId = null;
+          }
+        }
       });
       lookZone.addEventListener('touchcancel', e => {
         for (const t of e.changedTouches) { if (t.identifier === lookTouchId) lookTouchId = null; }
