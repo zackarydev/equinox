@@ -132,15 +132,48 @@
         user-select: none; -webkit-user-select: none;
       }
       .touch-btn.active { background: rgba(200,184,255,0.35); border-color: rgba(200,184,255,0.6); }
-      #touch-btn-action { right: 24px; bottom: 32px; width: 80px; height: 80px; font-size: 12px; }
-      #touch-btn-jump   { right: 116px; bottom: 56px; }
-      #touch-btn-turret { right: 24px; bottom: 124px; }
+      #touch-btn-action { right: 24px; bottom: 32px; width: 72px; height: 72px; font-size: 20px; }
+      #touch-btn-jump   { right: 108px; bottom: 52px; font-size: 16px; }
+      #touch-btn-turret { right: 24px; bottom: 116px; font-size: 18px; }
       #touch-btn-fs     { position: fixed; top: 12px; right: 12px; z-index: 51;
                           width: 36px; height: 36px; border-radius: 6px;
                           background: rgba(200,184,255,0.1); border: 1px solid rgba(200,184,255,0.2);
                           color: #c8b8ff; font-family: monospace; font-size: 16px;
                           display: none; align-items: center; justify-content: center;
                           touch-action: none; user-select: none; -webkit-user-select: none; }
+
+      /* Toggle button to hide/show controls */
+      #touch-btn-toggle {
+        position: fixed; z-index: 52; touch-action: none;
+        left: 12px; top: 12px;
+        width: 32px; height: 32px; border-radius: 6px;
+        background: rgba(200,184,255,0.1); border: 1px solid rgba(200,184,255,0.2);
+        color: #c8b8ff; font-family: monospace; font-size: 14px;
+        display: flex; align-items: center; justify-content: center;
+        user-select: none; -webkit-user-select: none;
+        transition: transform 0.2s;
+      }
+      /* When controls are manually hidden */
+      .touch-hidden #touch-joystick-zone,
+      .touch-hidden #touch-btn-action,
+      .touch-hidden #touch-btn-jump,
+      .touch-hidden #touch-btn-turret { opacity: 0; pointer-events: none; transition: opacity 0.2s; }
+      #touch-joystick-zone, #touch-btn-action,
+      #touch-btn-jump, #touch-btn-turret { transition: opacity 0.2s; }
+      .touch-hidden #touch-btn-toggle { transform: scaleX(-1); }
+
+      /* Ghost / night mode — hide everything, fullscreen becomes the control */
+      .ghost-touch #touch-joystick-zone,
+      .ghost-touch #touch-btn-action,
+      .ghost-touch #touch-btn-jump,
+      .ghost-touch #touch-btn-turret,
+      .ghost-touch #touch-btn-toggle,
+      .ghost-touch #touch-look-zone { opacity: 0; pointer-events: none; }
+      #touch-ghost-zone {
+        display: none; position: fixed; inset: 0; z-index: 50;
+        touch-action: none;
+      }
+      .ghost-touch #touch-ghost-zone { display: block; }
 
       /* Title screen adjustments for mobile */
       #title-screen h1 { font-size: 36px; letter-spacing: 10px; }
@@ -188,10 +221,12 @@
     </div>
   </div>
   <div id="touch-look-zone" class="touch-controls"></div>
-  <div id="touch-btn-action" class="touch-controls touch-btn">HOLD<br>ACT</div>
-  <div id="touch-btn-jump" class="touch-controls touch-btn">JUMP</div>
-  <div id="touch-btn-turret" class="touch-controls touch-btn">TUR-<br>RET</div>
-  <div id="touch-btn-fs" class="touch-controls touch-btn">⛶</div>
+  <div id="touch-ghost-zone" class="touch-controls"></div>
+  <div id="touch-btn-action" class="touch-controls touch-btn">&#9678;</div>
+  <div id="touch-btn-jump" class="touch-controls touch-btn">&#8593;</div>
+  <div id="touch-btn-turret" class="touch-controls touch-btn">&#9650;</div>
+  <div id="touch-btn-toggle" class="touch-controls">&#x2039;</div>
+  <div id="touch-btn-fs" class="touch-controls touch-btn">&#x26F6;</div>
 
   <canvas id="axis-hud" width="80" height="80"></canvas>
   <div id="axis-info"></div>
@@ -2708,6 +2743,58 @@
       turBtn.addEventListener('touchstart', e => { e.preventDefault(); placeTurretSite(); turBtn.classList.add('active'); }, { passive: false });
       turBtn.addEventListener('touchend',   e => { turBtn.classList.remove('active'); });
       turBtn.addEventListener('touchcancel', e => { turBtn.classList.remove('active'); });
+
+      // ── Toggle button (hide/show controls) ──
+      const toggleBtn = document.getElementById('touch-btn-toggle');
+      toggleBtn.addEventListener('touchstart', e => {
+        e.preventDefault();
+        document.body.classList.toggle('touch-hidden');
+      }, { passive: false });
+
+      // ── Ghost zone (night mode — fullscreen touch: drag=look, tap=jump) ──
+      const ghostZone = document.getElementById('touch-ghost-zone');
+      let ghostTouches = {};     // id → { startX, startY, lastX, lastY, moved }
+      const TAP_THRESHOLD = 12;  // px — under this is a tap, over is a drag/look
+
+      ghostZone.addEventListener('touchstart', e => {
+        e.preventDefault();
+        for (const t of e.changedTouches) {
+          ghostTouches[t.identifier] = {
+            startX: t.clientX, startY: t.clientY,
+            lastX: t.clientX, lastY: t.clientY, moved: false
+          };
+        }
+      }, { passive: false });
+
+      ghostZone.addEventListener('touchmove', e => {
+        e.preventDefault();
+        for (const t of e.changedTouches) {
+          const gt = ghostTouches[t.identifier];
+          if (!gt) continue;
+          const dx = t.clientX - gt.startX, dy = t.clientY - gt.startY;
+          if (Math.abs(dx) + Math.abs(dy) > TAP_THRESHOLD) gt.moved = true;
+          if (gt.moved) {
+            touchLookDX += (t.clientX - gt.lastX);
+            touchLookDY += (t.clientY - gt.lastY);
+          }
+          gt.lastX = t.clientX; gt.lastY = t.clientY;
+        }
+      }, { passive: false });
+
+      ghostZone.addEventListener('touchend', e => {
+        for (const t of e.changedTouches) {
+          const gt = ghostTouches[t.identifier];
+          if (gt && !gt.moved) {
+            // Tap → jump (pulse space key briefly)
+            keys[' '] = true;
+            setTimeout(() => { keys[' '] = false; }, 100);
+          }
+          delete ghostTouches[t.identifier];
+        }
+      });
+      ghostZone.addEventListener('touchcancel', e => {
+        for (const t of e.changedTouches) delete ghostTouches[t.identifier];
+      });
 
       // ── Fullscreen button ──
       const fsBtn = document.getElementById('touch-btn-fs');
@@ -8242,6 +8329,8 @@
         ghostFade = Math.max(0, ghostFade - dt * 2.0);
       }
       ghostActive = ghostFade > 0.01;
+      // Toggle touch controls for ghost mode
+      if (isTouchDevice) document.body.classList.toggle('ghost-touch', ghostActive);
       if (!ghostActive) {
         ghostCloud.visible = false; ghostCloud.count = 0;
         for (let i = 0; i < GHOST_LIGHT_COUNT; i++) ghostLights[i].light.visible = false;
