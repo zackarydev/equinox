@@ -2623,7 +2623,7 @@
       if (pointerLocked) {
         if (ghostActive) {
           // Night + pointer locked: hold = charge jump
-          keys[' '] = true;
+          ghostJumpCharging = true;
           mouseGhostHoldStart = performance.now() / 1000;
         } else {
           mouseDown = true; // Day: attack
@@ -2634,7 +2634,7 @@
       if (e.button !== 0) return;
       if (ghostActive && mouseGhostHoldStart >= 0) {
         const holdDuration = performance.now() / 1000 - mouseGhostHoldStart;
-        keys[' '] = false; // release charge → jump fires
+        ghostJumpCharging = false; // release charge → jump fires
         if (holdDuration < 0.2 && !playerAirborne) {
           // Quick click (pointer locked) → move ghost toward where camera is pointing
           const pos = ghostScreenTo3D(window.innerWidth / 2, window.innerHeight / 2);
@@ -2657,7 +2657,7 @@
           ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
           ghostAttractActive = true;
           ghostMoveTarget = null; // cancel any tap-move in progress
-          if (!playerAirborne) keys[' '] = true;
+          if (!playerAirborne) ghostJumpCharging = true;
         }
       }
     });
@@ -2668,7 +2668,7 @@
           mouseDragLook = true;
           if (ghostActive) {
             // Dragging: guide blob (cancel jump charge, keep attract)
-            if (keys[' ']) { keys[' '] = false; ghostHoldStart = -1; }
+            if (ghostJumpCharging) { ghostJumpCharging = false; ghostHoldStart = -1; }
           } else {
             clearTouchTarget();
           }
@@ -2684,7 +2684,7 @@
       if (e.button === 0 && mouseDownStart && !pointerLocked && gameStarted) {
         const holdDuration = performance.now() / 1000 - mouseDownStart.time;
         if (ghostActive) {
-          keys[' '] = false;
+          ghostJumpCharging = false;
           ghostAttractActive = false;
           if (!mouseDragLook && holdDuration < 0.2) {
             // Quick click at night → move ghost to that world position
@@ -3121,7 +3121,7 @@
             ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
             ghostAttractActive = true;
             ghostMoveTarget = null; // cancel any tap-move in progress
-            if (!playerAirborne) keys[' '] = true;
+            if (!playerAirborne) ghostJumpCharging = true;
           }
         }
       }, { passive: false });
@@ -3139,8 +3139,8 @@
             const pos = ghostScreenTo3D(t.clientX, t.clientY);
             ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
             // Moving finger cancels jump charge (guiding instead)
-            if (gt.moved && keys[' ']) {
-              keys[' '] = false;
+            if (gt.moved && ghostJumpCharging) {
+              ghostJumpCharging = false;
               ghostHoldStart = -1;
             }
           } else {
@@ -3161,7 +3161,7 @@
           const holdDuration = performance.now() / 1000 - gt.startTime;
 
           if (gt.role === 'blob') {
-            keys[' '] = false; // release jump charge
+            ghostJumpCharging = false; // release jump charge
             ghostAttractActive = false;
             ghostBlobTouchId = null;
 
@@ -3171,9 +3171,8 @@
                 const pos = ghostScreenTo3D(gt.startX, gt.startY);
                 ghostMoveTarget = { x: pos.x, z: pos.z };
               }
-              // Longer hold without moving = jump (already handled by keys[' '] release)
+              // Longer hold without moving = jump (handled by ghostJumpCharging release)
             }
-            // If finger moved (drag), blob was being guided — no move target needed
           }
           delete ghostTouches[t.identifier];
         }
@@ -3181,7 +3180,7 @@
       ghostZone.addEventListener('touchcancel', e => {
         for (const t of e.changedTouches) {
           if (ghostTouches[t.identifier] && ghostTouches[t.identifier].role === 'blob') {
-            keys[' '] = false;
+            ghostJumpCharging = false;
             ghostHoldStart = -1;
             ghostAttractActive = false;
             ghostBlobTouchId = null;
@@ -8608,9 +8607,10 @@
 
     // Moon jump
     const MOON_GRAVITY = 7;
-    const JUMP_VELOCITY_MIN = 20.0;   // minimum jump (quick tap)
+    const JUMP_VELOCITY_MIN = 30.0;   // minimum jump (just past threshold)
     const JUMP_VELOCITY_MAX = 65.0;   // max jump (full charge)
-    const JUMP_CHARGE_TIME = 1.2;     // seconds to reach full charge
+    const JUMP_HOLD_MIN = 1.0;        // must hold at least 1s before jump is possible
+    const JUMP_CHARGE_TIME = 1.5;     // additional seconds after threshold to reach full charge
     let playerYVel = 0;
     let playerAirborne = false;
     let _jumpLaunchFrame = false;
@@ -8618,6 +8618,7 @@
 
     // Ghost interaction state — hold-to-coalesce + throb on tap
     let ghostHoldStart = -1;        // timestamp when hold began (-1 = not holding)
+    let ghostJumpCharging = false;  // true while holding blob for jump (not keyboard)
     let ghostCoalesce = 0;          // 0..1 coalesce factor (tightens blob orbits)
     const COALESCE_RATE = 1.0 / JUMP_CHARGE_TIME; // ramp speed
     // Throb: repulsion pulse from a 3D point
@@ -9101,20 +9102,23 @@
         ghostCoalesce = Math.max(0, ghostCoalesce - COALESCE_RATE * 2.0 * dt); // relax faster
       }
 
-      // ── Moon jump (charged by hold) ──
+      // ── Moon jump (hold blob > 1s to charge, release to jump) ──
       if (ghostActive && keys[' '] && !playerAirborne) {
-        // Start charging
         if (ghostHoldStart < 0) ghostHoldStart = t;
       }
       if (ghostActive && !keys[' '] && ghostHoldStart >= 0 && !playerAirborne) {
-        // Released — launch with charged velocity
-        const holdTime = Math.min(t - ghostHoldStart, JUMP_CHARGE_TIME);
-        const charge = holdTime / JUMP_CHARGE_TIME; // 0..1
-        playerAirborne = true;
-        _jumpLaunchFrame = true;
-        playerYVel = JUMP_VELOCITY_MIN + charge * (JUMP_VELOCITY_MAX - JUMP_VELOCITY_MIN);
+        const holdTime = t - ghostHoldStart;
+        if (holdTime >= JUMP_HOLD_MIN) {
+          // Held long enough — jump with charge proportional to extra hold time
+          const chargeTime = Math.min(holdTime - JUMP_HOLD_MIN, JUMP_CHARGE_TIME);
+          const charge = chargeTime / JUMP_CHARGE_TIME; // 0..1
+          playerAirborne = true;
+          _jumpLaunchFrame = true;
+          playerYVel = JUMP_VELOCITY_MIN + charge * (JUMP_VELOCITY_MAX - JUMP_VELOCITY_MIN);
+          SFX.jumpLaunch();
+        }
+        // Either jumped or didn't hold long enough — reset
         ghostHoldStart = -1;
-        SFX.jumpLaunch();
       }
       if (playerAirborne) {
         playerYVel -= MOON_GRAVITY * dt;
