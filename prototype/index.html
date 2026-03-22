@@ -2635,27 +2635,28 @@
       if (ghostActive && mouseGhostHoldStart >= 0) {
         const holdDuration = performance.now() / 1000 - mouseGhostHoldStart;
         keys[' '] = false; // release charge → jump fires
-        if (holdDuration < 0.15 && !playerAirborne) {
-          // Quick click — throb from screen center
-          spawnGhostThrob(window.innerWidth / 2, window.innerHeight / 2);
+        if (holdDuration < 0.2 && !playerAirborne) {
+          // Quick click (pointer locked) → move ghost toward where camera is pointing
+          const pos = ghostScreenTo3D(window.innerWidth / 2, window.innerHeight / 2);
+          ghostMoveTarget = { x: pos.x, z: pos.z };
         }
         mouseGhostHoldStart = -1;
       }
       mouseDown = false;
     });
 
-    // Desktop click-to-move + drag-to-look (when pointer not locked)
-    let mouseDownStart = null; // { x, y, time, onBlob } for detecting drag vs click
+    // Desktop click-to-move + drag-to-look/guide (when pointer not locked)
+    let mouseDownStart = null; // { x, y, time } for detecting drag vs click
     const MOUSE_DRAG_THRESHOLD = 5; // px before it becomes a drag
     renderer.domElement.addEventListener('mousedown', e => {
       if (e.button === 0 && !pointerLocked && gameStarted) {
-        const onBlob = ghostActive && ghostScreenDist(e.clientX, e.clientY) < GHOST_TOUCH_SCREEN_RADIUS;
-        mouseDownStart = { x: e.clientX, y: e.clientY, time: performance.now() / 1000, onBlob };
-        if (onBlob) {
-          // Clicked on blob: start attract + charge jump
+        mouseDownStart = { x: e.clientX, y: e.clientY, time: performance.now() / 1000 };
+        if (ghostActive) {
+          // Night: start attracting blob toward click + charge jump
           const pos = ghostScreenTo3D(e.clientX, e.clientY);
           ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
           ghostAttractActive = true;
+          ghostMoveTarget = null; // cancel any tap-move in progress
           if (!playerAirborne) keys[' '] = true;
         }
       }
@@ -2665,16 +2666,16 @@
         const dx = e.clientX - mouseDownStart.x, dy = e.clientY - mouseDownStart.y;
         if (Math.abs(dx) + Math.abs(dy) > MOUSE_DRAG_THRESHOLD) {
           mouseDragLook = true;
-          if (mouseDownStart.onBlob) {
-            // Dragging on blob: guide it (cancel jump charge, keep attract)
+          if (ghostActive) {
+            // Dragging: guide blob (cancel jump charge, keep attract)
             if (keys[' ']) { keys[' '] = false; ghostHoldStart = -1; }
           } else {
-            clearTouchTarget(); // cancel any pending move if we start dragging
+            clearTouchTarget();
           }
         }
       }
-      // Update attract target while dragging on blob
-      if (mouseDownStart && mouseDownStart.onBlob && mouseDragLook) {
+      // Update attract target while dragging at night
+      if (mouseDownStart && ghostActive && mouseDragLook) {
         const pos = ghostScreenTo3D(e.clientX, e.clientY);
         ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
       }
@@ -2682,17 +2683,17 @@
     document.addEventListener('mouseup', e => {
       if (e.button === 0 && mouseDownStart && !pointerLocked && gameStarted) {
         const holdDuration = performance.now() / 1000 - mouseDownStart.time;
-        if (mouseDownStart.onBlob) {
-          // Release blob
+        if (ghostActive) {
           keys[' '] = false;
           ghostAttractActive = false;
-          if (!mouseDragLook && holdDuration < 0.15 && !playerAirborne) {
-            spawnGhostThrob(mouseDownStart.x, mouseDownStart.y);
+          if (!mouseDragLook && holdDuration < 0.2) {
+            // Quick click at night → move ghost to that world position
+            const pos = ghostScreenTo3D(mouseDownStart.x, mouseDownStart.y);
+            ghostMoveTarget = { x: pos.x, z: pos.z };
           }
         } else if (!mouseDragLook) {
-          // Day: click-to-move
           const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
-          if (isDay && !ghostActive) handleTouchPick(mouseDownStart.x, mouseDownStart.y);
+          if (isDay) handleTouchPick(mouseDownStart.x, mouseDownStart.y);
         }
         mouseDragLook = false;
         mouseDownStart = null;
@@ -2907,11 +2908,17 @@
 
     let ghostBlobTouchId = null; // which touch is controlling the blob (hoisted for access from updateGhostAttract)
 
-    // Ghost attract: move player toward attract point + airborne dive on touch
-    function updateGhostAttract(dt) {
-      if (!ghostActive) return;
+    // Ghost move target — tap anywhere at night to move ghost there (like daytime click-to-move)
+    let ghostMoveTarget = null; // { x, z } world position to walk toward, or null
 
-      // Any active touch/click while airborne → dive (like holding spacebar)
+    // Ghost attract: move player toward attract/move target + airborne dive on touch
+    function updateGhostAttract(dt) {
+      if (!ghostActive) {
+        ghostMoveTarget = null;
+        return;
+      }
+
+      // Any active touch/click while airborne → dive
       if (playerAirborne) {
         const hasTouch = ghostBlobTouchId !== null || (mouseDownStart && mouseDownStart.onBlob) || (mouseGhostHoldStart >= 0);
         if (hasTouch) {
@@ -2919,14 +2926,38 @@
         }
       }
 
-      if (!ghostAttractActive) return;
+      // Determine movement target: active attract (finger down) takes priority over tap-move
+      let moveX, moveZ;
+      if (ghostAttractActive) {
+        moveX = ghostAttractX;
+        moveZ = ghostAttractZ;
+      } else if (ghostMoveTarget) {
+        moveX = ghostMoveTarget.x;
+        moveZ = ghostMoveTarget.z;
+      } else {
+        // No target — clear movement input
+        touchMoveX = 0;
+        touchMoveY = 0;
+        return;
+      }
 
-      // Walk player toward the attract target
       const px = playerGroup.position.x, pz = playerGroup.position.z;
-      const dx = ghostAttractX - px, dz = ghostAttractZ - pz;
+      const dx = moveX - px, dz = moveZ - pz;
       const dist = Math.sqrt(dx * dx + dz * dz);
 
-      if (dist < 1.0) return; // close enough, don't jitter
+      // Arrived at tap-move target
+      if (!ghostAttractActive && dist < TERRAIN_ARRIVE_DIST) {
+        ghostMoveTarget = null;
+        touchMoveX = 0;
+        touchMoveY = 0;
+        return;
+      }
+
+      if (dist < 0.5) {
+        touchMoveX = 0;
+        touchMoveY = 0;
+        return;
+      }
 
       const forward = new THREE.Vector3(-Math.sin(cameraYaw), 0, -Math.cos(cameraYaw));
       const right   = new THREE.Vector3(-forward.z, 0, forward.x);
@@ -3063,33 +3094,34 @@
       }, { passive: false });
 
       // ── Ghost zone (night mode) ──
-      // Touch near blob → attract/guide blob (drag to steer), hold still = charge jump, quick tap = throb
-      // Touch far from blob → camera rotation (drag to look)
+      // Ghost zone multitouch:
+      //   First finger  → blob control (attract/guide, hold=charge jump, tap=move-to-point)
+      //   Other fingers → camera rotation (drag to look)
       const ghostZone = document.getElementById('touch-ghost-zone');
-      let ghostTouches = {};     // id → { startX, startY, lastX, lastY, moved, startTime, onBlob }
-      const TAP_THRESHOLD = 12;  // px — under this is a tap/hold, over is a drag
-      const HOLD_THRESHOLD = 0.15; // seconds — under = tap (throb), over = hold (jump charge)
-      ghostBlobTouchId = null; // which touch is controlling the blob
+      let ghostTouches = {};     // id → { startX, startY, lastX, lastY, moved, startTime, role:'blob'|'look' }
+      const TAP_THRESHOLD = 12;  // px movement before it counts as a drag
+      const HOLD_THRESHOLD = 0.2; // seconds — under = tap, over = hold
+      ghostBlobTouchId = null;   // first finger controls blob
 
       ghostZone.addEventListener('touchstart', e => {
         e.preventDefault();
         for (const t of e.changedTouches) {
-          const dist = ghostScreenDist(t.clientX, t.clientY);
-          const onBlob = dist < GHOST_TOUCH_SCREEN_RADIUS;
+          const role = (ghostBlobTouchId === null) ? 'blob' : 'look';
           ghostTouches[t.identifier] = {
             startX: t.clientX, startY: t.clientY,
             lastX: t.clientX, lastY: t.clientY, moved: false,
             startTime: performance.now() / 1000,
-            onBlob
+            role
           };
           spawnTouchDebugLight(t.clientX, t.clientY);
-          if (onBlob && ghostBlobTouchId === null) {
+          if (role === 'blob') {
             ghostBlobTouchId = t.identifier;
-            // Start attract + charge jump
+            // Start attracting blob toward finger + charge jump
             const pos = ghostScreenTo3D(t.clientX, t.clientY);
             ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
             ghostAttractActive = true;
-            if (!playerAirborne) keys[' '] = true; // begin jump charge
+            ghostMoveTarget = null; // cancel any tap-move in progress
+            if (!playerAirborne) keys[' '] = true;
           }
         }
       }, { passive: false });
@@ -3102,19 +3134,21 @@
           const dx = t.clientX - gt.startX, dy = t.clientY - gt.startY;
           if (Math.abs(dx) + Math.abs(dy) > TAP_THRESHOLD) gt.moved = true;
 
-          if (t.identifier === ghostBlobTouchId) {
-            // Blob touch: update attract target (guide the blob)
+          if (gt.role === 'blob') {
+            // Update attract target — guide the blob
             const pos = ghostScreenTo3D(t.clientX, t.clientY);
             ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
-            // If finger moved significantly, cancel jump charge (guiding, not charging)
+            // Moving finger cancels jump charge (guiding instead)
             if (gt.moved && keys[' ']) {
               keys[' '] = false;
               ghostHoldStart = -1;
             }
-          } else if (gt.moved) {
-            // Non-blob touch: camera rotation
-            touchLookDX += (t.clientX - gt.lastX);
-            touchLookDY += (t.clientY - gt.lastY);
+          } else {
+            // Camera rotation
+            if (gt.moved) {
+              touchLookDX += (t.clientX - gt.lastX);
+              touchLookDY += (t.clientY - gt.lastY);
+            }
           }
           gt.lastX = t.clientX; gt.lastY = t.clientY;
         }
@@ -3126,23 +3160,27 @@
           if (!gt) { delete ghostTouches[t.identifier]; continue; }
           const holdDuration = performance.now() / 1000 - gt.startTime;
 
-          if (t.identifier === ghostBlobTouchId) {
-            // Release blob touch
+          if (gt.role === 'blob') {
             keys[' '] = false; // release jump charge
             ghostAttractActive = false;
             ghostBlobTouchId = null;
 
-            if (!gt.moved && holdDuration < HOLD_THRESHOLD) {
-              // Quick tap on blob → throb
-              spawnGhostThrob(gt.startX, gt.startY);
+            if (!gt.moved) {
+              if (holdDuration < HOLD_THRESHOLD) {
+                // Quick tap → set move target (ghost walks to that world position)
+                const pos = ghostScreenTo3D(gt.startX, gt.startY);
+                ghostMoveTarget = { x: pos.x, z: pos.z };
+              }
+              // Longer hold without moving = jump (already handled by keys[' '] release)
             }
+            // If finger moved (drag), blob was being guided — no move target needed
           }
           delete ghostTouches[t.identifier];
         }
       });
       ghostZone.addEventListener('touchcancel', e => {
         for (const t of e.changedTouches) {
-          if (t.identifier === ghostBlobTouchId) {
+          if (ghostTouches[t.identifier] && ghostTouches[t.identifier].role === 'blob') {
             keys[' '] = false;
             ghostHoldStart = -1;
             ghostAttractActive = false;
