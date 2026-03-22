@@ -142,7 +142,10 @@
       .ghost-touch #touch-btn-jump,
       .ghost-touch #touch-btn-turret,
       .ghost-touch #touch-btn-toggle,
-      .ghost-touch #touch-look-zone { opacity: 0; pointer-events: none; }
+      .ghost-touch #touch-look-zone,
+      .ghost-touch #touch-btn-fs,
+      .ghost-touch .game-hud,
+      .ghost-touch #axis-hud { opacity: 0; pointer-events: none; }
       #touch-ghost-zone {
         display: none; position: fixed; inset: 0; z-index: 50;
         touch-action: none;
@@ -8696,8 +8699,8 @@
       }
       ghostActive = ghostFade > 0.01;
       if (!ghostActive) { ghostCoalesce = 0; ghostHoldStart = -1; ghostThrobs.length = 0; ghostAttractActive = false; }
-      // Toggle touch controls for ghost mode
-      if (isTouchDevice) document.body.classList.toggle('ghost-touch', ghostActive);
+      // Toggle UI visibility for ghost mode (hide all HUD/buttons at night)
+      document.body.classList.toggle('ghost-touch', ghostActive);
       if (!ghostActive) {
         ghostCloud.visible = false; ghostCloud.count = 0;
         for (let i = 0; i < GHOST_LIGHT_COUNT; i++) ghostLights[i].light.visible = false;
