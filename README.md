@@ -1,5 +1,8 @@
 # Equinox
 
+[Play Prototype](https://zackarydev.github.io/equinox/prototype/index.html)
+
+
 ![Dusk](<./screenshots/dusk.png>)
 ![Dusk_later](<./screenshots/dusk_later.png>)
 ![paths](<./screenshots/paths.png>)
