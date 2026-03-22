@@ -1,4 +1,4 @@
-# equinox
+# [equinox](https://zackarydev.github.io/equinox/prototype/index.html)
 
 [Play Prototype](https://zackarydev.github.io/equinox/prototype/index.html)
 
