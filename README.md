@@ -1,11 +1,21 @@
+# Equinox
+
+![Dusk](<./screenshots/dusk.png>)
+![Dusk_later](<./screenshots/dusk_later.png>)
+![paths](<./screenshots/paths.png>)
+![wind_vector_field](<./screenshots/wind_vector_field.png>)
+
+
 ## Codemap:
 
-![Codemap](<Screenshot 2026-03-21 at 2.15.53 PM.png>)
+[Project Codemap](../depgraph/runtime/project_codemap.md)
+
+![Codemap](<./screenshots/depgraph/depgraph1.png>)
 
 ## Hypergraph of Codemap + vars/pointers
 
-![Hypercodemap](<Screenshot 2026-03-21 at 2.30.31 PM.png>)
+![Hypercodemap](<./screenshots/depgraph/depgraph2.png>)
 
-![Hypercodemap](<Screenshot 2026-03-21 at 2.33.02 PM.png>)
+![Hypercodemap](<./screenshots/depgraph/depgraph3.png>)
 
-![Hypercodemap](<Screenshot 2026-03-21 at 3.08.07 PM.png>)
+![Hypercodemap](<./screenshots/depgraph/depgraph4.png>)
