@@ -143,6 +143,100 @@ Primary cluster = highest-weight affinity. Used for hull membership, node color,
 - `tools/project_codemap.md` — system sections + function importance
 - `prototype/index.html` — the game source being analyzed
 
+## Spatial Memory & Arrangement Navigation
+
+The layout is not just a computed output — it's a **document** that accumulates context over time. User interaction produces spatial knowledge that should persist, be navigable, and influence future layouts.
+
+### Three layers of layout input
+
+| Layer | Source | Persistence |
+|-------|--------|-------------|
+| Structure | AST (calls, shared state) | Recomputed from code |
+| Semantics | Codemap + affinity scoring | `project_codemap.md` |
+| Spatial memory | User interaction over time | `depgraph-spatial.json` |
+
+### Spatial affinity edges
+A new edge type that doesn't come from the AST — it comes from interaction. When the user drags nodes together, clicks nodes in sequence, or uses the attractor to pull neighborhoods together, this creates **spatial affinity** between those nodes. Over time, nodes the user mentally associates become physically closer in the default layout, even if they're in different codemap systems.
+
+Signals that build spatial affinity:
+- **Click co-occurrence**: clicking node A then node B within ~30s → co-occurrence event
+- **Drag proximity**: user manually places A near B → strong spatial signal
+- **Attractor grouping**: pulling B toward A → explicit association
+- **Frequency weighting**: repeated associations strengthen the edge, old ones decay
+
+These edges are stored and influence layout: nodes with strong spatial affinity get placed closer, potentially overriding pure cluster membership for positioning (while still keeping their cluster color/hull).
+
+### Arrangements as snapshots
+Each meaningful layout state is an **arrangement** — a `Map<nodeId, {x, y}>` plus metadata:
+- Timestamp
+- Focal nodes (what the user was looking at)
+- Auto-generated label (e.g. "terrain-npc interaction")
+- How it was created (drag, attractor, re-layout, file change)
+
+Arrangements are pushed onto a **navigation stack** as the user interacts.
+
+### Arrangement navigation (Back/Forward)
+
+Navigate between arrangements like browser history:
+- User explores default layout → arrangement A
+- Drags Night/Combat nodes toward Terrain → arrangement B (pushed)
+- Clicks NPC node, attractor pulls neighborhood → arrangement C (pushed)
+- **Back** → smooth transition to arrangement B
+- **Back** again → smooth transition to arrangement A
+- **Forward** → smooth transition to arrangement B
+
+Transitions between arrangements are animated interpolations of node positions (lerp over ~300ms).
+
+### Layout merging & comparison view
+
+When the user navigates **back/forward repeatedly** (oscillating between two arrangements), the system detects this pattern and enters a **comparison mode**:
+
+- The two arrangements are **merged** into a single view
+- Nodes that exist in both arrangements but at different positions are shown with their **differences exaggerated** — pulled further apart to highlight what's structurally different between the two views
+- Nodes that are in the same position in both arrangements stay put (they're the "common ground")
+- Edges/connections that are unique to one arrangement's focal context could be color-coded or emphasized
+- The result is a diff-like view of two exploration contexts, showing what the user was comparing
+
+This is analogous to how a diff highlights changes between two files — the comparison view highlights changes between two ways of looking at the same graph.
+
+Detection heuristic: if the user does back→forward→back within ~3 seconds (oscillating), trigger comparison mode. A third arrangement navigation or clicking away exits it.
+
+### Persistence format
+
+`tools/depgraph-spatial.json`:
+```json
+{
+  "arrangements": [
+    {
+      "id": "a1b2c3",
+      "timestamp": "2026-03-21T...",
+      "positions": {"getTerrainY": [120, 45], "moveNPC": [135, 50], ...},
+      "focal": ["getTerrainY", "moveNPC"],
+      "label": "terrain-npc interaction",
+      "trigger": "attractor"
+    }
+  ],
+  "spatialEdges": {
+    "getTerrainY\u0000moveNPC": {"weight": 0.7, "lastSeen": "2026-03-21T..."},
+    ...
+  },
+  "clickLog": [
+    {"node": "getTerrainY", "t": 1711036800000},
+    {"node": "moveNPC", "t": 1711036812000}
+  ]
+}
+```
+
+Spatial edges decay over time (half-life of ~1 week?) so stale associations fade. The click log can be truncated to last N entries. Arrangements could be capped (e.g. last 50) with older ones pruned.
+
+### How spatial memory influences layout
+
+During the constraint-based layout step:
+1. Pack clusters into non-overlapping regions (structural)
+2. Within each cluster, place nodes by importance (semantic)
+3. **Adjust positions** by spatial affinity — nodes with strong spatial edges get pulled closer, potentially across cluster boundaries (the node stays in its hull but shifts toward the hull edge nearest its spatial neighbor)
+4. If a saved arrangement exists for the current node set, use it as the starting point instead of computing fresh
+
 ## What went wrong with D3 force layout
 - Forces fight each other: cluster attraction vs cluster separation vs link forces vs collision → unstable equilibrium
 - Any interaction (click, drag) re-injects energy that cascades through the whole graph

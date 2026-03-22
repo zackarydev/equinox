@@ -2905,6 +2905,38 @@
       if (mag > 1) { touchMoveX /= mag; touchMoveY /= mag; }
     }
 
+    let ghostBlobTouchId = null; // which touch is controlling the blob (hoisted for access from updateGhostAttract)
+
+    // Ghost attract: move player toward attract point + airborne dive on touch
+    function updateGhostAttract(dt) {
+      if (!ghostActive) return;
+
+      // Any active touch/click while airborne → dive (like holding spacebar)
+      if (playerAirborne) {
+        const hasTouch = ghostBlobTouchId !== null || (mouseDownStart && mouseDownStart.onBlob) || (mouseGhostHoldStart >= 0);
+        if (hasTouch) {
+          playerYVel -= 120.0 * dt;
+        }
+      }
+
+      if (!ghostAttractActive) return;
+
+      // Walk player toward the attract target
+      const px = playerGroup.position.x, pz = playerGroup.position.z;
+      const dx = ghostAttractX - px, dz = ghostAttractZ - pz;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+
+      if (dist < 1.0) return; // close enough, don't jitter
+
+      const forward = new THREE.Vector3(-Math.sin(cameraYaw), 0, -Math.cos(cameraYaw));
+      const right   = new THREE.Vector3(-forward.z, 0, forward.x);
+      const dir = new THREE.Vector3(dx, 0, dz).normalize();
+      touchMoveY = dir.dot(forward);
+      touchMoveX = dir.dot(right);
+      const mag = Math.sqrt(touchMoveX * touchMoveX + touchMoveY * touchMoveY);
+      if (mag > 1) { touchMoveX /= mag; touchMoveY /= mag; }
+    }
+
     // ─────────────────────────────────────────
     //  TOUCH / MOBILE INPUT
     // ─────────────────────────────────────────
@@ -3037,7 +3069,7 @@
       let ghostTouches = {};     // id → { startX, startY, lastX, lastY, moved, startTime, onBlob }
       const TAP_THRESHOLD = 12;  // px — under this is a tap/hold, over is a drag
       const HOLD_THRESHOLD = 0.15; // seconds — under = tap (throb), over = hold (jump charge)
-      let ghostBlobTouchId = null; // which touch is controlling the blob
+      ghostBlobTouchId = null; // which touch is controlling the blob
 
       ghostZone.addEventListener('touchstart', e => {
         e.preventDefault();
@@ -9892,6 +9924,7 @@
 
       // Touch: auto-walk toward tapped target + debug lights
       updateTouchTarget(dt);
+      updateGhostAttract(dt);
       updateTouchDebugLights(dt);
 
       // Player
