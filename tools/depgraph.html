@@ -73,7 +73,8 @@ svg { position: fixed; top: 44px; left: 0; right: 0; bottom: 0; }
 .link { transition: stroke-opacity 0.2s, stroke-width 0.2s; }
 .link:hover { stroke-opacity: 0.8 !important; }
 .node circle { cursor: pointer; stroke-width: 1.5; transition: opacity 0.2s; }
-.node text { fill: #999; font-size: 10px; pointer-events: none; }
+.node text { fill: #999; font-size: 10px; pointer-events: none; user-select: none; }
+.label { pointer-events: none; user-select: none; }
 .node.highlighted circle { stroke-width: 3; }
 .hull { fill-opacity: 0.04; stroke-opacity: 0.15; stroke-width: 1.5; }
 .cluster-label { font-size: 11px; font-weight: 600; fill-opacity: 0.6; pointer-events: none; text-anchor: middle; dominant-baseline: central; }
@@ -88,7 +89,7 @@ svg { position: fixed; top: 44px; left: 0; right: 0; bottom: 0; }
     <select id="view-mode">
       <option value="systems">Systems (clustered)</option>
       <option value="functions">All functions</option>
-      <option value="hypergraph">Hypergraph (funcs + globals)</option>
+      <option value="hypergraph" selected>Hypergraph (funcs + globals)</option>
     </select>
   </label>
   <div class="sep"></div>
@@ -102,6 +103,7 @@ svg { position: fixed; top: 44px; left: 0; right: 0; bottom: 0; }
   <div class="sep"></div>
   <label><input type="checkbox" id="show-labels" checked> Labels</label>
   <label><input type="checkbox" id="show-hulls" checked> Clusters</label>
+  <label><input type="checkbox" id="live-reload" checked> Live</label>
   <label><input type="range" id="min-shared" min="1" max="15" value="3" style="width:80px"> Min shared: <span id="min-shared-val">3</span></label>
   <div class="sep"></div>
   <label>Search: <input type="text" id="search" placeholder="function name..." style="width:140px"></label>
@@ -139,6 +141,7 @@ let codemapSections = null;
 // ── State ──────────────────────────────────────────
 let analysisResult = null;
 let simulation = null;
+let savedPositions = new Map(); // id → {x, y} persisted across rebuilds
 let selectedNode = null;
 let currentK = 0.8; // current zoom scale
 
@@ -150,6 +153,9 @@ let attractorHoldStrength = 0; // 0→1 ramps during hold
 let attractorLocked = false;  // stays true after release until SPACEBAR
 let lastAttractorDuration = 0;
 let currentGraph = null;
+let currentClusterNames = new Map();
+let currentNodes = null;       // reference to active nodes array for hull/label updates
+let currentHullClusterIds = null;
 
 // ── Utility ────────────────────────────────────────
 function hashStr(s) {
@@ -159,8 +165,11 @@ function hashStr(s) {
 }
 
 // ── Codemap Parsing ────────────────────────────────
+let codemapImportance = new Map(); // funcName → importance (1-10)
+
 function parseCodemap(md) {
   const sections = new Map();
+  codemapImportance = new Map();
   let currentSection = null;
   for (const line of md.split('\n')) {
     const secMatch = line.match(/^## (.+)/);
@@ -172,7 +181,12 @@ function parseCodemap(md) {
     }
     if (!currentSection) continue;
     const funcMatch = line.match(/^- `(\w+)`/);
-    if (funcMatch) sections.get(currentSection).push(funcMatch[1]);
+    if (funcMatch) {
+      const name = funcMatch[1];
+      sections.get(currentSection).push(name);
+      const impMatch = line.match(/importance:(\d+)/);
+      if (impMatch) codemapImportance.set(name, parseInt(impMatch[1]));
+    }
   }
   return sections;
 }
@@ -431,7 +445,128 @@ const CLUSTER_COLORS = [
   '#e64980', '#7950f2', '#15aabf', '#fab005', '#82c91e',
 ];
 
-function buildGraph(analysis, clusters, clusterNames, opts) {
+// Keyword → codemap section name mapping for affinity scoring
+const SYSTEM_KEYWORDS = new Map([
+  ['terrain', 'Math / Noise / Terrain'], ['height', 'Math / Noise / Terrain'],
+  ['noise', 'Math / Noise / Terrain'], ['fbm', 'Math / Noise / Terrain'],
+  ['simplex', 'Math / Noise / Terrain'], ['ridged', 'Math / Noise / Terrain'],
+  ['tree', 'World Generation'], ['rock', 'World Generation'],
+  ['building', 'World Generation'], ['settlement', 'World Generation'],
+  ['wall', 'World Generation'], ['kingdom', 'World Generation'],
+  ['deferred', 'Rendering / Lighting'], ['light', 'Rendering / Lighting'],
+  ['moon', 'Rendering / Lighting'], ['shadow', 'Rendering / Lighting'],
+  ['lighting', 'Rendering / Lighting'], ['sun', 'Rendering / Lighting'],
+  ['camera', 'Camera & HUD'], ['hud', 'Camera & HUD'], ['project', 'Camera & HUD'],
+  ['trample', 'Path / Trampling'], ['path', 'Path / Trampling'], ['trail', 'Path / Trampling'],
+  ['wind', 'Wind & Smoke'], ['smoke', 'Wind & Smoke'], ['chimney', 'Wind & Smoke'],
+  ['player', 'Player'],
+  ['npc', 'NPCs'], ['villager', 'NPCs'], ['corn', 'NPCs'], ['farm', 'NPCs'],
+  ['sq', 'Squirrels'], ['squirrel', 'Squirrels'], ['acorn', 'Squirrels'], ['canopy', 'Squirrels'],
+  ['ghost', 'Night / Combat'], ['wraith', 'Night / Combat'], ['night', 'Night / Combat'],
+  ['ashen', 'Night / Combat'], ['combat', 'Night / Combat'], ['nm', 'Night / Combat'],
+  ['contam', 'Contamination'], ['vine', 'Contamination'], ['cleanse', 'Contamination'],
+  ['turret', 'Turrets'], ['zap', 'Turrets'],
+  ['touch', 'Controls / Touch'], ['joystick', 'Controls / Touch'],
+  ['animate', 'Main Loop'], ['clock', 'Main Loop'], ['dt', 'Main Loop'],
+]);
+
+const AFFINITY_STOPWORDS = new Set([
+  'get', 'set', 'update', 'draw', 'create', 'is', 'has', 'find',
+  'init', 'spawn', 'apply', 'handle', 'resolve', 'remove', 'rebuild',
+  'pick', 'move', 'check', 'clear', 'start', 'stop', 'push', 'pop',
+  'nearest', 'current', 'effective', 'smooth', 'exact', 'idx', 'key',
+]);
+
+// Split camelCase or underscore-separated name into lowercase tokens
+function tokenizeName(name) {
+  // camelCase split: insertBefore each uppercase letter
+  return name
+    .replace(/([a-z])([A-Z])/g, '$1_$2')
+    .split(/[_\d]+/)
+    .map(t => t.toLowerCase())
+    .filter(t => t.length > 1 && !AFFINITY_STOPWORDS.has(t));
+}
+
+function computeAffinities(analysis, clusters, clusterNames) {
+  const { functions } = analysis;
+
+  // Build sectionName → clusterId reverse map
+  const sectionToId = new Map();
+  for (const [cid, name] of clusterNames) sectionToId.set(name, cid);
+
+  // Build reverse call graph
+  const calledBy = new Map();
+  for (const [fname, info] of functions) {
+    for (const callee of info.calls) {
+      if (!calledBy.has(callee)) calledBy.set(callee, new Set());
+      calledBy.get(callee).add(fname);
+    }
+  }
+
+  // Resolve a keyword token to a clusterId (or null)
+  function tokenToCluster(token) {
+    const section = SYSTEM_KEYWORDS.get(token);
+    if (!section) return null;
+    return sectionToId.get(section) ?? null;
+  }
+
+  const allAffinities = new Map();
+
+  for (const [fname, info] of functions) {
+    const scores = new Map();
+    const addScore = (cid, w) => scores.set(cid, (scores.get(cid) || 0) + w);
+
+    // 1. Codemap assignment (strongest signal)
+    const primary = clusters.get(fname);
+    if (primary != null) addScore(primary, 5.0);
+
+    // 2. Name tokens
+    for (const token of tokenizeName(fname)) {
+      const cid = tokenToCluster(token);
+      if (cid != null) addScore(cid, 1.5);
+    }
+
+    // 3. Globals read/written
+    for (const globals of [info.reads, info.writes, info.rw]) {
+      for (const g of globals) {
+        for (const token of tokenizeName(g)) {
+          const cid = tokenToCluster(token);
+          if (cid != null) addScore(cid, 0.5);
+        }
+      }
+    }
+
+    // 4. Functions called → callee's primary cluster
+    for (const callee of info.calls) {
+      const cid = clusters.get(callee);
+      if (cid != null) addScore(cid, 0.3);
+    }
+
+    // 5. Called-by → caller's primary cluster
+    const callers = calledBy.get(fname);
+    if (callers) {
+      for (const caller of callers) {
+        const cid = clusters.get(caller);
+        if (cid != null) addScore(cid, 0.2);
+      }
+    }
+
+    // Normalize and prune
+    const total = [...scores.values()].reduce((a, b) => a + b, 0);
+    if (total > 0) {
+      const normalized = new Map();
+      for (const [cid, w] of scores) {
+        const nw = w / total;
+        if (nw >= 0.05) normalized.set(cid, nw);
+      }
+      allAffinities.set(fname, normalized);
+    }
+  }
+
+  return allAffinities;
+}
+
+function buildGraph(analysis, clusters, clusterNames, affinities, opts) {
   const { functions } = analysis;
   const nodes = [];
   const links = [];
@@ -441,16 +576,22 @@ function buildGraph(analysis, clusters, clusterNames, opts) {
   const edgeMode = opts.edgeMode;
   const minShared = opts.minShared;
 
+  // Build sectionName → clusterId for global affinity computation
+  const sectionToId = new Map();
+  for (const [cid, name] of clusterNames) sectionToId.set(name, cid);
+
   // Function nodes
   for (const [name, info] of functions) {
     const clusterId = clusters.get(name) ?? 0;
+    const nodeAffinities = affinities.get(name) || new Map([[clusterId, 1.0]]);
     const node = {
       id: name,
       type: 'function',
       cluster: clusterId,
       clusterName: clusterNames.get(clusterId) || 'misc',
+      affinities: nodeAffinities,
       info,
-      radius: Math.max(4, Math.sqrt(info.lines) * 1.2),
+      radius: Math.max(4, (codemapImportance.get(name) || 3) * 2),
       color: CLUSTER_COLORS[clusterId % CLUSTER_COLORS.length],
     };
     nodes.push(node);
@@ -471,11 +612,39 @@ function buildGraph(analysis, clusters, clusterNames, opts) {
     // Only show globals used by 2+ functions
     for (const [gname, users] of globalUsage) {
       if (users.size < 2) continue;
+      // Compute global affinities from naming + connected functions
+      const gScores = new Map();
+      const addGScore = (cid, w) => gScores.set(cid, (gScores.get(cid) || 0) + w);
+      // Naming signal (strong for globals like NPC_SPEED, GHOST_MAX)
+      for (const token of tokenizeName(gname)) {
+        const section = SYSTEM_KEYWORDS.get(token);
+        if (section) {
+          const cid = sectionToId.get(section);
+          if (cid != null) addGScore(cid, 2.0);
+        }
+      }
+      // Connected functions' clusters
+      for (const fname of users) {
+        const c = clusters.get(fname) ?? 0;
+        addGScore(c, 1.0);
+      }
+      // Normalize
+      const gTotal = [...gScores.values()].reduce((a, b) => a + b, 0);
+      const gAffinities = new Map();
+      let bestCluster = 0, bestWeight = 0;
+      if (gTotal > 0) {
+        for (const [cid, w] of gScores) {
+          const nw = w / gTotal;
+          if (nw >= 0.05) gAffinities.set(cid, nw);
+          if (nw > bestWeight) { bestCluster = cid; bestWeight = nw; }
+        }
+      }
       const node = {
         id: gname,
         type: 'global',
-        cluster: -1,
-        clusterName: 'globals',
+        cluster: bestCluster,
+        clusterName: clusterNames.get(bestCluster) || 'misc',
+        affinities: gAffinities,
         radius: Math.max(3, Math.sqrt(users.size) * 2),
         color: '#555',
       };
@@ -578,20 +747,20 @@ function applySemanticZoom() {
     const el = d3.select(this);
     const r = d.radius || 4;
     const screenRadius = r * k;
-    if (screenRadius < 6) {
+    if (screenRadius < 8) {
       el.attr('opacity', 0);
       return;
     }
-    const opacity = Math.min(1, (screenRadius - 6) / 8);
-    const fontSize = Math.max(6, Math.min(11, 10 / k));
-    // Approximate text width: ~0.6 * fontSize * charCount (in world coords)
-    const textWidth = d.id.length * fontSize * 0.6;
-    const fitsInside = textWidth < r * 1.6 && fontSize < r * 1.2;
+    const opacity = Math.min(1, (screenRadius - 8) / 10);
+    // Size font to fit inside the node: diameter / char count, clamped
+    const maxFontForWidth = (r * 1.8) / Math.max(1, d.id.length * 0.55);
+    const maxFontForHeight = r * 0.9;
+    const fontSize = Math.max(2, Math.min(maxFontForWidth, maxFontForHeight));
     el.attr('opacity', opacity)
       .attr('font-size', fontSize)
-      .attr('dominant-baseline', fitsInside ? 'central' : 'auto')
-      .attr('dy', fitsInside ? 0 : r + fontSize * 1.2)
-      .attr('fill', fitsInside ? '#fff' : (d.type === 'global' ? '#666' : '#999'));
+      .attr('dominant-baseline', 'central')
+      .attr('dy', 0)
+      .attr('fill', '#fff');
   });
 
   // Cluster labels: always readable — scale inversely with zoom
@@ -617,6 +786,13 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
   const showLabels = document.getElementById('show-labels').checked;
   const showHulls = document.getElementById('show-hulls').checked;
 
+  // Save current positions before clearing
+  if (simulation) {
+    for (const n of simulation.nodes()) {
+      if (n.x != null && n.y != null) savedPositions.set(n.id, { x: n.x, y: n.y });
+    }
+  }
+
   // Clear
   gLinks.selectAll('*').remove();
   gNodes.selectAll('*').remove();
@@ -624,32 +800,39 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
   gHulls.selectAll('*').remove();
   gLabels.selectAll('*').remove();
 
-  // Pre-position nodes by cluster so layout starts sensible
-  const clusterIds = [...new Set(nodes.filter(n => n.type === 'function').map(n => n.cluster))];
+  // Restore saved positions or assign initial positions by cluster
+  const clusterIds = [...new Set(nodes.filter(n => n.cluster != null && n.cluster >= 0).map(n => n.cluster))];
   const numClusters = clusterIds.length;
   const clusterMembers = new Map();
   for (const cid of clusterIds) clusterMembers.set(cid, nodes.filter(n => n.cluster === cid));
-  // Place clusters in a tight circle
   const baseRadius = Math.min(width, height) * 0.08 * Math.sqrt(Math.max(1, numClusters));
-  clusterIds.forEach((cid, i) => {
-    const angle = (2 * Math.PI * i) / numClusters - Math.PI / 2;
-    const cx = Math.cos(angle) * baseRadius;
-    const cy = Math.sin(angle) * baseRadius;
-    const members = clusterMembers.get(cid);
-    const memberRadius = Math.sqrt(members.length) * 8;
-    members.forEach((n, j) => {
-      const a2 = (2 * Math.PI * j) / members.length;
-      const r2 = memberRadius * (0.3 + 0.7 * Math.random());
-      n.x = cx + Math.cos(a2) * r2;
-      n.y = cy + Math.sin(a2) * r2;
+
+  let restoredCount = 0;
+  for (const n of nodes) {
+    const saved = savedPositions.get(n.id);
+    if (saved) { n.x = saved.x; n.y = saved.y; restoredCount++; }
+  }
+
+  // Only do random cluster placement for nodes without saved positions
+  if (restoredCount < nodes.length) {
+    clusterIds.forEach((cid, i) => {
+      const angle = (2 * Math.PI * i) / numClusters - Math.PI / 2;
+      const cx = Math.cos(angle) * baseRadius;
+      const cy = Math.sin(angle) * baseRadius;
+      const members = clusterMembers.get(cid);
+      const memberRadius = Math.sqrt(members.length) * 8;
+      members.forEach((n, j) => {
+        if (n.x != null && n.y != null) return; // already restored
+        const a2 = (2 * Math.PI * j) / members.length;
+        const r2 = memberRadius * (0.3 + 0.7 * Math.random());
+        n.x = cx + Math.cos(a2) * r2;
+        n.y = cy + Math.sin(a2) * r2;
+      });
     });
-  });
-  // Place globals near center
-  nodes.filter(n => n.type === 'global').forEach((n, i) => {
-    const a = (2 * Math.PI * i) / Math.max(1, nodes.filter(m => m.type === 'global').length);
-    n.x = Math.cos(a) * 15;
-    n.y = Math.sin(a) * 15;
-  });
+  }
+
+  // Use low alpha if positions were restored (gentle settle), high if fresh layout
+  const isWarmStart = restoredCount > nodes.length * 0.5;
 
   // Simulation — tight layout, strong clustering
   if (simulation) simulation.stop();
@@ -661,8 +844,10 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
     .force('cluster', clusterForce(nodes, clusters, clusterNames, 3))
     .force('clusterSep', clusterSeparationForce(nodes, clusters, baseRadius * 2))
     .force('viewport', viewportContainForce(nodes))
-    .alpha(0.5)
-    .alphaDecay(0.04);
+    .alpha(isWarmStart ? 0.05 : 0.5)
+    .alphaDecay(0.06)
+    .velocityDecay(0.5)
+    .on('end', () => { simulation.stop(); });
 
   // Compute node degree for density-adaptive rendering
   const nodeDegree = new Map();
@@ -730,9 +915,9 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
     .join('g')
     .attr('class', 'node')
     .call(d3.drag()
-      .on('start', (e, d) => { if (!e.active) simulation.alphaTarget(0.1).restart(); d.fx = d.x; d.fy = d.y; startAttractor(d, graph); })
-      .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; d.x = e.x; d.y = e.y; if (attractorNode) renderPositions(); })
-      .on('end', (e, d) => { if (!attractorNode) { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; } lockAttractor(); })
+      .on('start', (e, d) => { d.fx = d.x; d.fy = d.y; startAttractor(d, graph); })
+      .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; d.x = e.x; d.y = e.y; renderPositions(); })
+      .on('end', (e, d) => { if (!attractorNode) { d.fx = null; d.fy = null; } lockAttractor(); })
     );
 
   node.append('circle')
@@ -743,38 +928,49 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
     .on('mouseenter', (e, d) => { if (!attractorNode && !attractorLocked) highlightNeighbors(d, graph); })
     .on('mouseleave', () => { if (!attractorNode && !attractorLocked) clearHighlight(); });
 
+  // Secondary affinity ring — shows cross-system membership
+  node.filter(d => {
+    if (!d.affinities || d.affinities.size < 2) return false;
+    const sorted = [...d.affinities.entries()].sort((a, b) => b[1] - a[1]);
+    return sorted[1][1] >= 0.15;
+  }).append('circle')
+    .attr('r', d => d.radius + 2.5)
+    .attr('fill', 'none')
+    .attr('stroke', d => {
+      const sorted = [...d.affinities.entries()].sort((a, b) => b[1] - a[1]);
+      return CLUSTER_COLORS[sorted[1][0] % CLUSTER_COLORS.length];
+    })
+    .attr('stroke-width', d => {
+      const sorted = [...d.affinities.entries()].sort((a, b) => b[1] - a[1]);
+      return Math.max(1, sorted[1][1] * 4);
+    })
+    .attr('stroke-opacity', d => {
+      const sorted = [...d.affinities.entries()].sort((a, b) => b[1] - a[1]);
+      return 0.4 + sorted[1][1] * 0.6;
+    })
+    .style('pointer-events', 'none');
+
   // Labels — visibility controlled by semantic zoom
   gLabels.selectAll('text')
     .data(nodes)
     .join('text')
     .attr('class', 'label')
-    .attr('fill', d => d.type === 'global' ? '#666' : '#999')
-    .attr('font-size', 10)
+    .attr('fill', '#fff')
     .attr('text-anchor', 'middle')
-    .attr('dy', d => d.radius + 12)
+    .attr('dominant-baseline', 'central')
+    .attr('dy', 0)
     .attr('opacity', 0) // start hidden, semantic zoom reveals
+    .style('pointer-events', 'none')
+    .style('user-select', 'none')
     .text(d => d.id);
 
   // Cluster hulls
-  if (showHulls && document.getElementById('view-mode').value !== 'hypergraph') {
-    const hullClusterIds = [...new Set(nodes.filter(n => n.type === 'function').map(n => n.cluster))];
-    simulation.on('tick.hulls', () => {
-      gHulls.selectAll('path').remove();
-      for (const cid of hullClusterIds) {
-        const members = nodes.filter(n => n.cluster === cid && n.type === 'function');
-        if (members.length < 3) continue;
-        const points = members.map(d => [d.x, d.y]);
-        const hull = d3.polygonHull(points);
-        if (!hull) continue;
-        // Expand hull
-        const expanded = expandHull(hull, 20);
-        gHulls.append('path')
-          .attr('class', 'hull')
-          .attr('d', `M${expanded.join('L')}Z`)
-          .attr('fill', CLUSTER_COLORS[cid % CLUSTER_COLORS.length])
-          .attr('stroke', CLUSTER_COLORS[cid % CLUSTER_COLORS.length]);
-      }
-    });
+  currentNodes = nodes;
+  if (showHulls) {
+    currentHullClusterIds = [...new Set(nodes.filter(n => n.cluster != null && n.cluster >= 0).map(n => n.cluster))];
+    simulation.on('tick.hulls', renderHulls);
+  } else {
+    currentHullClusterIds = null;
   }
 
   // Cluster name labels — one per cluster
@@ -800,16 +996,7 @@ function renderGraph(graph, analysis, clusters, clusterNames) {
     gLabels.selectAll('text')
       .attr('x', (d, i) => nodes[i].x)
       .attr('y', (d, i) => nodes[i].y);
-    // Position cluster labels above each cluster
-    clusterLabel.each(function(d) {
-      const members = nodes.filter(n => n.cluster === d.cid && n.type === 'function');
-      if (!members.length) return;
-      let cx = 0, cy = 0;
-      for (const m of members) { cx += m.x; cy += m.y; }
-      cx /= members.length; cy /= members.length;
-      const minY = Math.min(...members.map(m => m.y - m.radius));
-      d3.select(this).attr('x', cx).attr('y', minY - 10);
-    });
+    renderClusterLabels();
   });
 
   // Update stats
@@ -845,13 +1032,14 @@ function expandHull(hull, pad) {
 }
 
 function clusterForce(nodes, clusters, clusterNames, strength) {
-  // Push nodes toward their cluster centroid
+  // Push nodes toward their affiliated cluster centroids (weighted by affinity)
   const centroids = new Map();
   return (alpha) => {
+    // Compute centroids from primary membership only (stable anchors)
     centroids.clear();
     const counts = new Map();
     for (const n of nodes) {
-      if (n.type !== 'function') continue;
+      if (n.cluster == null || n.cluster < 0) continue;
       const c = n.cluster;
       if (!centroids.has(c)) { centroids.set(c, { x: 0, y: 0 }); counts.set(c, 0); }
       centroids.get(c).x += n.x;
@@ -862,24 +1050,37 @@ function clusterForce(nodes, clusters, clusterNames, strength) {
       cen.x /= counts.get(c);
       cen.y /= counts.get(c);
     }
+    const s = strength * (1 - attractorHoldStrength * 0.85);
     for (const n of nodes) {
-      if (n.type !== 'function') continue;
-      const cen = centroids.get(n.cluster);
-      if (!cen) continue;
-      const s = strength * (1 - attractorHoldStrength * 0.85);
-      n.vx += (cen.x - n.x) * s * alpha;
-      n.vy += (cen.y - n.y) * s * alpha;
+      if (!n.affinities || n.affinities.size === 0) {
+        // Fallback: pull toward primary
+        if (n.cluster == null || n.cluster < 0) continue;
+        const cen = centroids.get(n.cluster);
+        if (cen) { n.vx += (cen.x - n.x) * s * alpha; n.vy += (cen.y - n.y) * s * alpha; }
+        continue;
+      }
+      // Multi-pull: weighted toward each affiliated centroid
+      for (const [cid, weight] of n.affinities) {
+        const cen = centroids.get(cid);
+        if (!cen) continue;
+        n.vx += (cen.x - n.x) * s * weight * alpha;
+        n.vy += (cen.y - n.y) * s * weight * alpha;
+      }
     }
   };
 }
 
+const CLUSTER_GAP = 40; // minimum pixel gap between cluster boundaries
+
 function clusterSeparationForce(nodes, clusters, minDist) {
-  // Push cluster centroids apart so they don't overlap
+  // Hard boundary: compute each cluster's bounding radius from its centroid,
+  // then ensure no two clusters' boundaries overlap (with CLUSTER_GAP padding).
+  // Also push stray nodes back inside their own cluster boundary.
   return (alpha) => {
     const centroids = new Map();
     const members = new Map();
     for (const n of nodes) {
-      if (n.type !== 'function') continue;
+      if (n.cluster == null || n.cluster < 0) continue;
       const c = n.cluster;
       if (!centroids.has(c)) { centroids.set(c, { x: 0, y: 0 }); members.set(c, []); }
       centroids.get(c).x += n.x;
@@ -891,20 +1092,38 @@ function clusterSeparationForce(nodes, clusters, minDist) {
       cen.x /= m.length;
       cen.y /= m.length;
     }
+
+    // Compute bounding radius for each cluster (max distance from centroid to any member)
+    const radii = new Map();
+    for (const [c, cen] of centroids) {
+      let maxR = 0;
+      for (const n of members.get(c)) {
+        const dx = n.x - cen.x, dy = n.y - cen.y;
+        const d = Math.sqrt(dx * dx + dy * dy) + (n.radius || 4);
+        if (d > maxR) maxR = d;
+      }
+      radii.set(c, maxR);
+    }
+
+    // Push clusters apart based on actual bounding radii + gap
+    // Push clusters apart via direct position displacement (not velocity).
+    // This avoids being eaten by velocityDecay while staying stable.
     const cids = [...centroids.keys()];
+    const attenuation = 1 - attractorHoldStrength * 0.9;
     for (let i = 0; i < cids.length; i++) {
       for (let j = i + 1; j < cids.length; j++) {
-        const a = centroids.get(cids[i]);
-        const b = centroids.get(cids[j]);
-        let dx = b.x - a.x, dy = b.y - a.y;
-        let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-        if (dist < minDist) {
-          const push = (minDist - dist) * 0.05 * alpha * (1 - attractorHoldStrength * 0.9);
-          const nx = (dx / dist) * push;
-          const ny = (dy / dist) * push;
-          for (const n of members.get(cids[i])) { n.vx -= nx; n.vy -= ny; }
-          for (const n of members.get(cids[j])) { n.vx += nx; n.vy += ny; }
-        }
+        const ca = centroids.get(cids[i]), cb = centroids.get(cids[j]);
+        let dx = cb.x - ca.x, dy = cb.y - ca.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const needed = radii.get(cids[i]) + radii.get(cids[j]) + CLUSTER_GAP;
+        if (dist >= needed) continue;
+        // Move each cluster's members directly, 10% of overlap per tick
+        const overlap = needed - dist;
+        const move = overlap * 0.1 * attenuation;
+        const nx = (dx / dist) * move;
+        const ny = (dy / dist) * move;
+        for (const n of members.get(cids[i])) { if (n.fx == null) { n.x -= nx; n.y -= ny; } }
+        for (const n of members.get(cids[j])) { if (n.fx == null) { n.x += nx; n.y += ny; } }
       }
     }
   };
@@ -1048,11 +1267,29 @@ function clearHighlight() {
   gLabels.selectAll('text').attr('opacity', 1);
 }
 
+function affinityBarsHTML(d, clusterNames) {
+  if (!d.affinities || d.affinities.size === 0) return '';
+  const sorted = [...d.affinities.entries()].sort((a, b) => b[1] - a[1]);
+  const bars = sorted.map(([cid, weight]) => {
+    const pct = Math.round(weight * 100);
+    const color = CLUSTER_COLORS[cid % CLUSTER_COLORS.length];
+    const name = clusterNames.get(cid) || `system_${cid}`;
+    return `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">
+      <div style="width:${Math.max(4, pct)}%;height:6px;background:${color};border-radius:3px;min-width:4px"></div>
+      <span style="color:${color};white-space:nowrap">${name} ${pct}%</span>
+    </div>`;
+  }).join('');
+  return `<div class="section"><div class="section-title">Affinities</div>${bars}</div>`;
+}
+
 function selectNode(d, analysis) {
   selectedNode = d;
   const panel = document.getElementById('info-panel');
   panel.classList.add('open');
   document.getElementById('info-name').textContent = d.id;
+
+  const clusterNames = currentClusterNames;
+  const affinitySection = affinityBarsHTML(d, clusterNames);
 
   if (d.type === 'global') {
     // Show which functions use this global
@@ -1066,6 +1303,7 @@ function selectNode(d, analysis) {
     }
     document.getElementById('info-body').innerHTML = `
       <div class="section"><div class="section-title">Type</div>global variable</div>
+      ${affinitySection}
       <div class="section"><div class="section-title">Used by ${users.length} functions</div>
         ${users.map(u => `<span class="tag">${u.fname} (${u.access})</span>`).join('')}
       </div>`;
@@ -1083,6 +1321,7 @@ function selectNode(d, analysis) {
   document.getElementById('info-body').innerHTML = `
     <div class="section"><div class="section-title">Location</div>Line ${info.line} — ${info.endLine} (${info.lines} lines)</div>
     <div class="section"><div class="section-title">System</div>${d.clusterName}</div>
+    ${affinitySection}
     ${reads.length ? `<div class="section"><div class="section-title">Reads (${reads.length})</div>${reads.map(r => `<span class="tag read">${r}</span>`).join('')}</div>` : ''}
     ${writes.length ? `<div class="section"><div class="section-title">Writes (${writes.length})</div>${writes.map(w => `<span class="tag write">${w}</span>`).join('')}</div>` : ''}
     ${rw.length ? `<div class="section"><div class="section-title">Read+Write (${rw.length})</div>${rw.map(v => `<span class="tag rw">${v}</span>`).join('')}</div>` : ''}
@@ -1094,8 +1333,39 @@ function selectNode(d, analysis) {
 // Pure JS — stops d3 entirely, runs own animation loop.
 let attractorRAF = null;
 
+function renderHulls() {
+  if (!currentHullClusterIds || !currentNodes) return;
+  gHulls.selectAll('path').remove();
+  for (const cid of currentHullClusterIds) {
+    const members = currentNodes.filter(n => n.cluster === cid);
+    if (members.length < 3) continue;
+    const points = members.map(d => [d.x, d.y]);
+    const hull = d3.polygonHull(points);
+    if (!hull) continue;
+    const expanded = expandHull(hull, 20);
+    gHulls.append('path')
+      .attr('class', 'hull')
+      .attr('d', `M${expanded.join('L')}Z`)
+      .attr('fill', CLUSTER_COLORS[cid % CLUSTER_COLORS.length])
+      .attr('stroke', CLUSTER_COLORS[cid % CLUSTER_COLORS.length]);
+  }
+}
+
+function renderClusterLabels() {
+  if (!currentNodes) return;
+  gClusterLabels.selectAll('text').each(function(d) {
+    const members = currentNodes.filter(n => n.cluster === d.cid && n.type === 'function');
+    if (!members.length) return;
+    let cx = 0, cy = 0;
+    for (const m of members) { cx += m.x; cy += m.y; }
+    cx /= members.length; cy /= members.length;
+    const minY = Math.min(...members.map(m => m.y - m.radius));
+    d3.select(this).attr('x', cx).attr('y', minY - 10);
+  });
+}
+
 function renderPositions() {
-  // Same as d3 tick handler — sync SVG to data positions
+  // Sync SVG to data positions — links, nodes, labels, hulls, cluster labels
   gLinks.selectAll('.link')
     .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
     .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
@@ -1105,6 +1375,8 @@ function renderPositions() {
   gLabels.selectAll('text')
     .attr('x', (d, i) => allNodes[i].x)
     .attr('y', (d, i) => allNodes[i].y);
+  renderHulls();
+  renderClusterLabels();
 }
 
 function attractorLoop() {
@@ -1120,6 +1392,8 @@ function attractorLoop() {
 
   const neighbors = adj.get(attractorNode.id) || new Set();
 
+  // Collect neighbor positions for collision resolution between them
+  const neighborNodes = [];
   for (const n of simulation.nodes()) {
     if (n.id === attractorNode.id) continue;
     if (!neighbors.has(n.id)) continue;
@@ -1130,12 +1404,82 @@ function attractorLoop() {
 
     // Target distance: just outside touching + small gap
     const targetDist = n.radius + attractorNode.radius + 12;
-    if (dist <= targetDist) continue;
 
-    // Lerp 15% of the way toward target distance each frame
-    const move = (dist - targetDist) * str * 0.15;
+    // Pull in if too far, push out if too close
+    const diff = dist - targetDist;
+    const move = diff * str * 0.15;
     n.x += (dx / dist) * move;
     n.y += (dy / dist) * move;
+
+    neighborNodes.push(n);
+  }
+
+  // Resolve collisions between neighbor nodes so they don't stack
+  for (let i = 0; i < neighborNodes.length; i++) {
+    for (let j = i + 1; j < neighborNodes.length; j++) {
+      const a = neighborNodes[i], b = neighborNodes[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
+      const minDist = a.radius + b.radius + 8;
+      if (dist < minDist) {
+        const push = (minDist - dist) * 0.8;
+        const nx = (dx / dist) * push;
+        const ny = (dy / dist) * push;
+        a.x -= nx; a.y -= ny;
+        b.x += nx; b.y += ny;
+      }
+    }
+  }
+
+  // Hull-level collision: compute bounding circle per cluster,
+  // then push entire clusters apart as rigid bodies when they overlap.
+  const allNodes = simulation.nodes();
+  const cCentroids = new Map();
+  const cMembers = new Map();
+  for (const n of allNodes) {
+    if (n.cluster == null || n.cluster < 0) continue;
+    const c = n.cluster;
+    if (!cCentroids.has(c)) { cCentroids.set(c, { x: 0, y: 0, count: 0 }); cMembers.set(c, []); }
+    const cen = cCentroids.get(c);
+    cen.x += n.x; cen.y += n.y; cen.count++;
+    cMembers.get(c).push(n);
+  }
+  const cRadii = new Map();
+  for (const [c, cen] of cCentroids) {
+    cen.x /= cen.count; cen.y /= cen.count;
+    let maxR = 0;
+    for (const n of cMembers.get(c)) {
+      const dx = n.x - cen.x, dy = n.y - cen.y;
+      maxR = Math.max(maxR, Math.sqrt(dx * dx + dy * dy) + (n.radius || 4));
+    }
+    cRadii.set(c, maxR);
+  }
+  const clusterIds = [...cCentroids.keys()];
+  for (let i = 0; i < clusterIds.length; i++) {
+    for (let j = i + 1; j < clusterIds.length; j++) {
+      const ci = clusterIds[i], cj = clusterIds[j];
+      const a = cCentroids.get(ci), b = cCentroids.get(cj);
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const needed = cRadii.get(ci) + cRadii.get(cj) + CLUSTER_GAP;
+      if (dist >= needed) continue;
+      // Push the cluster that does NOT contain the attractor node
+      const attCluster = attractorNode.cluster;
+      const overlap = (needed - dist) * 0.2;
+      const nx = (dx / dist) * overlap, ny = (dy / dist) * overlap;
+      if (ci === attCluster) {
+        // Push cluster j away
+        for (const n of cMembers.get(cj)) { if (n.fx == null) { n.x += nx; n.y += ny; } }
+      } else if (cj === attCluster) {
+        // Push cluster i away
+        for (const n of cMembers.get(ci)) { if (n.fx == null) { n.x -= nx; n.y -= ny; } }
+      } else {
+        // Neither is the attractor — split evenly
+        const half = 0.5;
+        for (const n of cMembers.get(ci)) { if (n.fx == null) { n.x -= nx * half; n.y -= ny * half; } }
+        for (const n of cMembers.get(cj)) { if (n.fx == null) { n.x += nx * half; n.y += ny * half; } }
+      }
+    }
   }
 
   renderPositions();
@@ -1197,9 +1541,6 @@ function releaseAttractor() {
   attractorNode = null;
   attractorHoldStrength = 0;
   attractorLocked = false;
-
-  // Restart d3
-  simulation.alpha(0.3).restart();
 }
 
 // SPACEBAR releases the locked attractor
@@ -1207,6 +1548,10 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'Space' && attractorLocked) {
     e.preventDefault();
     releaseAttractor();
+  }
+  // X — re-enable physics to re-settle the layout
+  if (e.code === 'KeyX' && !attractorLocked && !attractorNode) {
+    simulation.alpha(0.15).restart();
   }
 });
 
@@ -1238,7 +1583,9 @@ function rebuild() {
   if (!analysisResult) return;
   const clusters = clusterFunctions(analysisResult);
   const clusterNames = nameClusters(analysisResult, clusters);
-  const graph = buildGraph(analysisResult, clusters, clusterNames, getOpts());
+  currentClusterNames = clusterNames;
+  const affinities = computeAffinities(analysisResult, clusters, clusterNames);
+  const graph = buildGraph(analysisResult, clusters, clusterNames, affinities, getOpts());
   renderGraph(graph, analysisResult, clusters, clusterNames);
 }
 
@@ -1389,7 +1736,8 @@ function applyFocus(data) {
 }
 
 // ── Main Loop ──────────────────────────────────────
-async function loadAndAnalyze() {
+async function loadAndAnalyze(force) {
+  if (!force && !document.getElementById('live-reload').checked) return;
   const statusEl = document.getElementById('status');
   try {
     const [html, codemapMd] = await Promise.all([
@@ -1428,8 +1776,19 @@ window.addEventListener('resize', () => {
   svg.attr('width', width).attr('height', height);
 });
 
-loadAndAnalyze();
-setInterval(loadAndAnalyze, REFRESH_MS);
+loadAndAnalyze(true);
+setInterval(() => loadAndAnalyze(false), REFRESH_MS);
+document.getElementById('live-reload').addEventListener('change', (e) => {
+  const statusEl = document.getElementById('status');
+  if (e.target.checked) {
+    lastHash = null; // force re-check on next poll
+    statusEl.textContent = 'resuming...';
+    statusEl.className = '';
+  } else {
+    statusEl.textContent = 'paused';
+    statusEl.className = '';
+  }
+});
 connectFocusSSE();
 </script>
 </body>

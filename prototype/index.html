@@ -2566,6 +2566,10 @@
     window.addEventListener('keydown', e => {
       keys[e.key.toLowerCase()] = true;
       if (e.key === ' ') e.preventDefault(); // prevent scroll on space
+      // Escape toggles pointer lock
+      if (e.key === 'Escape' && gameStarted && !isTouchDevice) {
+        if (!pointerLocked) renderer.domElement.requestPointerLock();
+      }
     });
     window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
@@ -2584,24 +2588,113 @@
 
     // Mouse look
     let pointerLocked = false;
-    renderer.domElement.addEventListener('click', () => {
+    // Double-click to re-lock pointer (single click = click-to-move during day)
+    renderer.domElement.addEventListener('dblclick', () => {
       if (!gameStarted) return;
       if (!isTouchDevice) renderer.domElement.requestPointerLock();
+      if (!SFX.initialized) SFX.init();
+    });
+    renderer.domElement.addEventListener('click', () => {
+      if (!gameStarted) return;
+      // Only auto-lock pointer at night or when not in click-to-move mode
+      const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
+      if (!isTouchDevice && !isDay) renderer.domElement.requestPointerLock();
       if (!SFX.initialized) SFX.init();
     });
     document.addEventListener('pointerlockchange', () => {
       pointerLocked = document.pointerLockElement === renderer.domElement;
     });
+    let mouseDragLook = false;
     document.addEventListener('mousemove', e => {
-      if (!pointerLocked) return;
-      cameraYaw   -= e.movementX * 0.003;
-      cameraPitch  = Math.max(-0.3, Math.min(Math.PI / 2 - 0.05, cameraPitch + e.movementY * 0.003));
+      if (pointerLocked || mouseDragLook) {
+        cameraYaw   -= e.movementX * 0.003;
+        cameraPitch  = Math.max(-0.3, Math.min(Math.PI / 2 - 0.05, cameraPitch + e.movementY * 0.003));
+      }
     });
 
-    // Mouse button tracking (for attack hold)
+    // Mouse button tracking (for attack hold + ghost interactions)
     let mouseDown = false;
-    document.addEventListener('mousedown', e => { if (e.button === 0 && pointerLocked) mouseDown = true; });
-    document.addEventListener('mouseup', e => { if (e.button === 0) mouseDown = false; });
+    let mouseGhostHoldStart = -1; // for desktop ghost charge-jump timing
+    document.addEventListener('mousedown', e => {
+      if (e.button !== 0) return;
+      if (pointerLocked) {
+        if (ghostActive) {
+          // Night + pointer locked: hold = charge jump
+          keys[' '] = true;
+          mouseGhostHoldStart = performance.now() / 1000;
+        } else {
+          mouseDown = true; // Day: attack
+        }
+      }
+    });
+    document.addEventListener('mouseup', e => {
+      if (e.button !== 0) return;
+      if (ghostActive && mouseGhostHoldStart >= 0) {
+        const holdDuration = performance.now() / 1000 - mouseGhostHoldStart;
+        keys[' '] = false; // release charge → jump fires
+        if (holdDuration < 0.15 && !playerAirborne) {
+          // Quick click — throb from screen center
+          spawnGhostThrob(window.innerWidth / 2, window.innerHeight / 2);
+        }
+        mouseGhostHoldStart = -1;
+      }
+      mouseDown = false;
+    });
+
+    // Desktop click-to-move + drag-to-look (when pointer not locked)
+    let mouseDownStart = null; // { x, y, time, onBlob } for detecting drag vs click
+    const MOUSE_DRAG_THRESHOLD = 5; // px before it becomes a drag
+    renderer.domElement.addEventListener('mousedown', e => {
+      if (e.button === 0 && !pointerLocked && gameStarted) {
+        const onBlob = ghostActive && ghostScreenDist(e.clientX, e.clientY) < GHOST_TOUCH_SCREEN_RADIUS;
+        mouseDownStart = { x: e.clientX, y: e.clientY, time: performance.now() / 1000, onBlob };
+        if (onBlob) {
+          // Clicked on blob: start attract + charge jump
+          const pos = ghostScreenTo3D(e.clientX, e.clientY);
+          ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
+          ghostAttractActive = true;
+          if (!playerAirborne) keys[' '] = true;
+        }
+      }
+    });
+    document.addEventListener('mousemove', e => {
+      if (mouseDownStart && !mouseDragLook) {
+        const dx = e.clientX - mouseDownStart.x, dy = e.clientY - mouseDownStart.y;
+        if (Math.abs(dx) + Math.abs(dy) > MOUSE_DRAG_THRESHOLD) {
+          mouseDragLook = true;
+          if (mouseDownStart.onBlob) {
+            // Dragging on blob: guide it (cancel jump charge, keep attract)
+            if (keys[' ']) { keys[' '] = false; ghostHoldStart = -1; }
+          } else {
+            clearTouchTarget(); // cancel any pending move if we start dragging
+          }
+        }
+      }
+      // Update attract target while dragging on blob
+      if (mouseDownStart && mouseDownStart.onBlob && mouseDragLook) {
+        const pos = ghostScreenTo3D(e.clientX, e.clientY);
+        ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
+      }
+    });
+    document.addEventListener('mouseup', e => {
+      if (e.button === 0 && mouseDownStart && !pointerLocked && gameStarted) {
+        const holdDuration = performance.now() / 1000 - mouseDownStart.time;
+        if (mouseDownStart.onBlob) {
+          // Release blob
+          keys[' '] = false;
+          ghostAttractActive = false;
+          if (!mouseDragLook && holdDuration < 0.15 && !playerAirborne) {
+            spawnGhostThrob(mouseDownStart.x, mouseDownStart.y);
+          }
+        } else if (!mouseDragLook) {
+          // Day: click-to-move
+          const isDay = timeOfDay > 0.28 && timeOfDay < 0.72;
+          if (isDay && !ghostActive) handleTouchPick(mouseDownStart.x, mouseDownStart.y);
+        }
+        mouseDragLook = false;
+        mouseDownStart = null;
+      }
+    });
 
     // ─────────────────────────────────────────
     //  TOUCH INTERACTION — 3D object picking via raycaster
@@ -2610,8 +2703,9 @@
     const touchPickNDC = new THREE.Vector2();
 
     // Touch target state — tap an object to auto-walk + interact
-    let touchTarget = null;  // { type: 'rock'|'building'|..., index, position: Vector3 }
+    let touchTarget = null;  // { type: 'rock'|'building'|'terrain', index, position: Vector3 }
     const TOUCH_ARRIVE_DIST = 4.5; // distance at which auto-walk stops and interaction begins
+    const TERRAIN_ARRIVE_DIST = 2.0; // how close to get to a terrain click target
 
     // Perform a raycast from screen coords and return the best interactable hit
     function touchPick(screenX, screenY) {
@@ -2652,6 +2746,14 @@
         }
       }
 
+      // Fallback: check terrain if no object was hit
+      if (!bestHit) {
+        const terrainHits = touchPickRaycaster.intersectObject(terrain.mesh);
+        if (terrainHits.length > 0) {
+          bestHit = { type: 'terrain', index: -1, point: terrainHits[0].point.clone(), distance: terrainHits[0].distance };
+        }
+      }
+
       return bestHit;
     }
 
@@ -2669,10 +2771,11 @@
         touchTarget = { type: 'rock', index: hit.index, position: rp.clone() };
       } else if (hit.type === 'building' && isDay && !ghostActive) {
         const ba = buildingAttractors[hit.index];
-        if (!ba.contaminated || ba.destroyed) { clearTouchTarget(); return; }
+        if (ba.destroyed) { clearTouchTarget(); return; }
         touchTarget = { type: 'building', index: hit.index, position: new THREE.Vector3(ba.x, ba.y, ba.z) };
+      } else if (hit.type === 'terrain' && isDay && !ghostActive) {
+        touchTarget = { type: 'terrain', index: -1, position: hit.point.clone() };
       }
-      // Future: add more types here (NPCs, farms, etc.)
     }
 
     // ── Blue touch debug light — shows where touches land in the 3D scene ──
@@ -2762,18 +2865,29 @@
       }
       if (touchTarget.type === 'building') {
         const ba = buildingAttractors[touchTarget.index];
-        if (!ba.contaminated || ba.destroyed) { clearTouchTarget(); return; }
+        if (ba.destroyed) { clearTouchTarget(); return; }
       }
 
-      const interactRange = touchTarget.type === 'rock' ? PLAYER_MINE_RANGE : CLEANSE_RANGE;
-
-      if (dist < interactRange * 0.9) {
-        // Close enough — trigger interaction
-        mouseDown = true; // activates existing attack/mine logic
-        clearTouchTarget();
-        // Auto-release after a brief window to let the swing land
-        setTimeout(() => { if (isTouchDevice) mouseDown = false; }, 600);
-        return;
+      // Terrain: just walk there and stop
+      if (touchTarget.type === 'terrain') {
+        if (dist < TERRAIN_ARRIVE_DIST) { clearTouchTarget(); return; }
+      } else {
+        // Rock or building: walk up and interact
+        const interactRange = touchTarget.type === 'rock' ? PLAYER_MINE_RANGE : CLEANSE_RANGE;
+        if (dist < interactRange * 0.9) {
+          if (touchTarget.type === 'building') {
+            const ba = buildingAttractors[touchTarget.index];
+            if (ba.contaminated) {
+              mouseDown = true;
+              setTimeout(() => { if (isTouchDevice) mouseDown = false; }, 600);
+            }
+          } else {
+            mouseDown = true;
+            setTimeout(() => { if (isTouchDevice) mouseDown = false; }, 600);
+          }
+          clearTouchTarget();
+          return;
+        }
       }
 
       // Auto-walk: inject movement toward target via touchMoveX/Y
@@ -2913,19 +3027,35 @@
         document.body.classList.toggle('touch-hidden');
       }, { passive: false });
 
-      // ── Ghost zone (night mode — fullscreen touch: drag=look, tap=jump) ──
+      // ── Ghost zone (night mode) ──
+      // Touch near blob → attract/guide blob (drag to steer), hold still = charge jump, quick tap = throb
+      // Touch far from blob → camera rotation (drag to look)
       const ghostZone = document.getElementById('touch-ghost-zone');
-      let ghostTouches = {};     // id → { startX, startY, lastX, lastY, moved }
-      const TAP_THRESHOLD = 12;  // px — under this is a tap, over is a drag/look
+      let ghostTouches = {};     // id → { startX, startY, lastX, lastY, moved, startTime, onBlob }
+      const TAP_THRESHOLD = 12;  // px — under this is a tap/hold, over is a drag
+      const HOLD_THRESHOLD = 0.15; // seconds — under = tap (throb), over = hold (jump charge)
+      let ghostBlobTouchId = null; // which touch is controlling the blob
 
       ghostZone.addEventListener('touchstart', e => {
         e.preventDefault();
         for (const t of e.changedTouches) {
+          const dist = ghostScreenDist(t.clientX, t.clientY);
+          const onBlob = dist < GHOST_TOUCH_SCREEN_RADIUS;
           ghostTouches[t.identifier] = {
             startX: t.clientX, startY: t.clientY,
-            lastX: t.clientX, lastY: t.clientY, moved: false
+            lastX: t.clientX, lastY: t.clientY, moved: false,
+            startTime: performance.now() / 1000,
+            onBlob
           };
           spawnTouchDebugLight(t.clientX, t.clientY);
+          if (onBlob && ghostBlobTouchId === null) {
+            ghostBlobTouchId = t.identifier;
+            // Start attract + charge jump
+            const pos = ghostScreenTo3D(t.clientX, t.clientY);
+            ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
+            ghostAttractActive = true;
+            if (!playerAirborne) keys[' '] = true; // begin jump charge
+          }
         }
       }, { passive: false });
 
@@ -2936,7 +3066,18 @@
           if (!gt) continue;
           const dx = t.clientX - gt.startX, dy = t.clientY - gt.startY;
           if (Math.abs(dx) + Math.abs(dy) > TAP_THRESHOLD) gt.moved = true;
-          if (gt.moved) {
+
+          if (t.identifier === ghostBlobTouchId) {
+            // Blob touch: update attract target (guide the blob)
+            const pos = ghostScreenTo3D(t.clientX, t.clientY);
+            ghostAttractX = pos.x; ghostAttractY = pos.y; ghostAttractZ = pos.z;
+            // If finger moved significantly, cancel jump charge (guiding, not charging)
+            if (gt.moved && keys[' ']) {
+              keys[' '] = false;
+              ghostHoldStart = -1;
+            }
+          } else if (gt.moved) {
+            // Non-blob touch: camera rotation
             touchLookDX += (t.clientX - gt.lastX);
             touchLookDY += (t.clientY - gt.lastY);
           }
@@ -2947,16 +3088,33 @@
       ghostZone.addEventListener('touchend', e => {
         for (const t of e.changedTouches) {
           const gt = ghostTouches[t.identifier];
-          if (gt && !gt.moved) {
-            // Tap → jump (pulse space key briefly)
-            keys[' '] = true;
-            setTimeout(() => { keys[' '] = false; }, 100);
+          if (!gt) { delete ghostTouches[t.identifier]; continue; }
+          const holdDuration = performance.now() / 1000 - gt.startTime;
+
+          if (t.identifier === ghostBlobTouchId) {
+            // Release blob touch
+            keys[' '] = false; // release jump charge
+            ghostAttractActive = false;
+            ghostBlobTouchId = null;
+
+            if (!gt.moved && holdDuration < HOLD_THRESHOLD) {
+              // Quick tap on blob → throb
+              spawnGhostThrob(gt.startX, gt.startY);
+            }
           }
           delete ghostTouches[t.identifier];
         }
       });
       ghostZone.addEventListener('touchcancel', e => {
-        for (const t of e.changedTouches) delete ghostTouches[t.identifier];
+        for (const t of e.changedTouches) {
+          if (t.identifier === ghostBlobTouchId) {
+            keys[' '] = false;
+            ghostHoldStart = -1;
+            ghostAttractActive = false;
+            ghostBlobTouchId = null;
+          }
+          delete ghostTouches[t.identifier];
+        }
       });
 
       // ── Fullscreen button ──
@@ -8377,11 +8535,56 @@
 
     // Moon jump
     const MOON_GRAVITY = 7;
-    const JUMP_VELOCITY = 50.0;
+    const JUMP_VELOCITY_MIN = 20.0;   // minimum jump (quick tap)
+    const JUMP_VELOCITY_MAX = 65.0;   // max jump (full charge)
+    const JUMP_CHARGE_TIME = 1.2;     // seconds to reach full charge
     let playerYVel = 0;
     let playerAirborne = false;
     let _jumpLaunchFrame = false;
     let ghostActive = false;  // is ghost cloud currently active?
+
+    // Ghost interaction state — hold-to-coalesce + throb on tap
+    let ghostHoldStart = -1;        // timestamp when hold began (-1 = not holding)
+    let ghostCoalesce = 0;          // 0..1 coalesce factor (tightens blob orbits)
+    const COALESCE_RATE = 1.0 / JUMP_CHARGE_TIME; // ramp speed
+    // Throb: repulsion pulse from a 3D point
+    let ghostThrobs = [];           // [{ x, y, z, age, strength }]
+    const THROB_DURATION = 0.5;     // seconds
+    const THROB_RADIUS = 6.0;       // world units
+    const THROB_FORCE = 40.0;       // repulsion strength
+
+    // Touch-attract: guide blob cloud by touching/dragging on it
+    let ghostAttractActive = false;
+    let ghostAttractX = 0, ghostAttractY = 0, ghostAttractZ = 0;
+    const GHOST_ATTRACT_STRENGTH = 12.0; // spring constant toward attract point
+    const GHOST_TOUCH_SCREEN_RADIUS = 0.35; // NDC distance — how close touch must be to blob center to count as "on blob"
+
+    // Raycast from screen coords to find 3D point nearest the blob cloud center
+    function ghostScreenTo3D(screenX, screenY) {
+      touchPickNDC.x = (screenX / window.innerWidth) * 2 - 1;
+      touchPickNDC.y = -(screenY / window.innerHeight) * 2 + 1;
+      touchPickRaycaster.setFromCamera(touchPickNDC, camera);
+      const ray = touchPickRaycaster.ray;
+      const pp = playerGroup.position;
+      const toPlayer = new THREE.Vector3(pp.x - ray.origin.x, pp.y + 2.0 - ray.origin.y, pp.z - ray.origin.z);
+      const proj = toPlayer.dot(ray.direction);
+      return ray.at(Math.max(proj, 1.0), new THREE.Vector3());
+    }
+
+    // Estimate screen-space distance from a screen point to the blob cloud center
+    function ghostScreenDist(screenX, screenY) {
+      const pp = playerGroup.position;
+      const blobCenter = new THREE.Vector3(pp.x, pp.y + 2.0, pp.z);
+      const projected = blobCenter.clone().project(camera);
+      const ndcX = (screenX / window.innerWidth) * 2 - 1;
+      const ndcY = -(screenY / window.innerHeight) * 2 + 1;
+      return Math.sqrt((projected.x - ndcX) ** 2 + (projected.y - ndcY) ** 2);
+    }
+
+    function spawnGhostThrob(screenX, screenY) {
+      const hitPos = ghostScreenTo3D(screenX, screenY);
+      ghostThrobs.push({ x: hitPos.x, y: hitPos.y, z: hitPos.z, age: 0, strength: 1.0 });
+    }
 
     // Ghost blob data (SoA)
     const _gbx = new Float32Array(GHOST_MAX);
@@ -8492,6 +8695,7 @@
         ghostFade = Math.max(0, ghostFade - dt * 2.0);
       }
       ghostActive = ghostFade > 0.01;
+      if (!ghostActive) { ghostCoalesce = 0; ghostHoldStart = -1; ghostThrobs.length = 0; ghostAttractActive = false; }
       // Toggle touch controls for ghost mode
       if (isTouchDevice) document.body.classList.toggle('ghost-touch', ghostActive);
       if (!ghostActive) {
@@ -8666,15 +8870,16 @@
           continue;
         }
 
-        // Formation target — chaotic, irregular orbits
-        const orbR = _gborbit[i] * breath * (0.7 + 0.6 * Math.sin(t * 0.9 + _gbphase[i] * 5.3));
-        const orbSpeed = 0.2 + _gblayer[i] * 0.4 + Math.sin(_gbphase[i] * 2.1) * 0.3;
+        // Formation target — chaotic, irregular orbits (coalesce shrinks them)
+        const coalesceShrink = 1.0 - ghostCoalesce * 0.85; // at full coalesce, orbits → 15% of normal
+        const orbR = _gborbit[i] * breath * (0.7 + 0.6 * Math.sin(t * 0.9 + _gbphase[i] * 5.3)) * coalesceShrink;
+        const orbSpeed = (0.2 + _gblayer[i] * 0.4 + Math.sin(_gbphase[i] * 2.1) * 0.3) * (1.0 + ghostCoalesce * 2.0); // spin faster when coalescing
         const orbAngle = _gbphase[i] + t * orbSpeed + Math.sin(t * 1.3 + _gbphase[i] * 4.7) * 0.8;
         const tgtX = px + Math.cos(orbAngle) * orbR;
         const tgtZ = pz + Math.sin(orbAngle) * orbR;
-        const yRange = _gblayer[i] === 0 ? 1.0 : 2.2;
+        const yRange = (_gblayer[i] === 0 ? 1.0 : 2.2) * coalesceShrink;
         const tgtY = py + 2.0 + Math.sin(_gbphase[i] * 3.7 + t * 0.8) * yRange * breath
-          + Math.sin(t * 1.7 + _gbphase[i] * 6.1) * 0.6;
+          + Math.sin(t * 1.7 + _gbphase[i] * 6.1) * 0.6 * coalesceShrink;
 
         // Spring + shared curl + wind (no per-blob simplex calls)
         let fx = (tgtX - _gbx[i]) * GHOST_SPRING + _curlCenter.x * GHOST_CURL_STR + wdx;
@@ -8719,6 +8924,32 @@
             fx += (odx / od) * push + (-odz / od) * push * 0.6;
             fz += (odz / od) * push + (odx / od) * push * 0.6;
           }
+        }
+
+        // Throb repulsion — push blobs away from tap points
+        for (let th = 0; th < ghostThrobs.length; th++) {
+          const throb = ghostThrobs[th];
+          const tdx = _gbx[i] - throb.x, tdy = _gby[i] - throb.y, tdz = _gbz[i] - throb.z;
+          const td2 = tdx * tdx + tdy * tdy + tdz * tdz;
+          if (td2 < THROB_RADIUS * THROB_RADIUS && td2 > 0.01) {
+            const td = Math.sqrt(td2);
+            const falloff = 1.0 - td / THROB_RADIUS;
+            const fade = 1.0 - throb.age / THROB_DURATION;
+            const push = THROB_FORCE * falloff * falloff * fade * throb.strength;
+            fx += (tdx / td) * push;
+            fy += (tdy / td) * push;
+            fz += (tdz / td) * push;
+          }
+        }
+
+        // Touch-attract — pull blobs toward the finger's 3D position
+        if (ghostAttractActive) {
+          const adx = ghostAttractX - _gbx[i];
+          const ady = ghostAttractY - _gby[i];
+          const adz = ghostAttractZ - _gbz[i];
+          fx += adx * GHOST_ATTRACT_STRENGTH;
+          fy += ady * GHOST_ATTRACT_STRENGTH;
+          fz += adz * GHOST_ATTRACT_STRENGTH;
         }
 
         // Integrate — frame-rate-independent damping
@@ -8784,13 +9015,33 @@
       _ghostMat.emissiveIntensity = 0.3 + gp * 0.4;
       _ghostMat.opacity = 0.85 + ghostFade * 0.1;
 
-      // ── Moon jump ──
+      // ── Update throbs ──
+      for (let th = ghostThrobs.length - 1; th >= 0; th--) {
+        ghostThrobs[th].age += dt;
+        if (ghostThrobs[th].age >= THROB_DURATION) ghostThrobs.splice(th, 1);
+      }
+
+      // ── Update coalesce (hold state driven by ghostHoldStart) ──
+      if (ghostHoldStart >= 0 && !playerAirborne) {
+        ghostCoalesce = Math.min(1.0, ghostCoalesce + COALESCE_RATE * dt);
+      } else if (ghostCoalesce > 0) {
+        ghostCoalesce = Math.max(0, ghostCoalesce - COALESCE_RATE * 2.0 * dt); // relax faster
+      }
+
+      // ── Moon jump (charged by hold) ──
       if (ghostActive && keys[' '] && !playerAirborne) {
+        // Start charging
+        if (ghostHoldStart < 0) ghostHoldStart = t;
+      }
+      if (ghostActive && !keys[' '] && ghostHoldStart >= 0 && !playerAirborne) {
+        // Released — launch with charged velocity
+        const holdTime = Math.min(t - ghostHoldStart, JUMP_CHARGE_TIME);
+        const charge = holdTime / JUMP_CHARGE_TIME; // 0..1
         playerAirborne = true;
         _jumpLaunchFrame = true;
-        playerYVel = JUMP_VELOCITY;
+        playerYVel = JUMP_VELOCITY_MIN + charge * (JUMP_VELOCITY_MAX - JUMP_VELOCITY_MIN);
+        ghostHoldStart = -1;
         SFX.jumpLaunch();
-        // Launch carries current horizontal velocity — no reset
       }
       if (playerAirborne) {
         playerYVel -= MOON_GRAVITY * dt;
