@@ -58,6 +58,14 @@
     .game-hud { display: none; }
     .game-hud.visible { display: block; }
 
+    #commands-hud {
+      position: absolute; top: 16px; left: 16px;
+      color: #99a; font-family: monospace; font-size: 11px;
+      pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+      line-height: 1.7;
+    }
+    #commands-hud span { color: #c8b8ff; }
+
     /* ── Touch / Mobile ── */
     .touch-controls { display: none; }
     .touch-only { display: none !important; }
@@ -66,6 +74,7 @@
     @media (pointer: coarse) {
       .touch-controls { display: block; }
       .touch-only { display: block !important; }
+      #commands-hud.visible { display: none; }
 
       /* Look zone — fullscreen, BEHIND joystick & buttons so it catches all
          touches that don't land on a control. This fixes portrait-mode taps
@@ -192,6 +201,20 @@
   <div id="touch-btn-toggle" class="touch-controls">&#x22EE;</div>
   <div id="touch-btn-fs" class="touch-controls touch-btn">&#x26F6;</div>
 
+  <div id="commands-hud" class="game-hud">
+    <span>1-4</span> time of day<br>
+    <span>T</span> cycle day/night<br>
+    <span>F</span> place turret<br>
+    <span>Space</span> jump<br>
+    <span>M</span> moon phase<br>
+    <span>V</span> wind debug<br>
+    <span>&uarr;&darr;</span> wind layers<br>
+    <span>G</span> smoke<br>
+    <span>B</span> collision boxes<br>
+    <span>P</span> path overlay<br>
+    <span>X</span> axis debug<br>
+    <span>ESC</span> pointer lock
+  </div>
   <canvas id="axis-hud" width="80" height="80"></canvas>
   <div id="axis-info"></div>
 
